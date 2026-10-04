@@ -1,0 +1,14 @@
+services:
+  helpermcp:
+    build: .
+    restart: unless-stopped
+    user: "0"   # only to read root-owned Let's Encrypt keys; drop it for plain HTTP behind a proxy
+    ports: ["8444:8444"]
+    environment:
+      OPERATOR_KEY: ${OPERATOR_KEY:?set OPERATOR_KEY in .env}
+      PUBLIC_URL: ${PUBLIC_URL:-}          # e.g. https://helper.example.com:8444
+      # TLS terminated by the relay itself (no nginx needed):
+      TLS_CERT: ${TLS_CERT:-}              # /certs/live/<domain>/fullchain.pem
+      TLS_KEY: ${TLS_KEY:-}
+    volumes:
+      - ${CERTS_DIR:-/etc/letsencrypt}:/certs:ro

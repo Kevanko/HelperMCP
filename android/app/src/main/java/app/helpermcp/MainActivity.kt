@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var codeView: TextView
     private lateinit var hint: TextView
     private lateinit var allow: TextView
+    private lateinit var updateBtn: TextView
     private val allowViews = ArrayList<View>()
     private lateinit var start: TextView
     private lateinit var relay: EditText
@@ -46,6 +47,7 @@ class MainActivity : Activity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(22), dp(36), dp(22), dp(22)); setBackgroundColor(0xFF0F1724.toInt()) }
         col.addView(TextView(this).apply { text = t("Удалённая помощь", "Remote help"); setTextColor(Color.WHITE); textSize = 28f; typeface = Typeface.DEFAULT_BOLD })
         col.addView(TextView(this).apply { text = t("Человек, которому вы назовёте код, сможет смотреть на экран и нажимать за вас. Вы видите всё, что он делает, и можете остановить в любой момент.", "The person you give the code to can look at this screen and tap for you. You see everything they do and can stop at any time."); setTextColor(0xFFB8C4D8.toInt()); textSize = 15f; setPadding(0, dp(8), 0, dp(14)) })
+        updateBtn = button("", 0xFFEF6C00.toInt()) { Update.install(this, relay.text.toString().trim().ifEmpty { BuildConfig.RELAY }) }.apply { visibility = View.GONE }; col.addView(updateBtn)
         status = TextView(this).apply { setTextColor(0xFFFFB347.toInt()); textSize = 18f; typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(6), 0, dp(6)) }; col.addView(status)
         codeView = TextView(this).apply { setTextColor(0xFF0F1724.toInt()); textSize = 40f; typeface = Typeface.MONOSPACE; gravity = Gravity.CENTER; setPadding(dp(8), dp(14), dp(8), dp(14)); visibility = View.GONE
             background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(0xFFFFD54F.toInt()) } }
@@ -71,11 +73,14 @@ class MainActivity : Activity() {
         s.startSession(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY }, askSwitch.isChecked)
     }
 
-    override fun onResume() { super.onResume(); tick() }
+    override fun onResume() { super.onResume(); Update.check(prefs.getString("relay", BuildConfig.RELAY) ?: BuildConfig.RELAY); tick() }
     override fun onPause() { super.onPause(); h.removeCallbacksAndMessages(null) }
 
     private fun tick() {
         val on = HelperService.inst != null
+        val up = Update.available
+        updateBtn.visibility = if (up != null) View.VISIBLE else View.GONE
+        if (up != null) updateBtn.text = if (Update.progress.isNotEmpty()) (if (Update.progress.startsWith("error")) Update.progress else t("Скачиваю… ", "Downloading… ") + Update.progress.substringAfter(' ')) else t("⬇ Доступно обновление ", "⬇ Update available ") + up.optString("versionName") + t(" — обновить", " — install")
         status.text = when (HelperService.phase) {
             "connecting" -> t("◌ Подключаюсь к серверу…", "◌ Connecting to the server…")
             "wait" -> t("◌ Ожидание помощника… назовите ему код", "◌ Waiting for the helper… give them the code")

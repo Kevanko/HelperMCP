@@ -428,6 +428,11 @@ async function handler(req, res) {
       res.writeHead(200, { 'content-type': 'application/vnd.android.package-archive', 'content-disposition': 'attachment; filename="HelperMCP.apk"', 'cache-control': 'no-cache' });
       return res.end(fs.readFileSync(APK_FILE));
     }
+    if (p === '/apk/version') {   // the app asks this to offer an update: helpermcp.json = {"versionCode": N, "versionName": "x.y.z"} next to the APK
+      const vf = APK_FILE.replace(/\.apk$/, '.json');
+      if (!fs.existsSync(vf)) return text(res, 404, 'no version info');
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-cache' }); return res.end(fs.readFileSync(vf));
+    }
     if (p === '/qr.svg') {   // QR code of one of our own links
       const u = url.searchParams.get('u') || '';
       if (!u.startsWith(baseUrl(req) + '/') || u.length > 300) return text(res, 400, 'bad link');

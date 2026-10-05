@@ -38,6 +38,7 @@ kids.push(agent);
 let agentOut = '';
 agent.stdout.on('data', (d) => (agentOut += d));
 agent.stderr.on('data', (d) => (agentOut += d));
+process.on('uncaughtException', (e) => { console.error(e.message, '\n--- agent output ---\n' + agentOut); process.exit(1); });
 
 const client = new Client({ name: 'test', version: '0' });
 await client.connect(new StreamableHTTPClientTransport(new URL(BASE + '/mcp'), { requestInit: { headers: { Authorization: 'Bearer ' + KEY } } }));

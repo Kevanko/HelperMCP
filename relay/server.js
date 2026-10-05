@@ -374,60 +374,26 @@ function script(req, res, file) {
   text(res, 200, f.replaceAll('__RELAY__', baseUrl(req)).replaceAll('__BUILD__', build));   // LF whatever the checkout's line endings
 }
 
+const LANDING = fs.readFileSync(path.join(here, 'landing.html'), 'utf8');   // the page is a template: relay/landing.html
 function landing(req, res) {
   const b = baseUrl(req);
   const ps = `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${b}/h | iex`;
   const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`;
   const sh = `python3 <(curl -fsSL ${b}/p)`;
-  const hasApk = fs.existsSync(APK_FILE);
   const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  const box = (id, label, text) => `<div class=box><div class=lbl>${label}</div><pre id=${id}>${esc(text)}</pre><button class=cp data-t="${esc(text)}">Copy</button></div>`;
-  text(res, 200, `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Remote help</title>
-<style>
-:root{--bg:#f6f8fb;--fg:#0f1724;--mut:#5b6b82;--card:#fff;--bd:#d9e1ec;--ac:#3b7bff;--code:#0f1724;--codefg:#e8eefc}
-@media(prefers-color-scheme:dark){:root{--bg:#0b1018;--fg:#e8eefc;--mut:#8fa0b8;--card:#121a27;--bd:#25324a;--code:#070b12}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
-main{max-width:46rem;margin:0 auto;padding:2rem 1rem 4rem}h1{margin:0 0 .3rem;font-size:1.9rem}p.sub{color:var(--mut);margin:.2rem 0 1.4rem}
-.tabs{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:1rem}.tab{padding:.5rem .9rem;border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:999px;cursor:pointer;font:inherit}
-.tab.on{background:var(--ac);border-color:var(--ac);color:#fff}.pane{display:none;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:1.1rem 1.2rem}.pane.on{display:block}
-ol{padding-left:1.2rem;margin:.2rem 0 1rem}li{margin:.25rem 0}.box{position:relative;margin:.5rem 0 1rem}.lbl{font-size:.8rem;color:var(--mut);margin-bottom:.2rem}
-pre{margin:0;background:var(--code);color:var(--codefg);padding:.8rem 5.2rem .8rem .9rem;border-radius:10px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-.cp{position:absolute;right:.5rem;bottom:.55rem;border:0;background:var(--ac);color:#fff;border-radius:8px;padding:.35rem .8rem;cursor:pointer;font:600 13px system-ui}.cp.ok{background:#2e9e5b}
-.btn{display:inline-block;background:var(--ac);color:#fff;text-decoration:none;border-radius:10px;padding:.65rem 1.1rem;font-weight:600;margin:.2rem .4rem .2rem 0}.btn.alt{background:transparent;color:var(--ac);border:1px solid var(--ac)}
-small{color:var(--mut)}img.qr{background:#fff;border-radius:10px;padding:6px;border:1px solid var(--bd);display:block;margin:.4rem 0}
-</style>
-<main>
-<h1>Remote help</h1>
-<p class=sub>Someone is going to help you with your device. Pick yours, start it, then tell them the <b>code</b> it shows. You can stop at any time.</p>
-<div class=tabs><button class=tab data-p=win>Windows</button><button class=tab data-p=lin>Ubuntu / Linux</button>${hasApk ? '<button class=tab data-p=and>Android</button>' : ''}</div>
-
-<section class=pane id=win>
-<p><b>Easiest:</b> download the launcher and double-click it. It opens a window and starts everything.</p>
-<a class=btn href="${esc(b)}/h.cmd" download>Download launcher (.cmd)</a><br><small>Your browser may warn about a .cmd file: it is a 3-line text file, <a href="${esc(b)}/h.cmd">open it</a> to read it.</small>
-<p style="margin-top:1.1rem"><b>Or copy a command</b> and paste it into the window:</p>
-<ol><li>Press <b>Win + R</b>, type <code>powershell</code> (or <code>cmd</code>), press Enter.</li><li>Paste (right-click or Ctrl+V), press Enter.</li></ol>
-${box('c1', 'PowerShell', ps)}${box('c2', 'Command Prompt (cmd)', cmd)}
-</section>
-
-<section class=pane id=lin>
-<ol><li>Open a terminal (Ctrl + Alt + T).</li><li>Paste the command, press Enter.</li></ol>
-${box('c3', 'Terminal', sh)}
-<p>Or download a launcher: <a class=btn href="${esc(b)}/p.sh" download>Download (.sh)</a> and run <code>bash p.sh</code>.</p>
-</section>
-
-${hasApk ? `<section class=pane id=and>
-<ol><li>On the phone, scan the code with the camera (or open the link) and download the app.</li><li>Allow the install, open <b>HelperMCP</b>.</li><li>Press <b>1. Allow control</b> and switch HelperMCP on, then <b>2. Start help</b>.</li></ol>
-<img class=qr alt="QR" width=220 height=220 src="${esc(b)}/qr.svg?u=${encodeURIComponent(b + '/apk')}">
-${box('c4', 'Link to the app', b + '/apk')}<a class=btn href="${esc(b)}/apk">Download APK</a>
-</section>` : ''}
-<p><small>On Windows and Linux nothing is installed: the script runs from memory and disappears when you close the window. You can <a href="${esc(b)}/h">read the Windows script</a> or <a href="${esc(b)}/p">the Linux one</a> first.</small></p>
-</main>
-<script>
-const ua=navigator.userAgent,start=/Android/i.test(ua)?'and':/Linux|X11/i.test(ua)&&!/Android/i.test(ua)?'lin':'win';
-function show(id){if(!document.getElementById(id))id='win';document.querySelectorAll('.pane').forEach(e=>e.classList.toggle('on',e.id===id));document.querySelectorAll('.tab').forEach(e=>e.classList.toggle('on',e.dataset.p===id))}
-document.querySelectorAll('.tab').forEach(e=>e.onclick=()=>show(e.dataset.p));show(start);
-document.querySelectorAll('.cp').forEach(b=>b.onclick=async()=>{const t=b.dataset.t;try{await navigator.clipboard.writeText(t)}catch(e){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}const o=b.textContent;b.textContent='Copied';b.classList.add('ok');setTimeout(()=>{b.textContent=o;b.classList.remove('ok')},1500)});
-</script>`, 'text/html; charset=utf-8');
+  const apk = fs.existsSync(APK_FILE);
+  const vars = {
+    BASE: esc(b), PS: esc(ps), CMD: esc(cmd), SH: esc(sh), PS_ATTR: esc(ps), CMD_ATTR: esc(cmd), SH_ATTR: esc(sh),
+    APK_TAB: apk ? '<button class="tab" role="tab" data-p="and">android</button>' : '',
+    APK_PANE: apk ? `<section class="win" id="and" role="tabpanel"><div class="bar"><i></i><i></i><i></i><span>~/android</span></div><div class="body">
+<div class="qr"><img alt="QR code with the link to the app" src="${esc(b)}/qr.svg?u=${encodeURIComponent(b + '/apk')}"><div>
+<ol><li>Scan the code with the phone camera, or open the link, and download the app.</li><li>Allow the install and open <b>HelperMCP</b>.</li><li>Tap <b>Allow control</b>, switch HelperMCP on, then tap <b>Start help</b>.</li></ol>
+<div class="cmd"><small>Link</small><pre>${esc(b)}/apk</pre><button class="cp" data-t="${esc(b)}/apk">Copy</button></div>
+<a class="btn" href="${esc(b)}/apk">Download APK</a></div></div></div></section>` : '',
+  };
+  let html = LANDING;
+  for (const [k, v] of Object.entries(vars)) html = html.split(`{{${k}}}`).join(v);
+  text(res, 200, html, 'text/html; charset=utf-8');
 }
 
 function launcherCmd(b) {

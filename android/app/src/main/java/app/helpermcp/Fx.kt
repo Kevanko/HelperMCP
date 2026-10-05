@@ -149,11 +149,11 @@ class Fx(private val svc: AccessibilityService) {
             .apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES })
         val p = TextView(svc).apply {
             setTextColor(Color.WHITE); textSize = 14f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
-            setPadding(dp(18), dp(8), dp(18), dp(8)); setOnClickListener { onEnd?.invoke() }
+            setPadding(dp(18 + 22), dp(8 + 22), dp(18 + 22), dp(8 + 22)); setOnClickListener { onEnd?.invoke() }
         }
         pill = p
         wm.addView(p, WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(30) })
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(8) })
         pendingPointer?.let { v.pointer = it.first; v.hotX = it.second; v.hotY = it.third }
         applyState(); tick()
     }
@@ -170,12 +170,8 @@ class Fx(private val svc: AccessibilityService) {
             "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…") + "   ✕"
             else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…") + "   ✕"
         }
-        val col = colorOf(); val inner = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(0xE60F1724.toInt()); setStroke(dp(2), col) }
-        if (busy) {   // working: the outline breathes and a soft halo pulses around the label
-            val halo = GradientDrawable().apply { cornerRadius = dp(26).toFloat(); setColor(0); setStroke(dp(6), (col and 0x00FFFFFF) or ((30 + 120 * pulseV).toInt() shl 24)) }
-            val halo2 = GradientDrawable().apply { cornerRadius = dp(30).toFloat(); setColor(0); setStroke(dp(4), (col and 0x00FFFFFF) or ((10 + 60 * pulseV).toInt() shl 24)) }
-            p.background = android.graphics.drawable.LayerDrawable(arrayOf(halo2, halo, inner)).apply { setLayerInset(0, -dp(10), -dp(10), -dp(10), -dp(10)); setLayerInset(1, -dp(5), -dp(5), -dp(5), -dp(5)) }
-        } else p.background = inner
+        val bg = (p.background as? PillBg) ?: PillBg(dp(22)).also { p.background = it }
+        bg.col = colorOf(); bg.busy = busy; bg.pulse = pulseV; bg.r = dp(20).toFloat(); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
     }
 
     fun setState(s: String) = main.post { if (state != s) { state = s; applyState() } }
@@ -288,4 +284,22 @@ class Fx(private val svc: AccessibilityService) {
         main.post { card?.let { try { wm.removeView(it) } catch (_: Throwable) { } }; card = null }
         return answer
     }
+}
+
+/** the label's background: a dark pill with a plain outline; while the AI works a soft blurred halo (a fade in every direction) breathes around it */
+class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
+    var col = BLUE; var busy = false; var pulse = 0f; var r = 40f; var stroke = 4f
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    override fun draw(c: Canvas) {
+        val m = margin.toFloat(); val rect = android.graphics.RectF(bounds.left + m, bounds.top + m, bounds.right - m, bounds.bottom - m)
+        if (busy) for ((blur, a) in listOf(m to 0.45f + 0.45f * pulse, m * 0.5f to 0.65f + 0.35f * pulse)) {
+            p.reset(); p.isAntiAlias = true; p.style = Paint.Style.FILL; p.color = (col and 0x00FFFFFF) or ((a.coerceIn(0f, 1f) * 255).toInt() shl 24)
+            p.maskFilter = android.graphics.BlurMaskFilter(blur, android.graphics.BlurMaskFilter.Blur.NORMAL); c.drawRoundRect(rect, r, r, p)
+        }
+        p.reset(); p.isAntiAlias = true; p.color = 0xF20F1724.toInt(); c.drawRoundRect(rect, r, r, p)
+        p.style = Paint.Style.STROKE; p.strokeWidth = stroke; p.color = col; c.drawRoundRect(rect, r, r, p)
+    }
+    override fun setAlpha(a: Int) {}
+    override fun setColorFilter(f: android.graphics.ColorFilter?) {}
+    @Suppress("OVERRIDE_DEPRECATION") override fun getOpacity() = PixelFormat.TRANSLUCENT
 }

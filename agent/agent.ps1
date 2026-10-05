@@ -32,11 +32,17 @@ function Api($path, $data, $token, $timeout = 40) {
 }
 function Clip($s) { if ($s.Length -gt $MaxOut) { $s.Substring(0, $MaxOut) + "`n...[truncated]" } else { $s } }
 
-$Screen = [Windows.Forms.SystemInformation]::VirtualScreen
 $Scale = 1.0
+$script:OriginX = [Windows.Forms.SystemInformation]::VirtualScreen.Left; $script:OriginY = [Windows.Forms.SystemInformation]::VirtualScreen.Top   # real px of the screenshot's top-left
 
 function Do-Screenshot($a) {
-    $s = [Windows.Forms.SystemInformation]::VirtualScreen
+    $s = [Windows.Forms.SystemInformation]::VirtualScreen   # all monitors, or just one with "monitor"
+    if ($null -ne $a.monitor) {
+        $all = [Windows.Forms.Screen]::AllScreens
+        if ([int]$a.monitor -lt 0 -or [int]$a.monitor -ge $all.Count) { throw "No monitor $($a.monitor). Monitors: 0..$($all.Count - 1)" }
+        $s = $all[[int]$a.monitor].Bounds
+    }
+    $script:OriginX = $s.Left; $script:OriginY = $s.Top
     $bmp = New-Object Drawing.Bitmap $s.Width, $s.Height
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
@@ -57,7 +63,7 @@ function Do-Screenshot($a) {
 }
 
 function Do-Click($a) {
-    $x = [int]($a.x * $Scale) + $Screen.Left; $y = [int]($a.y * $Scale) + $Screen.Top
+    $x = [int]($a.x * $Scale) + $script:OriginX; $y = [int]($a.y * $Scale) + $script:OriginY
     [void][H.U]::SetCursorPos($x, $y)
     $btn = if ($a.button) { $a.button } else { 'left' }
     $down, $up = switch ($btn) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } }
@@ -135,12 +141,12 @@ function Do-SysInfo($a) {
         os = "$($os.Caption) build $($os.BuildNumber)"; host = $env:COMPUTERNAME; user = $env:USERNAME; admin = $admin
         powershell = $PSVersionTable.PSVersion.ToString(); cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
         ram_gb = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 1); free_ram_gb = [Math]::Round($os.FreePhysicalMemory / 1MB, 1)
-        screen = "$($Screen.Width)x$($Screen.Height)"; boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name
+        monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) }); boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name
     } | ConvertTo-Json) }
 }
 
 function Do-Scroll($a) {
-    if ($null -ne $a.x -and $null -ne $a.y) { [void][H.U]::SetCursorPos([int]($a.x * $Scale) + $Screen.Left, [int]($a.y * $Scale) + $Screen.Top) }
+    if ($null -ne $a.x -and $null -ne $a.y) { [void][H.U]::SetCursorPos([int]($a.x * $Scale) + $script:OriginX, [int]($a.y * $Scale) + $script:OriginY) }
     $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
     $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * $n)), 0)
     [H.U]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
@@ -272,14 +278,6 @@ Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] publi
 $label = $env:HM_LABEL; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 function Col($a) { [Windows.Media.Color]::FromArgb($a, 76, 141, 255) }
-function Edge($angle, $ha, $va, $w, $h) {
-    $gs = New-Object Windows.Media.GradientStopCollection
-    foreach ($s in @(@(150, 0.0), @(45, 0.35), @(0, 1.0))) { [void]$gs.Add((New-Object Windows.Media.GradientStop (Col $s[0]), $s[1])) }
-    $r = New-Object Windows.Shapes.Rectangle
-    $r.Width = $w; $r.Height = $h; $r.HorizontalAlignment = $ha; $r.VerticalAlignment = $va
-    $r.Fill = New-Object Windows.Media.LinearGradientBrush $gs, $angle
-    $r
-}
 $wins = @()
 foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $b = $scr.Bounds
@@ -288,9 +286,24 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $w.Topmost = $true; $w.ShowInTaskbar = $false; $w.ShowActivated = $false; $w.WindowStartupLocation = 'Manual'
     $w.Left = $b.X / $dpi; $w.Top = $b.Y / $dpi; $w.Width = $b.Width / $dpi; $w.Height = $b.Height / $dpi
     $g = New-Object Windows.Controls.Grid
-    $nan = [double]::NaN; $S = 70
-    [void]$g.Children.Add((Edge 0 'Left' 'Stretch' $S $nan)); [void]$g.Children.Add((Edge 180 'Right' 'Stretch' $S $nan))
-    [void]$g.Children.Add((Edge 90 'Stretch' 'Top' $nan $S)); [void]$g.Children.Add((Edge 270 'Stretch' 'Bottom' $nan $S))
+    # 4 trapezoids meeting on the corner diagonals (like a picture frame): each pixel belongs to exactly one strip,
+    # so nothing overlaps and the corners stay square
+    $S = 70; $Wd = $w.Width; $Ht = $w.Height
+    function Strip($pts, $x0, $y0, $x1, $y1) {
+        $gs = New-Object Windows.Media.GradientStopCollection
+        foreach ($x in @(@(150, 0.0), @(45, 0.35), @(0, 1.0))) { [void]$gs.Add((New-Object Windows.Media.GradientStop (Col $x[0]), $x[1])) }
+        $lb = New-Object Windows.Media.LinearGradientBrush; $lb.GradientStops = $gs
+        $lb.StartPoint = New-Object Windows.Point $x0, $y0; $lb.EndPoint = New-Object Windows.Point $x1, $y1
+        $poly = New-Object Windows.Shapes.Polygon
+        $poly.Points = New-Object Windows.Media.PointCollection (, [Windows.Point[]]($pts | ForEach-Object { New-Object Windows.Point $_[0], $_[1] }))
+        $poly.Fill = $lb; $poly.HorizontalAlignment = 'Left'; $poly.VerticalAlignment = 'Top'
+        [Windows.Media.RenderOptions]::SetEdgeMode($poly, 'Aliased')   # no anti-aliased seam on the diagonals
+        [void]$g.Children.Add($poly)
+    }
+    Strip @(@(0, 0), @($S, $S), @($S, ($Ht - $S)), @(0, $Ht)) 0 0.5 1 0.5                                   # left
+    Strip @(@($Wd, 0), @($Wd, $Ht), @(($Wd - $S), ($Ht - $S)), @(($Wd - $S), $S)) 1 0.5 0 0.5               # right
+    Strip @(@(0, 0), @($Wd, 0), @(($Wd - $S), $S), @($S, $S)) 0.5 0 0.5 1                                   # top
+    Strip @(@(0, $Ht), @($S, ($Ht - $S)), @(($Wd - $S), ($Ht - $S)), @($Wd, $Ht)) 0.5 1 0.5 0               # bottom
     $pill = New-Object Windows.Controls.Border
     $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 14, 6, 18, 6
     $pill.Margin = New-Object Windows.Thickness 0, 12, 0, 0; $pill.HorizontalAlignment = 'Center'; $pill.VerticalAlignment = 'Top'

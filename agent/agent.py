@@ -24,6 +24,7 @@ NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we
 CHILDREN = {}                             # name -> Child (other MCP servers running on this PC)
 TMP = []                                  # temp files/dirs removed on exit
 SCALE = 1.0                               # screenshot px -> real px
+ORIGIN = (0, 0)                           # real px of the screenshot's top-left corner (non-zero for a single monitor)
 GUI = {"type": None}                      # filled by find_gui()
 OVERLAY_PROC = None
 
@@ -112,21 +113,35 @@ def capture_file(d):
                        else "No Wayland screenshot tool. Ask the user to run: sudo apt install gnome-screenshot")
 
 
-def screenshot(_):
-    global SCALE
+def monitors():
+    """[(x, y, w, h)] of every screen, via GDK; empty if unknown."""
+    try:
+        import gi; gi.require_version("Gdk", "3.0"); from gi.repository import Gdk
+        d = Gdk.Display.get_default()
+        return [(g.x, g.y, g.width, g.height) for g in (d.get_monitor(i).get_geometry() for i in range(d.get_n_monitors()))]
+    except Exception:
+        return []
+
+
+def screenshot(a):
+    global SCALE, ORIGIN
     if not GUI["type"]: raise RuntimeError("No graphical session found (nobody is logged in to a desktop).")
+    mons, want = monitors(), (a or {}).get("monitor")
+    if want is not None and not (0 <= int(want) < len(mons)): raise RuntimeError(f"No monitor {want}. Monitors: {mons}")
     d = tempfile.mkdtemp()
     try:
         path = capture_file(d)
-        try:  # downscale to <=1920 px wide (cheaper for the AI), remember the factor for click coordinates
+        try:  # crop to one monitor if asked, downscale to <=1920 px wide, remember offset+factor for click coordinates
             import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
-            pb = GdkPixbuf.Pixbuf.new_from_file(path); w = pb.get_width()
-            SCALE = max(1.0, w / 1920)
+            pb = GdkPixbuf.Pixbuf.new_from_file(path); ORIGIN = (0, 0)
+            if want is not None:
+                x, y, w, h = mons[int(want)]; pb = pb.new_subpixbuf(x, y, w, h); ORIGIN = (x, y)
+            w = pb.get_width(); SCALE = max(1.0, w / 1920)
             if SCALE > 1: pb = pb.scale_simple(1920, int(pb.get_height() / SCALE), GdkPixbuf.InterpType.BILINEAR)
             _, buf = pb.save_to_bufferv("jpeg", ["quality"], ["70"])
             return {"image": base64.b64encode(buf).decode(), "mime": "image/jpeg"}
         except Exception:
-            SCALE = 1.0
+            SCALE, ORIGIN = 1.0, (0, 0)
             with open(path, "rb") as f:
                 return {"image": base64.b64encode(f.read()).decode(), "mime": "image/jpeg" if path.endswith("jpg") else "image/png"}
     finally:
@@ -135,7 +150,7 @@ def screenshot(_):
 
 # ---- mouse & keyboard (X11 XTest through ctypes: no xdotool needed) ---------------------------------
 def click(a):
-    X = xlib(); x, y = int(a["x"] * SCALE), int(a["y"] * SCALE)
+    X = xlib(); x, y = int(a["x"] * SCALE) + ORIGIN[0], int(a["y"] * SCALE) + ORIGIN[1]
     X["t"].XTestFakeMotionEvent(X["d"], -1, x, y, 0); sync(X); time.sleep(0.05)
     b = {"left": 1, "middle": 2, "right": 3}[a.get("button", "left")]
     for _ in range(2 if a.get("double") else 1):
@@ -145,7 +160,7 @@ def click(a):
 
 def scroll(a):
     X = xlib()
-    if "x" in a and "y" in a: X["t"].XTestFakeMotionEvent(X["d"], -1, int(a["x"] * SCALE), int(a["y"] * SCALE), 0)
+    if "x" in a and "y" in a: X["t"].XTestFakeMotionEvent(X["d"], -1, int(a["x"] * SCALE) + ORIGIN[0], int(a["y"] * SCALE) + ORIGIN[1], 0)
     n = int(a.get("amount", 3)); b = 5 if n > 0 else 4   # positive = down
     for _ in range(abs(n)):
         X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0)
@@ -244,6 +259,7 @@ def sysinfo(_):
         "os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(),
         "python": platform.python_version(), "cpus": os.cpu_count(), "root": os.geteuid() == 0,
         "display": os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"), "session": GUI["type"],
+        "monitors": [f"{i}: {w}x{h} at {x},{y}" for i, (x, y, w, h) in enumerate(monitors())],
         "node": sh("node -v 2>/dev/null")[1].strip() or None,
         "uptime": sh("uptime -p")[1].strip(), "mem": sh("free -h | sed -n 2p")[1].strip(), "disk": sh("df -h / | tail -1")[1].strip(),
     }, indent=2, ensure_ascii=False)}
@@ -375,13 +391,15 @@ def make(mon):                       # one overlay window per monitor: every scr
     if vis: w.set_visual(vis)
     w.set_default_size(W, H); w.move(g.x, g.y); w.set_keep_above(True); w.set_accept_focus(False)
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
-        s = 70
-        for (x0, y0, x1, y1, rx, ry, rw, rh) in ((0, 0, s, 0, 0, 0, s, H), (W, 0, W - s, 0, W - s, 0, s, H),
-                                                (0, 0, 0, s, 0, 0, W, s), (0, H, 0, H - s, 0, H - s, W, s)):
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+        cr.set_operator(cairo.OPERATOR_LIGHTEN)        # where two strips meet in a corner the brighter one wins instead of adding up
+        S = 70
+        for (x0, y0, x1, y1, rx, ry, rw, rh) in ((0, 0, S, 0, 0, 0, S, H), (W, 0, W - S, 0, W - S, 0, S, H),
+                                                (0, 0, 0, S, 0, 0, W, S), (0, H, 0, H - S, 0, H - S, W, S)):
             gr = cairo.LinearGradient(x0, y0, x1, y1)
-            gr.add_color_stop_rgba(0, R, G, B, 0.55); gr.add_color_stop_rgba(0.35, R, G, B, 0.18); gr.add_color_stop_rgba(1, R, G, B, 0)
+            gr.add_color_stop_rgba(0, R, G, B, 0.59); gr.add_color_stop_rgba(0.35, R, G, B, 0.18); gr.add_color_stop_rgba(1, R, G, B, 0)
             cr.set_source(gr); cr.rectangle(rx, ry, rw, rh); cr.fill()
+        cr.set_operator(cairo.OPERATOR_OVER)
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         tw = cr.text_extents(label).x_advance; pw, ph = tw + 54, 34; px, py, r = (W - pw) / 2, 12, 17
         cr.new_sub_path(); cr.arc(px + pw - r, py + r, r, -math.pi / 2, math.pi / 2); cr.arc(px + r, py + r, r, math.pi / 2, 3 * math.pi / 2); cr.close_path()

@@ -90,7 +90,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
       s.pending.delete(id);
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
     }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer, t0: Date.now(), tool, view: !!args.view });
+    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, view: !!args.view });
     s.queue.push({ id, tool, args });
     flush(s);
   });
@@ -122,6 +122,7 @@ setInterval(() => {
 }, 10_000).unref();
 
 // ---- adapting to the network: viewer frames step through quality levels, "lite" mode shrinks the AI's screenshots on slow links
+const FAKE_LATENCY_MS = Number(process.env.TEST_FAKE_LATENCY_MS || 0);   // tests only: pretend viewer frames are slow
 const LEVELS = [{ max_width: 480, quality: 35 }, { max_width: 640, quality: 45 }, { max_width: 800, quality: 50 }, { max_width: 960, quality: 55 }, { max_width: 1280, quality: 65 }];
 const viewParams = (s) => LEVELS[s.vl ?? 3];
 function adapt(s, pend, bytes) {

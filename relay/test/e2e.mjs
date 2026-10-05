@@ -18,7 +18,7 @@ process.on('exit', stop);
 const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`);
 fs.rmSync(STATE, { force: true });
 const startRelay = async () => {
-  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', STATE_FILE: STATE }, stdio: 'inherit' });
+  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', TEST_FAKE_LATENCY_MS: process.env.GUI ? '2500' : '0', STATE_FILE: STATE }, stdio: 'inherit' });
   kids.push(r);
   for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((x) => setTimeout(x, 100)); }
   return r;
@@ -195,6 +195,16 @@ if (process.env.GUI) {
   const full = size(await tool('screenshot', { session: code }));
   const lite = size(await tool('screenshot', { session: code, max_width: 640, quality: 30 }));
   assert.ok(lite < full / 2, `lite screenshot must be much smaller (${lite} vs ${full})`); console.log(`adaptive screenshot ok (${full} -> ${lite} bytes)`);
+  // adaptive viewer: frames pretend to be slow (2.5 s) -> the relay steps the quality down and the frames shrink
+  const vlevels = [], vsizes = [];
+  for (let i = 0; i < 8 && vlevels.at(-1) !== 0; i++) {
+    const fr = await fetch(vurl + '/frame?' + i);
+    if (fr.status === 200) { vlevels.push(Number(fr.headers.get('x-quality'))); vsizes.push((await fr.arrayBuffer()).byteLength); }
+    await new Promise((x) => setTimeout(x, 100));
+  }
+  assert.equal(vlevels.at(-1), 0, `viewer must step down to the lowest quality on a slow link: ${vlevels}`);
+  assert.ok(vsizes.length === 1 || vsizes.at(-1) < vsizes[0], `frames must shrink: ${vsizes}`);
+  console.log(`viewer adapts to a slow link ok (levels ${vlevels}, bytes ${vsizes})`);
   const shot = await tool('screenshot', { session: code });
   assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 200)); console.log('screenshot ok');
 }

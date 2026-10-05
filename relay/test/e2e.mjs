@@ -159,6 +159,17 @@ assert.match(txt(await tool('run', { session: code, command: 'echo after-restart
 assert.match(await (await fetch(vurl0)).text(), /Remote screen/);
 console.log('relay restart: session + agent + viewer link survive ok');
 
+// resilience: the relay is gone for a few seconds (outage) and comes back WITHOUT its state (fresh server): the agent registers again and keeps the same code
+relay.kill(); await new Promise((x) => setTimeout(x, 9000));
+fs.rmSync(STATE, { force: true });
+relay = await startRelay();
+let back = [];
+for (let i = 0; i < 40 && !back.some((x) => x.code === code); i++) { await new Promise((x) => setTimeout(x, 500)); back = JSON.parse(txt(await tool('list_sessions'))); }
+assert.ok(back.some((x) => x.code === code && x.online), `agent must re-register with the same code, got ${JSON.stringify(back)}`);
+assert.match(txt(await tool('run', { session: code, command: 'echo after-reset' })), /after-reset/);
+assert.match(agentOut, /connection lost/i); assert.match(agentOut, /connection restored|registered again/i);
+console.log('outage + fresh server: agent reconnects with the same code ok');
+
 // live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)
 const vurl = txt(await tool('open_viewer', { session: code }));
 assert.match(vurl, new RegExp(`^${BASE}/v/[0-9a-f]{36}$`));
@@ -195,6 +206,19 @@ if (process.env.GUI) {
   const full = size(await tool('screenshot', { session: code }));
   const lite = size(await tool('screenshot', { session: code, max_width: 640, quality: 30 }));
   assert.ok(lite < full / 2, `lite screenshot must be much smaller (${lite} vs ${full})`); console.log(`adaptive screenshot ok (${full} -> ${lite} bytes)`);
+  // the pointer glides to the target (move) and ends up exactly there
+  await tool('screenshot', { session: code });                         // sets the coordinate system the AI uses
+  const where = async () => txt(await tool('run', { session: code, command: useps
+    ? "Add-Type -AssemblyName System.Windows.Forms; $p = [Windows.Forms.Cursor]::Position; \"$($p.X),$($p.Y)\""
+    : "python3 -c \"import gi; gi.require_version('Gdk','3.0'); from gi.repository import Gdk; print(*Gdk.Display.get_default().get_default_seat().get_pointer().get_position()[1:], sep=',')\"" }));
+  const sh = await tool('screenshot', { session: code });
+  await tool('move', { session: code, x: 400, y: 300 });
+  const m1 = /(\d+),(\d+)/.exec(await where());
+  assert.ok(m1, 'pointer position unreadable');
+  await tool('move', { session: code, x: 600, y: 420 });
+  const m2 = /(\d+),(\d+)/.exec(await where());
+  assert.ok(Math.abs(m2[1] - m1[1]) > 50 && Math.abs(m2[2] - m1[2]) > 30, `the pointer must have moved between targets: ${m1[0]} -> ${m2[0]}`);
+  console.log(`move ok (pointer ${m1[0]} -> ${m2[0]})`);
   // adaptive viewer: frames pretend to be slow (2.5 s) -> the relay steps the quality down and the frames shrink
   const vlevels = [], vsizes = [];
   for (let i = 0; i < 8 && vlevels.at(-1) !== 0; i++) {

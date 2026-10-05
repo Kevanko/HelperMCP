@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HelperMCP agent for Linux. Python 3 stdlib only (GTK via python3-gi is used if present, for the overlay).
 Run: python3 <(curl -fsSL RELAY/p)"""
-import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, locale, os, platform, queue, shutil, signal, socket
+import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, math, random, locale, os, platform, queue, shutil, signal, socket
 import subprocess, sys, tarfile, tempfile, threading, time
 import urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -16,9 +16,10 @@ T = {
              "Mode: [1] ask before every action (recommended)  [2] full access: "),
     "allow": ("Разрешить? [y/N] ", "Allow? [y/N] "),
     "overlay": ("Удалённое управление", "Remote control"),
+    "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "move", "drag", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -80,6 +81,8 @@ def xlib():
     x11.XChangeKeyboardMapping.argtypes = [V, I, I, ctypes.POINTER(UL), I]
     x11.XDisplayKeycodes.argtypes = [V, ctypes.POINTER(I), ctypes.POINTER(I)]
     x11.XFree.argtypes, x11.XSync.argtypes, x11.XFlush.argtypes = [V], [V, I], [V]
+    x11.XDefaultRootWindow.restype, x11.XDefaultRootWindow.argtypes = UL, [V]
+    x11.XQueryPointer.argtypes = [V, UL, ctypes.POINTER(UL), ctypes.POINTER(UL)] + [ctypes.POINTER(I)] * 4 + [ctypes.POINTER(UI)]
     xt.XTestFakeKeyEvent.argtypes = [V, UI, I, UL]
     xt.XTestFakeButtonEvent.argtypes = [V, UI, I, UL]
     xt.XTestFakeMotionEvent.argtypes = [V, I, I, I, UL]
@@ -158,22 +161,60 @@ def screenshot(a):
 
 
 # ---- mouse & keyboard (X11 XTest through ctypes: no xdotool needed) ---------------------------------
+def pointer_pos():
+    X = xlib(); x11 = X["x"]
+    r, c = ctypes.c_ulong(), ctypes.c_ulong(); rx, ry, wx, wy, mk = ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_int(), ctypes.c_uint()
+    x11.XQueryPointer(X["d"], x11.XDefaultRootWindow(X["d"]), ctypes.byref(r), ctypes.byref(c), ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mk))
+    return rx.value, ry.value
+
+
+def glide(x, y, dur=None):
+    """Move the real pointer like a hand would: eased, about 60 steps/s, speed depends on the distance (the overlay cursor follows it)."""
+    X = xlib(); cx, cy = pointer_pos(); dist = math.hypot(x - cx, y - cy)
+    if dist < 2: return
+    dur = dur or min(0.7, 0.14 + dist * 0.00034)
+    n = max(4, int(dur / 0.016))
+    for i in range(1, n + 1):
+        p = i / n; k = 4 * p ** 3 if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2     # ease in-out cubic
+        X["t"].XTestFakeMotionEvent(X["d"], -1, int(round(cx + (x - cx) * k)), int(round(cy + (y - cy) * k)), 0); sync(X); time.sleep(dur / n)
+
+
+def _target(a, kx="x", ky="y"):
+    return int(a[kx] * SCALE) + ORIGIN[0], int(a[ky] * SCALE) + ORIGIN[1]
+
+
+def move(a):
+    xlib(); overlay_send("active"); x, y = _target(a); glide(x, y); return {"text": "ok"}
+
+
 def click(a):
-    X = xlib(); x, y = int(a["x"] * SCALE) + ORIGIN[0], int(a["y"] * SCALE) + ORIGIN[1]
-    X["t"].XTestFakeMotionEvent(X["d"], -1, x, y, 0); sync(X); time.sleep(0.05)
-    b = {"left": 1, "middle": 2, "right": 3}[a.get("button", "left")]
-    for _ in range(2 if a.get("double") else 1):
-        X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); time.sleep(0.06)
+    X = xlib(); x, y = _target(a); btn = a.get("button", "left"); b = {"left": 1, "middle": 2, "right": 3}[btn]
+    overlay_send("active"); glide(x, y); time.sleep(0.05)
+    for i in range(2 if a.get("double") else 1):
+        overlay_send(f"click {x} {y} {btn}")
+        X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); sync(X); time.sleep(0.08)
+        X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); time.sleep(0.1)
+    return {"text": "ok"}
+
+
+def drag(a):
+    """Press at (x,y), glide to (x2,y2) with the button held, release (moving windows, selecting, sliders ...)."""
+    X = xlib(); x1, y1 = _target(a); x2, y2 = _target(a, "x2", "y2"); b = {"left": 1, "middle": 2, "right": 3}[a.get("button", "left")]
+    overlay_send("active"); glide(x1, y1); time.sleep(0.06)
+    X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); sync(X); overlay_send(f"down {x1} {y1}"); time.sleep(0.12)
+    glide(x2, y2, min(1.4, 0.3 + math.hypot(x2 - x1, y2 - y1) * 0.0007)); time.sleep(0.1)
+    X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); overlay_send(f"up {x2} {y2}")
     return {"text": "ok"}
 
 
 def scroll(a):
-    X = xlib()
-    if "x" in a and "y" in a: X["t"].XTestFakeMotionEvent(X["d"], -1, int(a["x"] * SCALE) + ORIGIN[0], int(a["y"] * SCALE) + ORIGIN[1], 0)
+    X = xlib(); overlay_send("active")
+    if "x" in a and "y" in a: x, y = _target(a); glide(x, y)
     n = int(a.get("amount", 3)); b = 5 if n > 0 else 4   # positive = down
+    overlay_send(f"scroll {n}")
     for _ in range(abs(n)):
-        X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0)
-    sync(X); return {"text": "ok"}
+        X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); time.sleep(0.04)
+    return {"text": "ok"}
 
 
 MODS = {"ctrl": "Control_L", "control": "Control_L", "alt": "Alt_L", "shift": "Shift_L", "win": "Super_L", "windows": "Super_L",
@@ -199,12 +240,12 @@ def press_key(a):
         codes.append(kc)
     for kc in codes: X["t"].XTestFakeKeyEvent(X["d"], kc, 1, 0)
     for kc in reversed(codes): X["t"].XTestFakeKeyEvent(X["d"], kc, 0, 0)
-    sync(X); return {"text": "ok"}
+    overlay_send("typing"); sync(X); return {"text": "ok"}
 
 
 def type_text(a):
     """Type any Unicode: park each character's keysym on a spare keycode, press it, restore the keymap (what xdotool does)."""
-    X = xlib(); x11, d = X["x"], X["d"]
+    X = xlib(); x11, d = X["x"], X["d"]; overlay_send("typing")
     lo, hi, per = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     x11.XDisplayKeycodes(d, ctypes.byref(lo), ctypes.byref(hi))
     m = x11.XGetKeyboardMapping(d, lo.value, hi.value - lo.value + 1, ctypes.byref(per))
@@ -468,73 +509,242 @@ def mcp_stop(a):
 
 
 # ---- "remote control" overlay: glowing screen edges + a label on top (like Codex) ----------------------
-OVERLAY = r'''
-import os, sys, math
+OVERLAY = r'''import os, sys, math, time
 from array import array
+from collections import deque
 import gi, cairo
 gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib
-label, ppid = sys.argv[1], int(sys.argv[2])
-R, G, B = 0x4C / 255, 0x8D / 255, 0xFF / 255
-wins = []
-def make(mon):                       # one overlay window per monitor: every screen the helper can see is marked
-    g = mon.get_geometry()
-    W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
-    # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an override-redirect
-    # overlay to its own panel / tray (clock, tray icons, ...), whatever the X input shape says; it does for this window type.
-    w = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
-    w.set_decorated(False); w.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION); w.set_skip_taskbar_hint(True); w.set_skip_pager_hint(True); w.stick()
-    w.set_app_paintable(True)
-    vis = w.get_screen().get_rgba_visual()
-    if vis: w.set_visual(vis)
-    w.set_default_size(W, H); w.move(g.x, g.y); w.set_keep_above(True); w.set_accept_focus(False)
-    # Glow bitmap: alpha of every pixel is a fade of its distance to the NEAREST screen edge. No strips, so nothing can overlap or leave a gap.
-    S = 70
-    def fade(d):                                     # 0.59 at the edge, 0.18 at 35% of the depth, 0 at the depth
-        t = (d + 0.5) / S
+
+label, ppid, lost_label = sys.argv[1], int(sys.argv[2]), (sys.argv[3] if len(sys.argv) > 3 else "Connection lost")
+BLUE, ORANGE, VIOLET = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0)
+disp = Gdk.Display.get_default()
+scr = disp.get_default_screen()
+if not scr.is_composited() or scr.get_rgba_visual() is None:
+    sys.exit(0)                      # without compositing transparent windows would be opaque black boxes: show nothing
+state = "ok"                         # ok | lost  (connection to the relay)
+S_DEPTH = 70                         # glow depth in px
+
+def col(): return ORANGE if state == "lost" else BLUE
+
+def new_window(w, h, x, y):
+    # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an
+    # override-redirect overlay to its own panel / tray, whatever the X input shape says; it does for this window type.
+    win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    win.set_decorated(False); win.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+    win.set_skip_taskbar_hint(True); win.set_skip_pager_hint(True); win.stick()
+    win.set_app_paintable(True); win.set_visual(scr.get_rgba_visual())
+    win.set_default_size(w, h); win.move(x, y); win.set_keep_above(True); win.set_accept_focus(False)
+    return win
+
+def click_through(win): win.get_window().input_shape_combine_region(cairo.Region(), 0, 0)
+
+# ---- glow: alpha of every pixel is a fade of its distance to the NEAREST screen edge (no strips: nothing overlaps, no seams)
+def build_glow(W, H, rgb):
+    R, G, B = rgb
+    def fade(d):
+        t = (d + 0.5) / S_DEPTH
         return 0.59 + (0.18 - 0.59) * t / 0.35 if t <= 0.35 else 0.18 * (1 - (t - 0.35) / 0.65)
-    prof = [(int(255 * fade(d)) << 24) | (int(R * 255 * fade(d)) << 16) | (int(G * 255 * fade(d)) << 8) | int(B * 255 * fade(d)) for d in range(S)]
-    px = array("I", bytes(4 * W * H))                # premultiplied ARGB32
+    prof = [(int(255 * fade(d)) << 24) | (int(R * 255 * fade(d)) << 16) | (int(G * 255 * fade(d)) << 8) | int(B * 255 * fade(d)) for d in range(S_DEPTH)]
+    px = array("I", bytes(4 * W * H))
     for y in range(H):
         dy = min(y, H - 1 - y)
-        if dy < S:
-            left = [prof[min(dy, x)] for x in range(S)]
-            px[y * W: y * W + S] = array("I", left)
-            px[y * W + S: (y + 1) * W - S] = array("I", [prof[dy]]) * (W - 2 * S)
-            px[(y + 1) * W - S: (y + 1) * W] = array("I", left[::-1])
+        if dy < S_DEPTH:
+            left = [prof[min(dy, x)] for x in range(S_DEPTH)]
+            px[y * W: y * W + S_DEPTH] = array("I", left)
+            px[y * W + S_DEPTH: (y + 1) * W - S_DEPTH] = array("I", [prof[dy]]) * (W - 2 * S_DEPTH)
+            px[(y + 1) * W - S_DEPTH: (y + 1) * W] = array("I", left[::-1])
         else:
-            px[y * W: y * W + S] = array("I", prof)
-            px[(y + 1) * W - S: (y + 1) * W] = array("I", prof[::-1])
-    glow = cairo.ImageSurface.create_for_data(px, cairo.FORMAT_ARGB32, W, H, W * 4)
+            px[y * W: y * W + S_DEPTH] = array("I", prof)
+            px[(y + 1) * W - S_DEPTH: (y + 1) * W] = array("I", prof[::-1])
+    return cairo.ImageSurface.create_for_data(px, cairo.FORMAT_ARGB32, W, H, W * 4), px
+
+glows, pills = [], []
+tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
+tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); tmp.set_font_size(15)
+PILL_W = int(max(tmp.text_extents(label).x_advance, tmp.text_extents(lost_label).x_advance)) + 58
+
+def make_monitor(mon):
+    g = mon.get_geometry()
+    W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
+    w = new_window(W, H, g.x, g.y)
+    cache = {}
+    def surf():
+        if state not in cache: cache[state] = build_glow(W, H, col())
+        return cache[state][0]
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(glow, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
+    w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
+    # the label is its own small window: it pulses without repainting the full-screen glow
+    pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
+    def pdraw(_, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+        r_, g_, b_ = col(); lost = state == "lost"; text = lost_label if lost else label
+        pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
+        ph, rr = 34, 17; x0, y0 = (PILL_W - (PILL_W - 4)) / 2, 1
+        w_ = PILL_W - 4
+        cr.new_sub_path(); cr.arc(x0 + w_ - rr, y0 + rr, rr, -math.pi / 2, math.pi / 2); cr.arc(x0 + rr, y0 + rr, rr, math.pi / 2, 3 * math.pi / 2); cr.close_path()
+        cr.set_source_rgba(0.06, 0.09, 0.14, 0.9); cr.fill_preserve(); cr.set_source_rgba(r_, g_, b_, 0.95); cr.set_line_width(1.5); cr.stroke()
+        cr.arc(x0 + 20, y0 + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, pulse); cr.fill()
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
-        tw = cr.text_extents(label).x_advance; pw, ph = tw + 54, 34; px, py, r = (W - pw) / 2, 12, 17
-        cr.new_sub_path(); cr.arc(px + pw - r, py + r, r, -math.pi / 2, math.pi / 2); cr.arc(px + r, py + r, r, math.pi / 2, 3 * math.pi / 2); cr.close_path()
-        cr.set_source_rgba(0.06, 0.09, 0.14, 0.88); cr.fill_preserve(); cr.set_source_rgba(R, G, B, 0.9); cr.set_line_width(1.5); cr.stroke()
-        cr.arc(px + 20, py + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(R, G, B, 1); cr.fill()
-        cr.set_source_rgba(1, 1, 1, 1); cr.move_to(px + 34, py + ph / 2 + 5); cr.show_text(label)
-    w.connect("draw", draw); w.show_all()
-    w.get_window().input_shape_combine_region(cairo.Region(), 0, 0)   # clicks go straight through
-    wins.append(w)
-dsp = Gdk.Display.get_default()
-for i in range(dsp.get_n_monitors()): make(dsp.get_monitor(i))
+        cr.set_source_rgba(1, 1, 1, 1); cr.move_to(x0 + 34, y0 + ph / 2 + 5); cr.show_text(text)
+    pw.connect("draw", pdraw); pw.show_all(); click_through(pw); pills.append(pw)
+
+for i in range(disp.get_n_monitors()): make_monitor(disp.get_monitor(i))
+
+# ---- the big cursor, click ripples, drag / scroll / typing indicators
+CW = 140; HX = HY = 44               # cursor window size and where the arrow tip sits in it
+cursor = new_window(CW, CW, -500, -500)
+RW = 220
+ripple = new_window(RW, RW, -500, -500)
+last_active = 0.0; opacity = 0.0
+pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
+rip = None                            # (x, y, t0, rgb)
+trail = deque(maxlen=14)
+shown = {"cursor": False, "ripple": False}
+
+def pointer():
+    _, x, y = disp.get_default_seat().get_pointer().get_position()
+    return x, y
+
+def ease_out(p): return 1 - (1 - p) ** 3
+
+ARROW = [(0, 0), (0, 23), (5.2, 18.2), (8.8, 26.5), (12.3, 25), (8.7, 16.8), (15.6, 16.8)]
+
+def draw_cursor(_, cr):
+    cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+    now = time.monotonic(); r_, g_, b_ = col(); px, py = pointer()
+    for (t0, x, y) in trail:                             # soft comet tail while moving
+        age = now - t0
+        if 0 <= age < 0.3:
+            cr.arc(HX + x - px + 3, HY + y - py + 5, 6 * (1 - age / 0.3) + 1, 0, 2 * math.pi)
+            cr.set_source_rgba(r_, g_, b_, 0.32 * (1 - age / 0.3)); cr.fill()
+    pa = now - pressed_t
+    s = 1.4 * (1 - 0.16 * math.sin(math.pi * pa / 0.2)) if 0 <= pa < 0.2 else 1.4
+    if dragging: s = 1.4 * 0.9
+    if dragging:                                          # grabbing: a pulsing ring around the tip
+        rr = 22 + 3 * math.sin(now * 8)
+        cr.arc(HX, HY, rr, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, 0.18); cr.fill_preserve()
+        cr.set_source_rgba(r_, g_, b_, 0.85); cr.set_line_width(2.4); cr.stroke()
+    cr.save(); cr.translate(HX, HY); cr.scale(s, s)
+    cr.move_to(*ARROW[0])
+    for p in ARROW[1:]: cr.line_to(*p)
+    cr.close_path()
+    for lw, a in ((9, 0.10), (6, 0.16), (3.5, 0.28)):    # glow
+        cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.stroke_preserve()
+    cr.set_source_rgba(1, 1, 1, 1); cr.fill_preserve()
+    cr.set_source_rgba(0.05, 0.1, 0.18, 0.95); cr.set_line_width(1.6); cr.stroke(); cr.restore()
+    sa = now - scroll_t
+    if scroll_dir and 0 <= sa < 0.7:                      # scrolling: chevrons travel in the scroll direction
+        for k in range(3):
+            q = ((sa / 0.7) + k / 3.0) % 1.0
+            yy = HY + 26 + scroll_dir * (6 + 26 * q) + (-26 if scroll_dir < 0 else 0)
+            cr.set_source_rgba(r_, g_, b_, 0.9 * (1 - q)); cr.set_line_width(3); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            cr.move_to(HX + 34, yy - 4 * scroll_dir); cr.line_to(HX + 41, yy + 3 * scroll_dir); cr.line_to(HX + 48, yy - 4 * scroll_dir); cr.stroke()
+    ta = now - typing_t
+    if 0 <= ta < 1.6:                                     # typing: three pulsing dots
+        cr.rectangle(0, 0, 0, 0)
+        for k in range(3):
+            a = 0.35 + 0.65 * max(0, math.sin(ta * 9 - k * 0.9))
+            cr.arc(HX + 30 + k * 9, HY + 40, 3.2, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, a); cr.fill()
+
+def draw_ripple(_, cr):
+    cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+    if not rip: return
+    now = time.monotonic(); x, y, t0, (r_, g_, b_) = rip
+    for delay, base in ((0.0, 8), (0.16, 4)):             # two rings, the second one follows a moment later
+        p = (now - t0 - delay) / 0.6
+        if 0 <= p <= 1:
+            rad = base + 72 * ease_out(p)
+            cr.arc(RW / 2, RW / 2, rad, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, 0.12 * (1 - p)); cr.fill_preserve()
+            cr.set_source_rgba(r_, g_, b_, 0.9 * (1 - p) ** 1.3); cr.set_line_width(3.4 * (1 - p) + 1); cr.stroke()
+    p0 = (now - t0) / 0.3
+    if 0 <= p0 <= 1:
+        cr.arc(RW / 2, RW / 2, 9 * (1 - p0) + 2, 0, 2 * math.pi); cr.set_source_rgba(1, 1, 1, 0.9 * (1 - p0)); cr.fill()
+
+cursor.connect("draw", draw_cursor); ripple.connect("draw", draw_ripple)
+
+def show(win, name):
+    if not shown[name]: win.show_all(); click_through(win); shown[name] = True
+def hide(win, name):
+    if shown[name]: win.hide(); shown[name] = False
+
 def tick():
+    global opacity, rip
+    now = time.monotonic(); px, py = pointer()
+    if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
+    target = 1.0 if (now - last_active < 3.0 or dragging) else 0.0
+    opacity += (target - opacity) * 0.22
+    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
+    else:
+        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.set_opacity(min(1.0, opacity)); cursor.get_window().raise_(); cursor.queue_draw()
+    if rip and now - rip[2] > 0.9: rip = None
+    if rip:
+        show(ripple, "ripple"); ripple.move(int(rip[0] - RW / 2), int(rip[1] - RW / 2)); ripple.get_window().raise_(); ripple.queue_draw()
+    else: hide(ripple, "ripple")
+    return True
+
+def set_state(s):
+    global state
+    if s == state: return
+    state = s
+    for w in glows: w.queue_draw()
+    for w in pills: w.queue_draw()
+
+def on_line(line):
+    global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip
+    f = line.split(); now = time.monotonic()
+    if not f: return
+    if f[0] == "state" and len(f) > 1: set_state(f[1]); return
+    last_active = now
+    if f[0] == "click" and len(f) >= 4:
+        pressed_t = now; rip = (float(f[1]), float(f[2]), now, VIOLET if f[3] == "right" else col())
+    elif f[0] == "down": dragging = True; pressed_t = now
+    elif f[0] == "up":
+        dragging = False
+        if len(f) >= 3: rip = (float(f[1]), float(f[2]), now, col())
+    elif f[0] == "scroll" and len(f) > 1: scroll_dir = 1 if float(f[1]) > 0 else -1; scroll_t = now
+    elif f[0] == "typing": typing_t = now
+
+def on_stdin(chan, cond):
+    if cond & GLib.IO_HUP and not (cond & GLib.IO_IN): Gtk.main_quit(); return False
+    try:
+        status, line, _, _ = chan.read_line()
+        if status == GLib.IOStatus.NORMAL: on_line(line)
+        elif status == GLib.IOStatus.EOF: Gtk.main_quit(); return False
+    except Exception: pass
+    return True
+
+def watchdog():
     try: os.kill(ppid, 0)            # agent gone (window closed, crash): remove the overlay too
     except OSError: Gtk.main_quit(); return False
-    for w in wins: w.get_window().raise_()
+    for w in glows + pills: w.get_window().raise_()
     return True
-GLib.timeout_add(1500, tick)
+
+chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)
+chan.set_close_on_unref(False)
+GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
+GLib.timeout_add(16, tick)
+GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state == "lost" else None) or True)   # orange label pulses
+GLib.timeout_add(1500, watchdog)
 Gtk.main()
 '''
+
+
+def overlay_send(line):
+    """Tell the overlay about connection state and effects (click ripple, drag, scroll ...). Never raises."""
+    try:
+        if OVERLAY_PROC and OVERLAY_PROC.stdin:
+            OVERLAY_PROC.stdin.write((line + "\n").encode()); OVERLAY_PROC.stdin.flush()
+    except Exception: pass
 
 
 def overlay_start():
     global OVERLAY_PROC
     if os.environ.get("HELPER_NO_OVERLAY") or not GUI["type"]: return
     try:
-        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid())],
-                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost")],
+                                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception: pass
 
 
@@ -571,12 +781,12 @@ def post_result(res, token):
         api("/a/result", res, token, timeout=60)
 
 
-TOOLS = dict(fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
+TOOLS = dict(move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
-GUI_TOOLS = {"click", "scroll", "type_text", "press_key"}   # one X11 connection: never two at once
+GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key"}   # one X11 connection: never two at once
 GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 
 
@@ -596,34 +806,65 @@ def handle(cmd, mode, token):
     except Exception as e:  # report every failure to the operator
         res.update(ok=False, error=f"{type(e).__name__}: {e}")
     for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
-        try: post_result(res, token); break
+        try: post_result(res, TOKEN or token); break
         except urllib.error.HTTPError as e:
             if e.code in (401, 410): break
             time.sleep(1 + attempt)
         except Exception: time.sleep(1 + attempt)
 
 
+NET = {"s": "ok"}
+
+
+def net_state(st):
+    if NET["s"] == st: return
+    NET["s"] = st
+    print("[helper] " + ("connection lost, retrying ..." if st == "lost" else "connection restored"), flush=True)
+    overlay_send("state " + st)   # the overlay turns orange while the link is down
+
+
+def register(mode, resume=None):
+    body = {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode}
+    if resume: body["resume"] = resume   # the server may have forgotten us (restart, long outage): ask for the same code back
+    _, reg = api("/a/register", body, timeout=20)
+    return reg
+
+
 def main():
+    global TOKEN
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))  # run cleanup()
     find_gui()
     mode = os.environ.get("HELPER_MODE")
     if mode not in ("ask", "full"):
         mode = "full" if input(t("mode")).strip() == "2" else "ask"
-    _, reg = api("/a/register", {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode})
-    token = reg["token"]
-    global TOKEN; TOKEN = token
-    print(f"\n  {t('banner')}  {reg['code']}\n  {t('tell')}\n", flush=True)
+    reg = register(mode); token = TOKEN = reg["token"]; code = reg["code"]
+    print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
     overlay_start()
     pool = ThreadPoolExecutor(max_workers=8)
+    fails, delay = 0, 1.0
     try:
         while True:
+            failed = False
             try:
                 status, cmd = api("/a/poll", token=token, timeout=40)
             except urllib.error.HTTPError as e:
-                if e.code in (401, 410): print("session closed (ended by the helper, or the helper server was reset: run the command again)"); return
-                time.sleep(3); continue
-            except (urllib.error.URLError, OSError, TimeoutError):
-                time.sleep(3); continue
+                status = cmd = None
+                if e.code == 410: print("session closed (ended by the helper)"); return
+                if e.code == 401:   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
+                    try:
+                        reg = register(mode, code); token = TOKEN = reg["token"]
+                        print(f"[helper] registered again, session code: {reg['code']}", flush=True)
+                        code = reg["code"]; fails, delay = 0, 1.0; net_state("ok"); continue
+                    except Exception: pass
+                failed = True
+            except Exception:   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying
+                status = cmd = None; failed = True
+            if failed:
+                fails += 1
+                if fails >= 2: net_state("lost")
+                time.sleep(min(delay, 10.0) * (0.8 + 0.4 * random.random())); delay *= 1.7
+                continue
+            fails, delay = 0, 1.0; net_state("ok")
             if status != 200 or not cmd: continue
             if cmd["tool"] == "bye": print("session closed"); return
             pool.submit(handle, cmd, mode, token)
@@ -632,7 +873,7 @@ def main():
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         cleanup()
-        try: api("/a/bye", {}, token, timeout=5)
+        try: api("/a/bye", {}, TOKEN, timeout=5)
         except Exception: pass
 
 

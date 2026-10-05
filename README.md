@@ -42,6 +42,8 @@ The script runs in memory (Windows) or from a pipe (Linux), asks for a mode and 
 * **Full mode:** no prompts.
 * Everything the AI does is printed in the friend's console.
 * While a helper is connected, **every screen gets a soft glowing edge and a "Remote control" label on top** (like Codex). It ignores the mouse, stays on top, and disappears when the window is closed, even if the agent is killed.
+* **The AI's mouse is visible.** The pointer glides to its targets (eased, speed by distance) instead of jumping, and a big cursor with a soft glow and a comet tail follows it. Clicks send a ripple, the cursor squeezes on press; drags show a ring around the pointer; scrolling shows chevrons, typing shows pulsing dots. The cursor fades out 3 s after the last action so it does not get in your way.
+* **Connection state is visible.** Blue edge = connected. If the link breaks (internet lost, VPN switch, sleep, server restart) the edge and the label turn **orange** ("Connection lost, reconnecting...") until the agent is back.
 
 **Linux:** the agent finds the user's desktop session by itself (also when started over SSH) and drives the mouse/keyboard through X11 directly, so nothing has to be installed (`scrot`/`python3-gi`, present on most desktops, are used for screenshots and the overlay). On **Wayland** screenshots (needs `grim`/`gnome-screenshot`), commands, files and browsers work, but mouse/keyboard control does not: log in with "Ubuntu on Xorg" for that.
 
@@ -70,7 +72,7 @@ Two ways to connect:
 |------|------|
 | `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs. `read_file` returns images (renders, saved screenshots) as images |
 | `start_process` | start a program **detached** (GUI apps like Blender or Unity, servers) and keep it running |
-| `click`, `scroll`, `type_text`, `press_key` | mouse and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
+| `click`, `move`, `drag`, `scroll`, `type_text`, `press_key` | mouse (smooth glide, drag and drop) and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
 | `mcp_start`, `mcp_tools`, `mcp_call`, `mcp_stop` | run and use **other MCP servers on the friend's PC** |
 | `recipe` | verified how-tos for apps (`blender`, the generic `any-app`) |
 | `wait_job` | collect the result of a long operation (see below) |
@@ -105,6 +107,10 @@ mcp_call   server="browser" tool="browser_navigate" arguments={"url": "https://e
 * Screenshots travel as raw JPEG (no base64 inflation), big JSON output is gzipped.
 * The live viewer steps its quality up and down to keep about one frame per second, and sends nothing while the screen does not change.
 * On a slow link the AI's screenshots shrink on their own; `screenshot` takes `max_width` and `quality`, `monitor=N` crops to one screen.
+
+## Reconnecting by itself
+
+The agent never gives up on a bad connection: failed requests are retried with a growing delay (1 s to 10 s), after two failures the overlay turns orange, and when the link is back everything continues. Connections that died with an old route (VPN switched) are dropped and re-opened. A session is kept for 5 minutes after the agent was last seen; `list_sessions` shows `online` and `last_seen_s`, and a call to an offline PC fails at once with a clear message instead of hanging. If the server forgot the session (restart without `data/`, outage longer than 5 minutes) the agent registers again and asks for **the same code**, so the operator keeps using it.
 
 ## Sessions survive restarts
 

@@ -19,7 +19,8 @@ const PORT = Number(process.env.PORT || 8444);
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const RECIPES_DIR = process.env.RECIPES_DIR || path.join(here, '..', 'recipes');
 const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
-const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 90_000);
+const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 300_000);
+const ONLINE_MS = 40_000;   // an agent that has not polled for this long is shown as offline (it polls every <= 25 s)
 const POLL_MS = 25_000;
 const MAX_SESSIONS = 200;
 const MAX_PER_IP = 10;
@@ -76,6 +77,9 @@ const safeEq = (a, b) => {
 function call(code, tool, args = {}, timeoutMs = 60_000) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}". Use list_sessions.`));
+  if (Date.now() - s.lastSeen > ONLINE_MS && !s.pending.size && tool !== 'bye') {
+    return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
+  }
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'ask') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
@@ -170,6 +174,7 @@ const tools = [
     run: async () => ({
       text: JSON.stringify([...sessions].map(([code, s]) => ({
         code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
+        online: Date.now() - s.lastSeen <= ONLINE_MS, last_seen_s: Math.round((Date.now() - s.lastSeen) / 1000),
         connected_s: Math.round((Date.now() - s.created) / 1000),
       })), null, 2),
     }) },
@@ -193,6 +198,10 @@ const tools = [
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
   { name: 'click', agent: true, description: 'Move the mouse to (x,y) in screenshot coordinates and click.',
     props: { x: num('x'), y: num('y'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
+  { name: 'move', agent: true, description: 'Glide the mouse pointer to (x,y) in screenshot coordinates without clicking (hover, open menus that open on hover).',
+    props: { x: num('x'), y: num('y') }, required: ['x', 'y'] },
+  { name: 'drag', agent: true, description: 'Drag with the mouse: press at (x,y), glide to (x2,y2) with the button held, release. Coordinates are screenshot pixels.',
+    props: { x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] } }, required: ['x', 'y', 'x2', 'y2'] },
   { name: 'scroll', agent: true, description: 'Scroll the mouse wheel (positive amount = down, negative = up), optionally at (x,y) in screenshot coordinates.',
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
   { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
@@ -454,7 +463,8 @@ async function handler(req, res) {
       const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
       if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const info = JSON.parse((await body(req, 10_000)) || '{}');
-      let code; do code = newCode(); while (sessions.has(code));
+      let code = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(info.resume || '') && !sessions.has(info.resume) ? info.resume : null;   // same code after a server reset
+      if (!code) do code = newCode(); while (sessions.has(code));
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
         th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(),

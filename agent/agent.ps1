@@ -4,10 +4,10 @@ $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored a
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
-$script:TmpDirs = @(); $script:OverlayProc = $null
+$script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
 $script:ExtraPath = @()   # dirs of portable runtimes (node, uv) put in front of PATH for everything we start
 $script:Started = @()    # processes launched with start_process (listed by sysinfo, left running on exit)
 $Children = @{}   # name -> other MCP servers running on this PC
@@ -84,20 +84,57 @@ function Post-Result($res, $token) {
     } else { [void](Api '/a/result' $res $token 60) }
 }
 
+# Move the real pointer like a hand would: eased, about 60 steps/s, speed depends on the distance (the overlay cursor follows it).
+function Glide($x, $y, $dur) {
+    $p0 = [Windows.Forms.Cursor]::Position; $cx = $p0.X; $cy = $p0.Y
+    $dist = [Math]::Sqrt([Math]::Pow($x - $cx, 2) + [Math]::Pow($y - $cy, 2)); if ($dist -lt 2) { return }
+    if (-not $dur) { $dur = [Math]::Min(0.7, 0.14 + $dist * 0.00034) }
+    $n = [Math]::Max(4, [int]($dur / 0.016))
+    for ($i = 1; $i -le $n; $i++) {
+        $q = $i / $n; $k = if ($q -lt 0.5) { 4 * $q * $q * $q } else { 1 - [Math]::Pow(-2 * $q + 2, 3) / 2 }   # ease in-out cubic
+        [void][H.U]::SetCursorPos([int]($cx + ($x - $cx) * $k), [int]($cy + ($y - $cy) * $k)); [Threading.Thread]::Sleep([int](($dur / $n) * 1000))
+    }
+}
+function Target($a, $kx = 'x', $ky = 'y') { @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
+function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
+
+function Do-Move($a) { Overlay-Send 'active'; $t = Target $a; Glide $t[0] $t[1] $null; @{ text = 'ok' } }
+
 function Do-Click($a) {
-    $x = [int]($a.x * $Scale) + $script:OriginX; $y = [int]($a.y * $Scale) + $script:OriginY
-    [void][H.U]::SetCursorPos($x, $y)
-    $btn = if ($a.button) { $a.button } else { 'left' }
-    $down, $up = switch ($btn) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } }
+    $t = Target $a; $btn = if ($a.button) { $a.button } else { 'left' }; $down, $up = Btn $btn
+    Overlay-Send 'active'; Glide $t[0] $t[1] $null; Start-Sleep -Milliseconds 50
     $n = if ($a.double) { 2 } else { 1 }
     1..$n | ForEach-Object {
-        [H.U]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); [H.U]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero)
-        Start-Sleep -Milliseconds 40
+        Overlay-Send "click $($t[0]) $($t[1]) $btn"
+        [H.U]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
+        [H.U]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100
     }
     @{ text = 'ok' }
 }
 
+# Press at (x,y), glide to (x2,y2) with the button held, release (moving windows, selecting, sliders ...).
+function Do-Drag($a) {
+    $t1 = Target $a; $t2 = Target $a 'x2' 'y2'; $btn = if ($a.button) { $a.button } else { 'left' }; $down, $up = Btn $btn
+    Overlay-Send 'active'; Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 60
+    [H.U]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "down $($t1[0]) $($t1[1])"; Start-Sleep -Milliseconds 120
+    $d = [Math]::Sqrt([Math]::Pow($t2[0] - $t1[0], 2) + [Math]::Pow($t2[1] - $t1[1], 2))
+    Glide $t2[0] $t2[1] ([Math]::Min(1.4, 0.3 + $d * 0.0007)); Start-Sleep -Milliseconds 100
+    [H.U]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "up $($t2[0]) $($t2[1])"
+    @{ text = 'ok' }
+}
+
+function Do-Scroll($a) {
+    Overlay-Send 'active'
+    if ($null -ne $a.x -and $null -ne $a.y) { $t = Target $a; Glide $t[0] $t[1] $null }
+    $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
+    Overlay-Send "scroll $n"
+    $one = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * [Math]::Sign($n))), 0)
+    1..[Math]::Abs($n) | ForEach-Object { [H.U]::mouse_event(0x0800, 0, 0, $one, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40 }
+    @{ text = 'ok' }
+}
+
 function Do-TypeText($a) {
+    Overlay-Send 'typing'
     # SendKeys treats + ^ % ~ ( ) { } [ ] specially: wrap each in braces
     $esc = [regex]::Replace($a.text, '[+^%~(){}\[\]]', '{$0}')
     $esc = $esc -replace "`r?`n", '{ENTER}'
@@ -110,6 +147,7 @@ $Vk = @{ ctrl = 0x11; control = 0x11; alt = 0x12; shift = 0x10; win = 0x5B; wind
     pageup = 0x21; pagedown = 0x22; left = 0x25; up = 0x26; right = 0x27; down = 0x28 }
 1..12 | ForEach-Object { $Vk["f$_"] = 0x6F + $_ }
 function Do-PressKey($a) {
+    Overlay-Send 'typing'
     $codes = foreach ($k in $a.keys.ToLower().Split('+')) {
         if ($Vk.ContainsKey($k)) { [byte]$Vk[$k] }
         elseif ($k.Length -eq 1) { [byte][char]$k.ToUpper() }
@@ -204,14 +242,6 @@ function Do-SysInfo($a) {
         monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) }); boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name; node = (& { try { (& node -v 2>$null) } catch { $null } }); uv = (& { try { (& uv --version 2>$null) } catch { $null } })
         started = @($script:Started | ForEach-Object { '{0} running={1}' -f $_.Id, (-not $_.HasExited) })
     } | ConvertTo-Json) }
-}
-
-function Do-Scroll($a) {
-    if ($null -ne $a.x -and $null -ne $a.y) { [void][H.U]::SetCursorPos([int]($a.x * $Scale) + $script:OriginX, [int]($a.y * $Scale) + $script:OriginY) }
-    $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
-    $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * $n)), 0)
-    [H.U]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
-    @{ text = 'ok' }
 }
 
 # Launch a program detached (GUI apps like Blender/Unity, servers) and return at once; it keeps running after this call.
@@ -383,68 +413,217 @@ $OverlayScript = @'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
 [void][O.W]::SetProcessDPIAware()
-Add-Type -Namespace O -Name Glow -MemberDefinition @"
-public static byte[] Make(int w, int h, int s, int r, int g, int b) {
-    var px = new byte[w * h * 4]; var prof = new double[s];
-    for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; prof[d] = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); }
-    for (int y = 0; y < h; y++) { int dy = Math.Min(y, h - 1 - y);
+Add-Type -TypeDefinition @"
+using System; using System.Collections.Concurrent; using System.Threading;
+namespace O {
+  public static class Glow {
+    // alpha of every pixel is a fade of its distance to the NEAREST screen edge: no strips, nothing overlaps, no seams
+    public static byte[] Make(int w, int h, int s, int r, int g, int b) {
+      var px = new byte[w * h * 4]; var prof = new double[s];
+      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; prof[d] = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); }
+      for (int y = 0; y < h; y++) { int dy = Math.Min(y, h - 1 - y);
         for (int x = 0; x < w; x++) { int d = Math.Min(dy, Math.Min(x, w - 1 - x)); if (d >= s) continue;
-            double a = prof[d]; int i = (y * w + x) * 4; px[i] = (byte)(b * a); px[i + 1] = (byte)(g * a); px[i + 2] = (byte)(r * a); px[i + 3] = (byte)(255 * a); } }
-    return px;
+          double a = prof[d]; int i = (y * w + x) * 4; px[i] = (byte)(b * a); px[i + 1] = (byte)(g * a); px[i + 2] = (byte)(r * a); px[i + 3] = (byte)(255 * a); } }
+      return px;
+    }
+  }
+  public static class Pump {   // commands from the agent arrive on stdin, one per line
+    public static ConcurrentQueue<string> Q = new ConcurrentQueue<string>();
+    public static volatile bool Eof;
+    public static void Start() { var t = new Thread(() => { try { string l; while ((l = Console.In.ReadLine()) != null) Q.Enqueue(l); } catch { } Eof = true; }); t.IsBackground = true; t.Start(); }
+  }
 }
 "@
-$label = $env:HM_LABEL; $ppid = [int]$env:HM_PPID
+[O.Pump]::Start()
+$label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
-function Col($a) { [Windows.Media.Color]::FromArgb($a, 76, 141, 255) }
-$wins = @()
+$script:state = 'ok'
+function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
+$BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255
+function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
+function Cur() { if ($script:state -eq 'lost') { $ORANGE } else { $BLUE } }
+
+function New-Win($x, $y, $w, $h) {
+    $win = New-Object Windows.Window
+    $win.WindowStyle = 'None'; $win.ResizeMode = 'NoResize'; $win.AllowsTransparency = $true; $win.Background = [Windows.Media.Brushes]::Transparent
+    $win.Topmost = $true; $win.ShowInTaskbar = $false; $win.ShowActivated = $false; $win.WindowStartupLocation = 'Manual'
+    $win.Left = $x; $win.Top = $y; $win.Width = $w; $win.Height = $h
+    $win
+}
+function Click-Through($win) {   # click-through, no focus, hidden from Alt+Tab
+    $h = (New-Object Windows.Interop.WindowInteropHelper $win).Handle
+    [void][O.W]::SetWindowLong($h, -20, ([O.W]::GetWindowLong($h, -20) -bor 0x20 -bor 0x80 -bor 0x08000000))
+}
+function New-Shown($x, $y, $w, $h) { $win = New-Win $x $y $w $h; $win.Show(); Click-Through $win; $win }
+
+# ---- glow + label, one window per monitor
+$mons = @()
 foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $b = $scr.Bounds
-    $w = New-Object Windows.Window
-    $w.WindowStyle = 'None'; $w.ResizeMode = 'NoResize'; $w.AllowsTransparency = $true; $w.Background = [Windows.Media.Brushes]::Transparent
-    $w.Topmost = $true; $w.ShowInTaskbar = $false; $w.ShowActivated = $false; $w.WindowStartupLocation = 'Manual'
-    $w.Left = $b.X / $dpi; $w.Top = $b.Y / $dpi; $w.Width = $b.Width / $dpi; $w.Height = $b.Height / $dpi
+    $win = New-Win ($b.X / $dpi) ($b.Y / $dpi) ($b.Width / $dpi) ($b.Height / $dpi)
     $g = New-Object Windows.Controls.Grid
-    # Glow bitmap: alpha of every pixel is a fade of its distance to the NEAREST screen edge. No strips, so nothing can overlap or leave a gap.
-    $pw = $b.Width; $ph = $b.Height
-    $pix = [O.Glow]::Make($pw, $ph, [int](70 * $dpi), 76, 141, 255)
-    $bmp = [Windows.Media.Imaging.BitmapSource]::Create($pw, $ph, 96 * $dpi, 96 * $dpi, [Windows.Media.PixelFormats]::Pbgra32, $null, $pix, $pw * 4)
-    $bmp.Freeze()
-    $img = New-Object Windows.Controls.Image
-    $img.Source = $bmp; $img.Stretch = 'None'; $img.HorizontalAlignment = 'Left'; $img.VerticalAlignment = 'Top'
+    $img = New-Object Windows.Controls.Image; $img.Stretch = 'None'; $img.HorizontalAlignment = 'Left'; $img.VerticalAlignment = 'Top'
     [void]$g.Children.Add($img)
     $pill = New-Object Windows.Controls.Border
     $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 14, 6, 18, 6
     $pill.Margin = New-Object Windows.Thickness 0, 12, 0, 0; $pill.HorizontalAlignment = 'Center'; $pill.VerticalAlignment = 'Top'
-    $pill.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromArgb(224, 15, 23, 36))
-    $pill.BorderBrush = New-Object Windows.Media.SolidColorBrush (Col 230); $pill.BorderThickness = New-Object Windows.Thickness 1.5
+    $pill.Background = New-Object Windows.Media.SolidColorBrush (C 15 23 36 224); $pill.BorderThickness = New-Object Windows.Thickness 1.5
     $sp = New-Object Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
-    $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 9; $dot.Height = 9; $dot.VerticalAlignment = 'Center'; $dot.Fill = New-Object Windows.Media.SolidColorBrush (Col 255)
-    $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $label; $tb.Foreground = [Windows.Media.Brushes]::White; $tb.FontSize = 14
+    $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 9; $dot.Height = 9; $dot.VerticalAlignment = 'Center'
+    $tb = New-Object Windows.Controls.TextBlock; $tb.Foreground = [Windows.Media.Brushes]::White; $tb.FontSize = 14
     $tb.FontWeight = 'SemiBold'; $tb.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'; $tb.Margin = New-Object Windows.Thickness 9, 0, 0, 0
     [void]$sp.Children.Add($dot); [void]$sp.Children.Add($tb); $pill.Child = $sp; [void]$g.Children.Add($pill)
-    $w.Content = $g
-    $w.Show()
-    $h = (New-Object Windows.Interop.WindowInteropHelper $w).Handle   # click-through, no focus, hidden from Alt+Tab
-    [void][O.W]::SetWindowLong($h, -20, ([O.W]::GetWindowLong($h, -20) -bor 0x20 -bor 0x80 -bor 0x08000000))
-    $wins += $w
+    $win.Content = $g
+    $m = @{ win = $win; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
+    $win.Show(); Click-Through $win; $mons += $m
 }
+function Apply-State {
+    $c = Cur; $key = $script:state
+    foreach ($m in $mons) {
+        if (-not $m.cache.ContainsKey($key)) {
+            $px = [O.Glow]::Make($m.w, $m.h, [int](70 * $dpi), $c.R, $c.G, $c.B)
+            $bs = [Windows.Media.Imaging.BitmapSource]::Create($m.w, $m.h, 96 * $dpi, 96 * $dpi, [Windows.Media.PixelFormats]::Pbgra32, $null, $px, $m.w * 4); $bs.Freeze()
+            $m.cache[$key] = $bs
+        }
+        $m.img.Source = $m.cache[$key]
+        $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
+        $m.tb.Text = if ($script:state -eq 'lost') { $lostLabel } else { $label }
+        if ($script:state -eq 'lost') {   # the orange dot pulses while the link is down
+            $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
+            $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+            $m.dot.BeginAnimation([Windows.UIElement]::OpacityProperty, $an)
+        } else { $m.dot.BeginAnimation([Windows.UIElement]::OpacityProperty, $null); $m.dot.Opacity = 1 }
+    }
+}
+Apply-State
+
+# ---- the big cursor: arrow with glow, press animation, drag ring, typing dots, scroll chevrons, comet tail
+$CW = 140; $HX = 44; $HY = 44
+$cwin = New-Win -500 -500 $CW $CW; $cwin.Show(); Click-Through $cwin; $cwin.Hide()
+$cv = New-Object Windows.Controls.Canvas; $cwin.Content = $cv
+$trailDots = @(); 1..9 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 8; $e.Height = 8; $e.Visibility = 'Collapsed'; [void]$cv.Children.Add($e); $trailDots += $e }
+$ring = New-Object Windows.Shapes.Ellipse; $ring.Width = 46; $ring.Height = 46; $ring.StrokeThickness = 2.4; $ring.Visibility = 'Collapsed'
+[Windows.Controls.Canvas]::SetLeft($ring, $HX - 23); [Windows.Controls.Canvas]::SetTop($ring, $HY - 23); [void]$cv.Children.Add($ring)
+$arrow = New-Object Windows.Shapes.Polygon
+$pts = New-Object Windows.Media.PointCollection
+foreach ($q in @(@(0, 0), @(0, 23), @(5.2, 18.2), @(8.8, 26.5), @(12.3, 25), @(8.7, 16.8), @(15.6, 16.8))) { $pts.Add((New-Object Windows.Point ($q[0] * 1.4), ($q[1] * 1.4))) }
+$arrow.Points = $pts; $arrow.Fill = [Windows.Media.Brushes]::White; $arrow.Stroke = Brush (C 13 26 46 242); $arrow.StrokeThickness = 1.7; $arrow.StrokeLineJoin = 'Round'
+$arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrow.RenderTransform = $arrowScale; $arrow.RenderTransformOrigin = New-Object Windows.Point 0, 0
+$glow = New-Object Windows.Media.Effects.DropShadowEffect; $glow.ShadowDepth = 0; $glow.BlurRadius = 16; $glow.Opacity = 0.9; $arrow.Effect = $glow
+[Windows.Controls.Canvas]::SetLeft($arrow, $HX); [Windows.Controls.Canvas]::SetTop($arrow, $HY); [void]$cv.Children.Add($arrow)
+$typeDots = @(); 0..2 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 6.4; $e.Height = 6.4; $e.Visibility = 'Collapsed'
+    [Windows.Controls.Canvas]::SetLeft($e, $HX + 27 + $_ * 9); [Windows.Controls.Canvas]::SetTop($e, $HY + 37); [void]$cv.Children.Add($e); $typeDots += $e }
+$chev = @(); 0..2 | ForEach-Object { $l = New-Object Windows.Shapes.Polyline; $l.StrokeThickness = 3; $l.StrokeStartLineCap = 'Round'; $l.StrokeEndLineCap = 'Round'; $l.StrokeLineJoin = 'Round'
+    $l.Points = New-Object Windows.Media.PointCollection; foreach ($q in @(@(0, 0), @(7, 7), @(14, 0))) { $l.Points.Add((New-Object Windows.Point $q[0], $q[1])) }
+    $l.Visibility = 'Collapsed'; [void]$cv.Children.Add($l); $chev += $l }
+
+# ---- click ripple
+$RW = 220
+$rwin = New-Win -500 -500 $RW $RW; $rwin.Show(); Click-Through $rwin; $rwin.Hide()
+$rc = New-Object Windows.Controls.Canvas; $rwin.Content = $rc
+$rings = @(); 0..1 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Visibility = 'Collapsed'; [void]$rc.Children.Add($e); $rings += $e }
+$rdot = New-Object Windows.Shapes.Ellipse; $rdot.Fill = [Windows.Media.Brushes]::White; $rdot.Visibility = 'Collapsed'; [void]$rc.Children.Add($rdot)
+function Place($e, $cx, $cy, $r) { $e.Width = 2 * $r; $e.Height = 2 * $r; [Windows.Controls.Canvas]::SetLeft($e, $cx - $r); [Windows.Controls.Canvas]::SetTop($e, $cy - $r) }
+
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
+$script:scrollDir = 0; $script:scrollT = -99.0; $script:typingT = -99.0; $script:rip = $null; $script:cursorShown = $false; $script:ripShown = $false
+$trail = New-Object System.Collections.ArrayList
+$script:lastPtr = $null
+
+function On-Line($line) {
+    $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
+    if (-not $f -or -not $f[0]) { return }
+    if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { $script:state = $f[1]; Apply-State }; return }
+    $script:lastActive = $now
+    switch ($f[0]) {
+        'click' { $script:pressedT = $now; $c = if ($f[3] -eq 'right') { $VIOLET } else { Cur }; $script:rip = @{ x = [double]$f[1]; y = [double]$f[2]; t = $now; c = $c } }
+        'down'  { $script:dragging = $true; $script:pressedT = $now }
+        'up'    { $script:dragging = $false; if ($f.Count -ge 3) { $script:rip = @{ x = [double]$f[1]; y = [double]$f[2]; t = $now; c = (Cur) } } }
+        'scroll' { $script:scrollDir = if ([double]$f[1] -gt 0) { 1 } else { -1 }; $script:scrollT = $now }
+        'typing' { $script:typingT = $now }
+    }
+}
+
 $timer = New-Object Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromSeconds(1)
+$timer.Interval = [TimeSpan]::FromMilliseconds(16)
 $timer.Add_Tick({
-    if (-not (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() }
-    else { foreach ($x in $wins) { $x.Topmost = $false; $x.Topmost = $true } }   # stay above other topmost windows
+    $line = $null
+    while ([O.Pump]::Q.TryDequeue([ref]$line)) { On-Line $line }
+    if ([O.Pump]::Eof) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown(); return }
+    $now = $clock.Elapsed.TotalSeconds; $p = [Windows.Forms.Cursor]::Position; $c = Cur
+    if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
+    $active = (($now - $script:lastActive) -lt 3.0) -or $script:dragging
+    $tgt = if ($active) { 1.0 } else { 0.0 }
+    $script:opacity += ($tgt - $script:opacity) * 0.22
+    if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
+    else {
+        if (-not $script:cursorShown) { $cwin.Show(); $script:cursorShown = $true }
+        $cwin.Left = $p.X / $dpi - $HX; $cwin.Top = $p.Y / $dpi - $HY; $cwin.Opacity = [Math]::Min(1.0, $script:opacity)
+        $glow.Color = $c; $br = Brush $c
+        $pa = $now - $script:pressedT
+        $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
+        $arrowScale.ScaleX = $s; $arrowScale.ScaleY = $s
+        if ($script:dragging) { $ring.Visibility = 'Visible'; $ring.Stroke = $br; $ring.Fill = Brush (C $c.R $c.G $c.B 46); $rr = 23 + 3 * [Math]::Sin($now * 8); Place $ring $HX $HY $rr } else { $ring.Visibility = 'Collapsed' }
+        for ($i = 0; $i -lt $trailDots.Count; $i++) {   # comet tail
+            $e = $trailDots[$i]; $k = $trail.Count - 2 - $i
+            if ($k -ge 0 -and ($now - $trail[$k].t) -lt 0.3) {
+                $age = ($now - $trail[$k].t) / 0.3; $e.Visibility = 'Visible'; $e.Fill = Brush (C $c.R $c.G $c.B ([int](82 * (1 - $age))))
+                $e.Width = 12 * (1 - $age) + 2; $e.Height = $e.Width
+                [Windows.Controls.Canvas]::SetLeft($e, $HX + $trail[$k].x - $p.X + 3 - $e.Width / 2); [Windows.Controls.Canvas]::SetTop($e, $HY + $trail[$k].y - $p.Y + 5 - $e.Width / 2)
+            } else { $e.Visibility = 'Collapsed' }
+        }
+        $ta = $now - $script:typingT
+        for ($i = 0; $i -lt 3; $i++) { if ($ta -ge 0 -and $ta -lt 1.6) { $typeDots[$i].Visibility = 'Visible'; $typeDots[$i].Fill = Brush (C $c.R $c.G $c.B ([int](255 * (0.35 + 0.65 * [Math]::Max(0, [Math]::Sin($ta * 9 - $i * 0.9)))))) } else { $typeDots[$i].Visibility = 'Collapsed' } }
+        $sa = $now - $script:scrollT
+        for ($i = 0; $i -lt 3; $i++) {
+            if ($script:scrollDir -ne 0 -and $sa -ge 0 -and $sa -lt 0.7) {
+                $q = (($sa / 0.7) + $i / 3.0) % 1.0; $yy = $HY + 26 + $script:scrollDir * (6 + 26 * $q) + $(if ($script:scrollDir -lt 0) { -26 } else { 0 })
+                $chev[$i].Visibility = 'Visible'; $chev[$i].Stroke = Brush (C $c.R $c.G $c.B ([int](230 * (1 - $q))))
+                $chev[$i].RenderTransform = New-Object Windows.Media.ScaleTransform 1, $script:scrollDir
+                [Windows.Controls.Canvas]::SetLeft($chev[$i], $HX + 34); [Windows.Controls.Canvas]::SetTop($chev[$i], $yy - 3.5 * $script:scrollDir - $(if ($script:scrollDir -lt 0) { 0 } else { 0 }))
+            } else { $chev[$i].Visibility = 'Collapsed' }
+        }
+    }
+    if ($script:rip -and ($now - $script:rip.t) -gt 0.9) { $script:rip = $null }
+    if ($script:rip) {
+        $r = $script:rip; if (-not $script:ripShown) { $rwin.Show(); $script:ripShown = $true }
+        $rwin.Left = $r.x / $dpi - $RW / 2; $rwin.Top = $r.y / $dpi - $RW / 2; $rb = Brush $r.c
+        $idx = 0
+        foreach ($d in @(@(0.0, 8), @(0.16, 4))) {
+            $pp = ($now - $r.t - $d[0]) / 0.6; $e = $rings[$idx]; $idx++
+            if ($pp -ge 0 -and $pp -le 1) {
+                $e.Visibility = 'Visible'; Place $e ($RW / 2) ($RW / 2) ($d[1] + 72 * (1 - [Math]::Pow(1 - $pp, 3)))
+                $e.Stroke = Brush (C $r.c.R $r.c.G $r.c.B ([int](230 * [Math]::Pow(1 - $pp, 1.3)))); $e.StrokeThickness = 3.4 * (1 - $pp) + 1; $e.Fill = Brush (C $r.c.R $r.c.G $r.c.B ([int](30 * (1 - $pp))))
+            } else { $e.Visibility = 'Collapsed' }
+        }
+        $p0 = ($now - $r.t) / 0.3
+        if ($p0 -ge 0 -and $p0 -le 1) { $rdot.Visibility = 'Visible'; Place $rdot ($RW / 2) ($RW / 2) (9 * (1 - $p0) + 2); $rdot.Opacity = 1 - $p0 } else { $rdot.Visibility = 'Collapsed' }
+    } elseif ($script:ripShown) { $rwin.Hide(); $script:ripShown = $false }
 })
 $timer.Start()
+$wd = New-Object Windows.Threading.DispatcherTimer
+$wd.Interval = [TimeSpan]::FromSeconds(1.5)
+$wd.Add_Tick({
+    if (-not (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() }   # agent gone: remove the overlay too
+    else { foreach ($m in $mons) { $m.win.Topmost = $false; $m.win.Topmost = $true } }   # stay above other topmost windows
+})
+$wd.Start()
 [Windows.Threading.Dispatcher]::Run()
 '@
 function Start-Overlay {
     if ($env:HELPER_NO_OVERLAY) { return }
     try {
         $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
-        $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($OverlayScript))
-        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        # the script is too long for -EncodedCommand (the command line limit is ~32k chars): run it from a temp file (UTF-8 with BOM for PS 5.1)
+        $file = Join-Path $env:TEMP ('helpermcp-overlay-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+        [IO.File]::WriteAllText($file, $OverlayScript, (New-Object Text.UTF8Encoding $true)); $script:TmpDirs += $file
+        $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $file + '"'
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
         $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
+        $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
+        $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
     } catch { }   # a missing overlay must never block the help session
 }
 
@@ -470,7 +649,7 @@ function Process-Command($cmd) {
             $yn = Read-Host (T 'Разрешить? [y/N]' 'Allow? [y/N]')
             if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
         }
-        $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
+        $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
             fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
@@ -493,6 +672,23 @@ function Pump-Light {
     if ($LightTools -contains $cmd.tool) { Process-Command $cmd } else { [void]$script:Deferred.Add($cmd) }
 }
 
+# Tell the overlay about connection state and effects (click ripple, drag, scroll ...). Never throws.
+function Overlay-Send($line) { try { if ($script:OverlayIn) { $script:OverlayIn.WriteLine($line) } } catch { } }
+
+$script:Net = 'ok'
+function Net-State($st) {
+    if ($script:Net -eq $st) { return }
+    $script:Net = $st
+    Write-Host ("[helper] " + $(if ($st -eq 'lost') { 'connection lost, retrying ...' } else { 'connection restored' }))
+    Overlay-Send "state $st"   # the overlay turns orange while the link is down
+}
+
+function Register-Agent($mode, $resume) {
+    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode }
+    if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
+    (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
+}
+
 function Start-Helper {
     $mode = $env:HELPER_MODE
     if ($mode -ne 'ask' -and $mode -ne 'full') {
@@ -500,24 +696,40 @@ function Start-Helper {
         $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
     }
     $script:Mode = $mode
-    $osn = (Get-CimInstance Win32_OperatingSystem).Caption
-    $r = (Api '/a/register' @{ os = $osn; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode }).Content | ConvertFrom-Json
-    $token = $r.token; $script:Token = $token
+    $r = Register-Agent $mode $null
+    $token = $r.token; $script:Token = $token; $code = $r.code
     Write-Host ''
-    Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $r.code) -ForegroundColor Yellow
+    Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $code) -ForegroundColor Yellow
     Write-Host ("  " + (T 'Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.' 'Give this code to your helper. Close this window or press Ctrl+C to stop.'))
     Write-Host ''
     Start-Overlay
+    $fails = 0; $delay = 1.0
     try {
         while ($true) {
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
             else {
-                try { $resp = Api '/a/poll' $null $token 40 }
+                $failed = $false; $resp = $null
+                try { $resp = Api '/a/poll' $null $script:Token 40 }
                 catch {
-                    $code = [int]$_.Exception.Response.StatusCode
-                    if ($code -eq 401 -or $code -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её или сервер помощи перезапущен): запусти команду заново' 'session closed (ended by the helper, or the helper server was reset: run the command again)'); return }
-                    Start-Sleep 3; continue
+                    $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }
+                    if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); return }
+                    if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
+                        try {
+                            $r = Register-Agent $mode $code; $script:Token = $r.token; $code = $r.code
+                            Write-Host "[helper] registered again, session code: $code"
+                            $fails = 0; $delay = 1.0; Net-State 'ok'; continue
+                        } catch { }
+                    }
+                    $failed = $true
                 }
+                if ($failed) {   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying with backoff
+                    $fails++
+                    if ($fails -ge 2) { Net-State 'lost' }
+                    try { [Net.ServicePointManager]::FindServicePoint([Uri]$RELAY).CloseConnectionGroup('') | Out-Null } catch { }   # drop connections that died with the old route
+                    Start-Sleep -Milliseconds ([int]([Math]::Min($delay, 10.0) * 1000 * (0.8 + 0.4 * (Get-Random -Maximum 1.0))))
+                    $delay = $delay * 1.7; continue
+                }
+                $fails = 0; $delay = 1.0; Net-State 'ok'
                 if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
                 $cmd = $resp.Content | ConvertFrom-Json
             }
@@ -526,7 +738,7 @@ function Start-Helper {
         }
     } finally {
         Cleanup-Children
-        try { [void](Api '/a/bye' @{} $token 5) } catch { }
+        try { [void](Api '/a/bye' @{} $script:Token 5) } catch { }
     }
 }
 Start-Helper

@@ -83,6 +83,7 @@ class HelperService : AccessibilityService() {
         token = reg.getString("token"); code = reg.getString("code")
         main.post { try { (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("code", code)) } catch (_: Throwable) { } }
         fx.show(); fx.setState("wait"); phase = "wait"; Sound.play("ok")
+        Thread { loadPointer(relay) }.start()
         var fails = 0; var delay = 1000L; var lost = false
         try {
             while (!ended) {
@@ -102,6 +103,31 @@ class HelperService : AccessibilityService() {
                 }
             }
         } finally { try { Net.req(relay, "POST", "/a/bye", token, "{}".toByteArray(), timeoutMs = 5000) } catch (_: Throwable) { } }
+    }
+
+    /** the pointer of the operator's cursor pack (data/cursor/pointer.cur on the relay): the AI's pointer looks the same on every device */
+    private fun loadPointer(relay: String) {
+        try {
+            val (st, b) = Net.req(relay, "GET", "/cursor/pointer.cur", null, timeoutMs = 8000)
+            if (st != 200 || b.size < 30) return
+            fun u16(o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+            fun u32(o: Int) = u16(o) or (u16(o + 2) shl 16)
+            val n = u16(4); var best = -1; var bw = 0
+            for (i in 0 until n) { val o = 6 + 16 * i; val w = (b[o].toInt() and 0xFF).let { if (it == 0) 256 else it }; if (best < 0 || (w <= 48 && w > bw)) { best = o; bw = w } }
+            val w = bw; val h = (b[best + 1].toInt() and 0xFF).let { if (it == 0) 256 else it }; val hx = u16(best + 4); val hy = u16(best + 6); val off = u32(best + 12)
+            val bmp: Bitmap
+            if ((b[off].toInt() and 0xFF) == 0x89) { bmp = android.graphics.BitmapFactory.decodeByteArray(b, off, b.size - off) ?: return }
+            else {
+                if (u16(off + 14) != 32) return
+                val hs = u32(off); val px = IntArray(w * h)
+                for (y in 0 until h) for (x in 0 until w) {
+                    val o = off + hs + ((h - 1 - y) * w + x) * 4
+                    px[y * w + x] = ((b[o + 3].toInt() and 0xFF) shl 24) or ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 1].toInt() and 0xFF) shl 8) or (b[o].toInt() and 0xFF)
+                }
+                bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+            }
+            fx.setPointer(bmp, hx, hy)
+        } catch (_: Throwable) { }
     }
 
     private fun handle(relay: String, token: String, cmd: JSONObject) {

@@ -43,6 +43,7 @@ class Ripple(val x: Float, val y: Float, val t0: Long, val color: Int)
 class FxView(ctx: Context) : View(ctx) {
     private val d = resources.displayMetrics.density
     var glow: Bitmap? = null
+    var pointer: Bitmap? = null; var hotX = 0; var hotY = 0   // the cursor pack's pointer (the same one the PC agents use), when the relay has it
     var color = BLUE
     var cx = -1f; var cy = -1f
     var lean = 0f
@@ -86,13 +87,21 @@ class FxView(ctx: Context) : View(ctx) {
             if (dragging) { paint.style = Paint.Style.FILL; paint.color = withAlpha(color, 0.18f * alpha); c.drawCircle(0f, 0f, 22 * d, paint); paint.style = Paint.Style.STROKE; paint.strokeWidth = 2.4f * d; paint.color = withAlpha(color, 0.85f * alpha); c.drawCircle(0f, 0f, 22 * d, paint) }
             val pa = (now - pressedAt) / 200f
             val s = if (dragging) 0.9f else if (pa in 0f..1f) 1f - 0.16f * Math.sin(PI * pa).toFloat() else 1f
-            c.rotate(Math.toDegrees(lean.toDouble()).toFloat()); c.scale(k * s, k * s)
+            c.rotate(Math.toDegrees(lean.toDouble()).toFloat())
+            val pb = pointer
+            if (pb != null) {
+                val kk = d * 1.2f * s; paint.alpha = (alpha * 255).toInt(); paint.isFilterBitmap = true
+                c.save(); c.scale(kk, kk); c.drawBitmap(pb, -hotX.toFloat(), -hotY.toFloat(), paint); c.restore(); paint.alpha = 255
+                c.restore()
+            } else {
+            c.scale(k * s, k * s)
             paint.style = Paint.Style.STROKE; paint.strokeJoin = Paint.Join.ROUND
             paint.strokeWidth = 4.2f; paint.color = withAlpha(Color.BLACK, 0.12f * alpha); c.save(); c.translate(1.2f, 2.4f); c.drawPath(arrow, paint); c.restore()
             paint.strokeWidth = 3.4f; paint.color = withAlpha(Color.WHITE, alpha); c.drawPath(arrow, paint)
             paint.style = Paint.Style.FILL; paint.shader = LinearGradient(0f, 0f, 0f, 27f, withAlpha(Color.WHITE, alpha), withAlpha(0xFFD1E3FF.toInt(), alpha), Shader.TileMode.CLAMP); c.drawPath(arrow, paint); paint.shader = null
             paint.style = Paint.Style.STROKE; paint.strokeWidth = 1.1f; paint.color = withAlpha(color, 0.65f * alpha); c.drawPath(arrow, paint)
             c.restore()
+            }
             if (now < typingUntil) {   // typing: three pulsing dots
                 val ta = (typingUntil - now) / 1000f
                 for (i in 0..2) { paint.style = Paint.Style.FILL; paint.color = withAlpha(color, 0.35f + 0.65f * max(0f, Math.sin(ta * 9 - i * 0.9).toFloat())); c.drawCircle(cx + (30 + i * 9) * d, cy + 40 * d, 3.2f * d, paint) }
@@ -135,6 +144,7 @@ class Fx(private val svc: AccessibilityService) {
         pill = p
         wm.addView(p, WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(30) })
+        pendingPointer?.let { v.pointer = it.first; v.hotX = it.second; v.hotY = it.third }
         applyState(); tick()
     }
 
@@ -186,6 +196,8 @@ class Fx(private val svc: AccessibilityService) {
         view = null; pill = null; card = null
     }
 
+    fun setPointer(b: Bitmap?, hx: Int, hy: Int) = main.post { view?.let { it.pointer = b; it.hotX = hx; it.hotY = hy; it.invalidate() }; pendingPointer = Triple(b, hx, hy) }
+    private var pendingPointer: Triple<Bitmap?, Int, Int>? = null
     fun active() = main.post { view?.let { it.lastActive = SystemClock.uptimeMillis(); it.invalidate() } }
     fun typing() = main.post { view?.let { it.typingUntil = SystemClock.uptimeMillis() + 1600; it.lastActive = SystemClock.uptimeMillis(); it.invalidate() } }
     fun press() = main.post { view?.let { it.pressedAt = SystemClock.uptimeMillis(); it.invalidate() } }

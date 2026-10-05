@@ -559,7 +559,7 @@ def build_glow(W, H, rgb):
             px[(y + 1) * W - S_DEPTH: (y + 1) * W] = array("I", prof[::-1])
     return cairo.ImageSurface.create_for_data(px, cairo.FORMAT_ARGB32, W, H, W * 4), px
 
-glows, pills = [], []
+glows, pills, strips = [], [], []
 tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
 tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); tmp.set_font_size(15)
 PILL_W = int(max(tmp.text_extents(label).x_advance, tmp.text_extents(lost_label).x_advance)) + 58
@@ -569,17 +569,28 @@ def make_monitor(mon):
     W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
     w = new_window(W, H, g.x, g.y)
     cache = {}
-    # GNOME Shell draws its panel / dock above every normal window, so a glow at the very screen edge would vanish under it and look cut off.
-    # The glow therefore hugs the work area (the space left by the panel): the panel sits outside the light, nothing is covered.
-    wa = mon.get_workarea(); ox, oy = max(0, wa.x - g.x), max(0, wa.y - g.y)
-    gw, gh = min(W - ox, wa.width - 1 if wa.width < g.width else W), min(H - oy, wa.height - 1 if wa.height < g.height else H)
     def surf():
-        if state not in cache: cache[state] = build_glow(gw, gh, col())
+        if state not in cache: cache[state] = build_glow(W, H, col())
         return cache[state][0]
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
-        cr.set_source_surface(surf(), ox, oy); cr.paint()
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
     w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
+    # GNOME Shell draws its panel / dock above every normal window, so the glow would vanish under it. Where the panel takes space
+    # (work area smaller than the monitor) an override-redirect strip repeats the same glow right over the panel, so the light runs
+    # along the whole monitor. Shell does not let clicks through such a window, so the strip hides while the pointer is on it
+    # (see tick): the panel stays clickable, the glow only blinks out where the mouse actually is.
+    wa = mon.get_workarea(); sides = []
+    if wa.y > g.y: sides.append((0, 0, W, min(S_DEPTH, wa.y - g.y + 6)))
+    if wa.y + wa.height < g.y + g.height - 1: d = g.y + g.height - (wa.y + wa.height) + 6; d = min(S_DEPTH, d); sides.append((0, H - d, W, d))
+    if wa.x > g.x: sides.append((0, 0, min(S_DEPTH, wa.x - g.x + 6), H))
+    if wa.x + wa.width < g.x + g.width - 1: d = min(S_DEPTH, g.x + g.width - (wa.x + wa.width) + 6); sides.append((W - d, 0, d, H))
+    for (sx, sy, sw, sh) in sides:
+        sw_ = Gtk.Window(type=Gtk.WindowType.POPUP); sw_.set_app_paintable(True); sw_.set_visual(scr.get_rgba_visual())
+        sw_.set_default_size(sw, sh); sw_.move(g.x + sx, g.y + sy); sw_.set_keep_above(True); sw_.set_accept_focus(False)
+        def sdraw(_, cr, sx=sx, sy=sy):
+            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), -sx, -sy); cr.paint()
+        sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
+        strips.append([sw_, (g.x + sx - 6, g.y + sy - 6, sw + 12, sh + 12), True])
     # the label is its own small window: it pulses without repainting the full-screen glow
     pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
     def pdraw(_, cr):
@@ -618,6 +629,7 @@ ARROW = [(0, 0), (0, 23), (5.2, 18.2), (8.8, 26.5), (12.3, 25), (8.7, 16.8), (15
 
 def draw_cursor(_, cr):
     cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+    cr.push_group()   # fade by painting the group with alpha (window opacity is not honoured by every compositor)
     now = time.monotonic(); r_, g_, b_ = col(); px, py = pointer()
     for (t0, x, y) in trail:                             # soft comet tail while moving
         age = now - t0
@@ -631,6 +643,9 @@ def draw_cursor(_, cr):
         rr = 22 + 3 * math.sin(now * 8)
         cr.arc(HX, HY, rr, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, 0.18); cr.fill_preserve()
         cr.set_source_rgba(r_, g_, b_, 0.85); cr.set_line_width(2.4); cr.stroke()
+    halo = cairo.RadialGradient(HX + 6, HY + 8, 2, HX + 6, HY + 8, 46)   # soft light around the pointer, like Codex
+    halo.add_color_stop_rgba(0, r_, g_, b_, 0.42); halo.add_color_stop_rgba(0.5, r_, g_, b_, 0.16); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
+    cr.set_source(halo); cr.arc(HX + 6, HY + 8, 46, 0, 2 * math.pi); cr.fill()
     cr.save(); cr.translate(HX, HY); cr.scale(s, s)
     cr.move_to(*ARROW[0])
     for p in ARROW[1:]: cr.line_to(*p)
@@ -652,6 +667,7 @@ def draw_cursor(_, cr):
         for k in range(3):
             a = 0.35 + 0.65 * max(0, math.sin(ta * 9 - k * 0.9))
             cr.arc(HX + 30 + k * 9, HY + 40, 3.2, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, a); cr.fill()
+    cr.pop_group_to_source(); cr.paint_with_alpha(max(0.0, min(1.0, opacity)))
 
 def draw_ripple(_, cr):
     cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
@@ -682,7 +698,11 @@ def tick():
     opacity += (target - opacity) * 0.22
     if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
     else:
-        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.set_opacity(min(1.0, opacity)); cursor.get_window().raise_(); cursor.queue_draw()
+        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
+    for st in strips:   # over-the-panel glow strips: out of the way while the pointer is on them
+        x, y, w_, h_ = st[1]; inside = x <= px < x + w_ and y <= py < y + h_
+        if inside and st[2]: st[0].hide(); st[2] = False
+        elif not inside and not st[2]: st[0].show_all(); click_through(st[0]); st[2] = True
     if rip and now - rip[2] > 0.9: rip = None
     if rip:
         show(ripple, "ripple"); ripple.move(int(rip[0] - RW / 2), int(rip[1] - RW / 2)); ripple.get_window().raise_(); ripple.queue_draw()
@@ -723,7 +743,8 @@ def on_stdin(chan, cond):
 def watchdog():
     try: os.kill(ppid, 0)            # agent gone (window closed, crash): remove the overlay too
     except OSError: Gtk.main_quit(); return False
-    for w in glows + pills: w.get_window().raise_()
+    for w in glows + pills:
+        if w.get_window() and w.get_visible(): w.get_window().raise_()
     return True
 
 chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)

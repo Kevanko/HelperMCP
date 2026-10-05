@@ -12,6 +12,10 @@ T = {
     "banner": ("УДАЛЁННАЯ ПОМОЩЬ. Код сессии:", "REMOTE HELP. Session code:"),
     "tell": ("Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.",
              "Give this code to your helper. Close this window or press Ctrl+C to stop."),
+    "hdr1": ("УДАЛЁННАЯ ПОМОЩЬ", "REMOTE HELP"), "hdr2": ("Код сессии:", "Session code:"), "copied": ("скопирован в буфер обмена", "copied to the clipboard"),
+    "hdr3": ("Esc — завершить сеанс в любой момент", "Esc — end the session at any time"), "hdr4": ("Скажи этот код тому, кто помогает.", "Tell this code to the person who helps you."),
+    "stopask": ("не спрашивать про", "stop asking about"),
+    "ready": ("Подключено. Жду действий.", "Connected. Waiting for actions."),
     "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ: ",
              "Mode: [1] ask before every action (recommended)  [2] full access: "),
     "allow": ("Разрешить: ", "Allow: "),
@@ -21,7 +25,7 @@ T = {
     "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "move", "drag", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -282,70 +286,205 @@ def restore_focus(w):
     except Exception: pass
 
 
-ASK_GROUP = {"click": "mouse", "move": "mouse", "drag": "mouse", "scroll": "mouse", "type_text": "keyboard", "press_key": "keyboard", "run": "commands",
+ASK_GROUP = {"click": "input", "move": "input", "drag": "input", "scroll": "input", "type_text": "input", "press_key": "input", "actions": "input", "run": "commands",
              "start_process": "commands", "write_file": "files", "fetch_file": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
-GROUP_LABEL = {"mouse": ("мышь", "mouse"), "keyboard": ("клавиатура", "keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
+GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
+KEYS = queue.Queue(); PUMP = {"on": False, "old": None}
+HDR = 5   # lines of the pinned header
+def c(code, x): return f"\033[{code}m{x}\033[0m"
 
 
-def cut(x, n): x = str(x); return x if len(x) <= n else x[:n] + "…"
+def cut(x, n): x = str(x).replace("\n", " "); return x if len(x) <= n else x[:n] + "…"
+
+
+def step_text(st):
+    """one small action as a short sentence"""
+    d = st.get("do") or ""; x, y = st.get("x"), st.get("y")
+    if d == "move": return f"подвинуть мышь к ({x}, {y})" if RU else f"move the mouse to ({x}, {y})"
+    if d == "click":
+        w = {"right": ("правый клик", "right-click"), "middle": ("средний клик", "middle-click")}.get(st.get("button"), ("нажать", "click"))[0 if RU else 1]
+        return (f"двойной клик ({x}, {y})" if RU else f"double-click ({x}, {y})") if st.get("double") else f"{w} ({x}, {y})"
+    if d == "drag": return f"перетащить ({x}, {y}) → ({st.get('x2')}, {st.get('y2')})" if RU else f"drag ({x}, {y}) → ({st.get('x2')}, {st.get('y2')})"
+    if d == "scroll": return f"прокрутить ({st.get('amount', 3)})" if RU else f"scroll ({st.get('amount', 3)})"
+    if d == "type": return 'ввести "' + cut(st.get("text", ""), 60) + '"' if RU else 'type "' + cut(st.get("text", ""), 60) + '"'
+    if d == "key": return f"нажать клавиши {st.get('keys')}" if RU else f"press {st.get('keys')}"
+    if d == "wait": return f"подождать {st.get('ms', 500)} мс" if RU else f"wait {st.get('ms', 500)} ms"
+    return d
+
+
+def steps_of(name, a):
+    """the steps of a tool call; a move right before a click on the same spot is shown as one step"""
+    if name == "actions": raw = list(a.get("steps") or [])
+    else: raw = [dict(a, do={"type_text": "type", "press_key": "key"}.get(name, name))]
+    out = []
+    for st in raw:
+        if out and out[-1].get("do") == "move" and st.get("do") == "click" and (out[-1].get("x"), out[-1].get("y")) == (st.get("x"), st.get("y")): out.pop()
+        out.append(st)
+    return out
 
 
 def describe(name, a):
-    ru = os.environ.get("LANG", "").startswith("ru")
-    d = {"click": f"клик ({a.get('x')}, {a.get('y')})" if ru else f"click ({a.get('x')}, {a.get('y')})",
-         "move": f"движение мыши к ({a.get('x')}, {a.get('y')})" if ru else f"move the mouse to ({a.get('x')}, {a.get('y')})",
-         "drag": f"перетаскивание ({a.get('x')}, {a.get('y')}) -> ({a.get('x2')}, {a.get('y2')})" if ru else f"drag ({a.get('x')}, {a.get('y')}) -> ({a.get('x2')}, {a.get('y2')})",
-         "type_text": ("ввод текста: " if ru else "type text: ") + '"' + cut(a.get("text", ""), 60) + '"', "press_key": ("клавиши: " if ru else "keys: ") + str(a.get("keys")),
-         "run": ("команда: " if ru else "command: ") + cut(a.get("command", ""), 90)}
-    return d.get(name) or f"{name} {cut(json.dumps(a, ensure_ascii=False), 90)}"
+    if name in ASK_GROUP and ASK_GROUP[name] == "input": return [step_text(st) for st in steps_of(name, a)]
+    ru = RU
+    return [{"run": ("команда: ", "command: "), "start_process": ("запустить: ", "start: "), "write_file": ("записать файл: ", "write file: "), "fetch_file": ("скопировать файл: ", "copy file: "),
+             "mcp_start": ("запустить MCP: ", "start MCP: "), "mcp_call": ("вызвать MCP: ", "call MCP: ")}.get(name, (name + " ", name + " "))[0 if ru else 1]
+            + cut(a.get("command") or a.get("path") or a.get("name") or json.dumps(a, ensure_ascii=False), 90)]
+
+
+QUIET = {"screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
+         "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP")}
+
+
+def line_for(name, a):
+    if name in QUIET: return c("2", "  · " + QUIET[name][0 if RU else 1])
+    d = describe(name, a)
+    return c("36", "  → ") + (d[0] if len(d) == 1 else (c("1", "действия:" if RU else "actions:") + "".join(f"\n      {i}. {x}" for i, x in enumerate(d, 1))))
+
+
+# ---- sounds: soft bells made on the fly (no files shipped), played by whatever the system has
+def make_wav(notes, sr=22050):
+    import struct, wave, io
+    total = max(st + du for _, st, du, _ in notes); buf = [0.0] * int(sr * (total + 0.1))
+    for f, st, du, amp in notes:
+        i0 = int(st * sr)
+        for i in range(int(du * sr)):
+            tt = i / sr; env = (1 - math.exp(-tt * 400)) * math.exp(-tt * 5.5)
+            v = amp * env * (math.sin(2 * math.pi * f * tt) + 0.28 * math.sin(2 * math.pi * 2 * f * tt) + 0.08 * math.sin(2 * math.pi * 3.01 * f * tt))
+            if i0 + i < len(buf): buf[i0 + i] += v
+    bio = io.BytesIO(); w = wave.open(bio, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
+    w.writeframes(b"".join(struct.pack("<h", max(-32000, min(32000, int(v * 22000)))) for v in buf)); w.close()
+    return bio.getvalue()
+
+
+SOUNDS = {"ask": [(784.0, 0.0, 0.55, 0.5), (1046.5, 0.16, 0.7, 0.5)], "ok": [(523.25, 0.0, 0.5, 0.4), (659.25, 0.12, 0.5, 0.4), (783.99, 0.24, 0.7, 0.4)]}
+SOUND_FILES = {}
+
+
+def play(kind):
+    try:
+        if kind not in SOUND_FILES:
+            f = os.path.join(tempfile.gettempdir(), f"helpermcp-{kind}-{os.getpid()}.wav"); open(f, "wb").write(make_wav(SOUNDS[kind])); SOUND_FILES[kind] = f; TMP.append(f)
+        for cmd in (["paplay"], ["pw-play"], ["aplay", "-q"], ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]):
+            if shutil.which(cmd[0]): subprocess.Popen(cmd + [SOUND_FILES[kind]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); return
+        sys.stdout.write("\a"); sys.stdout.flush()
+    except Exception: pass
+
+
+def copy_clip(text):
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        if shutil.which(cmd[0]):
+            try:
+                pr = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); pr.stdin.write(text.encode()); pr.stdin.close(); return True
+            except Exception: pass
+    overlay_send("clip " + text); return bool(OVERLAY_PROC)   # the overlay (GTK) owns the clipboard while the session lasts
+
+
+def header(code, copied):
+    try: rows = shutil.get_terminal_size().lines
+    except Exception: rows = 24
+    bar = "─" * 54
+    sys.stdout.write("\033[2J\033[H" + c("1;33", f"  ┌ {t('hdr1')} {bar}") + "\n" + c("1;33", f"  │ {t('hdr2')}  ") + c("1;30;43", f" {code} ") + c("32", f"   ✔ {t('copied')}" if copied else "") + "\n"
+                     + c("33", f"  │ {t('hdr4')}") + "\n" + c("33", f"  │ {t('hdr3')}") + "\n" + c("1;33", f"  └{bar}{'─' * 18}") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
+    sys.stdout.flush()
+
+
+def end_ui():
+    try: sys.stdout.write("\033[r\033[999;1H\n"); sys.stdout.flush()
+    except Exception: pass
+
+
+def key_pump():
+    """one reader for the keyboard: Esc ends the session at any moment, the rest goes to the questions"""
+    import termios, tty, select
+    fd = sys.stdin.fileno(); PUMP["old"] = termios.tcgetattr(fd); tty.setcbreak(fd); PUMP["on"] = True
+    import atexit; atexit.register(lambda: (termios.tcsetattr(fd, termios.TCSADRAIN, PUMP["old"]), end_ui()))
+    while True:
+        try: ch = os.read(fd, 1)
+        except OSError: return
+        if not ch: return
+        if ch == b"\x1b":
+            if select.select([fd], [], [], 0.05)[0]:
+                os.read(fd, 8); continue                    # an arrow key or similar
+            END.set(); print(c("33", "  " + t("esc")), flush=True); os.kill(os.getpid(), signal.SIGTERM); return
+        KEYS.put(ch.lower().decode(errors="ignore"))
 
 
 def read_key():
-    """one key press, no Enter: y / Enter = yes, a = always, n = no, Esc = end the session"""
-    import termios, tty, select
-    fd = sys.stdin.fileno(); old = termios.tcgetattr(fd)
+    if not PUMP["on"]: raise RuntimeError("No keyboard to ask on (the helper must run in a terminal in ask mode).")
+    while not KEYS.empty(): KEYS.get_nowait()          # keys typed before the question must not answer it
+    while True:
+        k = KEYS.get()
+        if k in ("y", "\n", "\r"): return "y"
+        if k in ("a", "n"): return k
+
+
+def focus_window():
+    """the window that has the keyboard focus (None when unknown): the terminal where the friend answers takes it, so it is given back afterwards"""
     try:
-        termios.tcflush(fd, termios.TCIFLUSH); tty.setcbreak(fd)
-        while True:
-            ch = os.read(fd, 1)
-            if ch == b"\x1b":
-                if select.select([fd], [], [], 0.05)[0]: os.read(fd, 8); continue      # an arrow key or similar: not Esc
-                return "esc"
-            ch = ch.lower()
-            if ch in (b"y", b"\n", b"\r"): return "y"
-            if ch in (b"a", b"n"): return ch.decode()
-    finally: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        X = xlib(); x11 = X["x"]; w = ctypes.c_ulong(); rv = ctypes.c_int()
+        x11.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)]   # without argtypes the Display pointer is cut to 32 bits: segfault
+        x11.XGetInputFocus(X["d"], ctypes.byref(w), ctypes.byref(rv)); return w.value if w.value > 1 else None
+    except Exception: return None
+
+
+def restore_focus(w):
+    if not w: return
+    try:
+        X = xlib(); X["x"].XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        X["x"].XSetInputFocus(X["d"], ctypes.c_ulong(w), 1, 0); sync(X); time.sleep(0.15)
+    except Exception: pass
 
 
 def ask_permission(name, a):
     g = ASK_GROUP[name]
     if g in ALLOWED: return
-    fw = focus_window() or AI["fw"]; label = GROUP_LABEL[g][0 if t("keys") == "да" else 1]
-    sys.stdout.write("\a"); sys.stdout.flush()
-    try: subprocess.Popen(["notify-send", "-u", "critical", "-t", "20000", "HelperMCP", describe(name, a)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    fw = focus_window() or AI["fw"]; label = GROUP_LABEL[g][0 if RU else 1]; d = describe(name, a)
+    play("ask")
+    try: subprocess.Popen(["notify-send", "-u", "critical", "-t", "20000", "HelperMCP", "\n".join(d)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception: pass
-    print(f"\n\033[1;30;43m  >>> {t('allow')}{describe(name, a)}?  \033[0m\n\033[33m      [Y] {t('keys')}    [A] {t('always')} ({label}, {t('until')})    [N] {t('no')}    [Esc] {t('endk')}\033[0m", flush=True)
+    print("\n" + c("1;30;43", f"  ▶ {t('allow')}" + (d[0] if len(d) == 1 else "") + "  ") + ("".join("\n" + c("33", f"      {i}. {x}") for i, x in enumerate(d, 1)) if len(d) > 1 else "")
+          + "\n" + c("33", f"    [Y] {t('keys')}    [A] {t('always')}    [N] {t('no')}    [Esc] {t('endk')}") + "\n" + c("2;33", f"    A = {t('stopask')} {label} {t('until')}"), flush=True)
     k = read_key()
-    if k == "esc": END.set(); print("  " + t("esc"), flush=True); raise RuntimeError("The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.")
-    if k == "n": print("  " + t("den"), flush=True); raise RuntimeError("The user denied this action. Do not repeat it; ask the operator what to do instead.")
-    if k == "a": ALLOWED.add(g); print(f"\033[32m  {t('ok2')}: {label}\033[0m", flush=True)
-    else: print(f"\033[32m  {t('ok1')}\033[0m", flush=True)
+    if k == "n": print(c("2", "    " + t("den")), flush=True); raise RuntimeError("The user denied this action. Do not repeat it; ask the operator what to do instead.")
+    if k == "a": ALLOWED.add(g); print(c("32", f"    ✔ {t('ok2')}: {label}"), flush=True)
+    else: print(c("32", f"    ✔ {t('ok1')}"), flush=True)
     restore_focus(fw)
 
 
-def resume_state(name):
+def resume_state(name, a=None):
     """put the window focus and the pointer back where the previous AI action left them (answering a question moves both)"""
     if name not in GUI_TOOLS or not AI["pos"] or time.time() - AI["t"] > 90: return
+    first = (steps_of(name, a or {}) or [{}])[0].get("do")
     if AI["fw"] and focus_window() != AI["fw"]: restore_focus(AI["fw"])
-    if name in ("type_text", "press_key", "scroll"):
+    if first in ("type", "key", "scroll"):
         x, y = pointer_pos()
         if abs(x - AI["pos"][0]) + abs(y - AI["pos"][1]) > 6: overlay_send("active"); glide(*AI["pos"], 0.3)
 
 
 def mark_state(name):
     if name in GUI_TOOLS: time.sleep(0.08); AI.update(t=time.time(), pos=pointer_pos(), fw=focus_window())
+
+
+def actions(a):
+    """a short list of small GUI steps, confirmed once"""
+    steps = list(a.get("steps") or [])[:20]; done = []
+    for i, st in enumerate(steps, 1):
+        d = st.get("do")
+        try:
+            if d == "move": move(st)
+            elif d == "click": click(st)
+            elif d == "drag": drag(st)
+            elif d == "scroll": scroll(st)
+            elif d == "type": type_text({"text": st["text"]})
+            elif d == "key": press_key({"keys": st["keys"]})
+            elif d == "wait": time.sleep(min(5000, int(st.get("ms", 500))) / 1000)
+            else: raise RuntimeError(f"unknown step '{d}'")
+        except Exception as e:
+            raise RuntimeError(f"step {i} ({d}) failed: {e}. Steps before it were done: {', '.join(done) or 'none'}.")
+        done.append(f"{i}:{d}")
+    return {"text": f"ok, {len(done)} step(s) done"}
 
 
 def type_text(a):
@@ -1004,6 +1143,8 @@ def on_line(line):
     f = line.split(); now = time.monotonic()
     if not f: return
     if f[0] == "state" and len(f) > 1: set_state(f[1]); return
+    if f[0] == "clip" and len(f) > 1:
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD); cb.set_text(f[1], -1); cb.store(); return
     if f[0] == "pre":                               # about to click: over the panel the arrow window would swallow the click
         px, py = pointer()
         if in_panel(px, py): pre_until = now + 0.5
@@ -1101,29 +1242,30 @@ def post_result(res, token):
         api("/a/result", res, token, timeout=60)
 
 
-TOOLS = dict(move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
+TOOLS = dict(actions=actions, move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
-GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key"}   # one X11 connection: never two at once
+GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
 GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 
 
 def handle(cmd, mode, token):
     """One tool call, in its own thread: a slow install or render never blocks screenshots, the live viewer or other calls."""
     name, args = cmd["tool"], cmd["args"]
-    print(f"[helper] {name} {json.dumps(args, ensure_ascii=False)[:200]}", flush=True)
+    print(line_for(name, args), flush=True)
     res = {"id": cmd["id"]}
     try:
         if mode == "ask" and name in ASK_TOOLS:
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
-            with GUI_LOCK: resume_state(name); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)
+            with GUI_LOCK: resume_state(name, args); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)
         else:
             res.update(ok=True, data=TOOLS[name](args))
     except Exception as e:  # report every failure to the operator
         res.update(ok=False, error=f"{type(e).__name__}: {e}")
+    if name not in QUIET: print((c("32", "    ✔ " + ("готово" if RU else "done")) if res.get("ok") else c("31", "    ✘ " + cut(res.get("error"), 120))), flush=True)
     for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
         try: post_result(res, TOKEN or token); break
         except urllib.error.HTTPError as e:
@@ -1165,8 +1307,13 @@ def main():
         except Exception as e:
             print(f"[helper] cannot reach the server ({type(e).__name__}), retrying ...", flush=True); time.sleep(min(wait, 10.0)); wait *= 1.7
     token = TOKEN = reg["token"]; code = reg["code"]; LAST_OK[0] = time.time()
-    print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
     overlay_start()
+    copied = copy_clip(code)
+    if sys.stdout.isatty(): header(code, copied)
+    else: print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
+    play("ok")
+    if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()
+    print(c("32", "  ✔ " + t("ready")), flush=True)
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0
     def watchdog():   # a connection can die silently (the poll just hangs): do not stay blue for long

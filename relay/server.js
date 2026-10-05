@@ -207,6 +207,13 @@ const tools = [
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
   { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
   { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', props: { keys: str('Key combo') }, required: ['keys'] },
+  { name: 'actions', agent: true, ms: (a) => 30000 + (a.steps || []).length * 20000,
+    description: 'A short sequence of small GUI steps done as ONE action the friend confirms once (move + click, click + type, drag, scroll, key presses). Prefer this over separate click / move / type_text calls. Coordinates are screenshot pixels. Stops at the first failing step.',
+    props: { steps: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: {
+      do: { type: 'string', enum: ['move', 'click', 'drag', 'scroll', 'type', 'key', 'wait'], description: 'move | click | drag | scroll | type (text) | key (keys) | wait (ms)' },
+      x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' },
+      amount: { type: 'integer' }, text: str('text to type'), keys: str('key combo'), ms: { type: 'integer', description: 'wait milliseconds, up to 5000' } }, required: ['do'] } } },
+    required: ['steps'] },
   { name: 'mcp_start', agent: true, ms: (a) => ((a.timeout_s || 240) + 30) * 1000,
     description: 'Start another MCP server on the remote PC and use it through this bridge (any stdio MCP server: browser, Blender via uvx blender-mcp, filesystem, ...). Browser: name="browser", command="playwright" opens a real, visible Chrome/Edge window on the user\'s screen with sound on. Any other server: command="npx", args=["-y","<package>"] (or uvx, python, an exe). If Node >= 20 is missing a portable copy is downloaded to a temp dir and removed on exit. Returns its tools; call them with mcp_call (or directly as <name>__<tool> on a /s/<code>/mcp connection).',
     props: { name: str('Short name, e.g. browser'), command: str('Executable, e.g. npx'), args: { type: 'array', items: { type: 'string' } }, env: { type: 'object', additionalProperties: { type: 'string' } }, cwd: str('working directory'), timeout_s: { type: 'integer', minimum: 10, maximum: 1800, description: 'time allowed for the server to start (first start may download packages), default 240' } },
@@ -261,7 +268,8 @@ Workflow for any task:
 5. Operations that take longer than ~45 s return "Still running (job X)": call wait_job with that id. Raise timeout_s on mcp_start / mcp_call / run for installs and renders.
 6. The network may be slow: take screenshots only when needed (monitor=N crops to one screen), avoid huge command output.
 7. The user watches the screen: make your work visible. Do windowing with the mouse (drag a title bar to move a window, drag an edge or corner to resize, click the minimise / maximise / close buttons, click taskbar icons to open or hide an app) instead of keyboard shortcuts or commands when a mouse action exists. When you read or check something, use move to glide the pointer to the text you are reading first (like a person following a line with the cursor). Skip this for background work (files, commands, MCP calls).
-8. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
+8. Talk to the user while you work. At the start say whether the connection worked (list_sessions, sysinfo) and that the friend can end the session at any time with Esc. Before a group of actions say in one short line what you are going to do, afterwards whether it worked. Bundle small GUI steps (move + click, click + type, drag, scroll) into ONE actions call so the friend confirms once instead of per step. If any call comes back "ended", "denied", "Agent left" or "No such session": stop, do not retry, tell the operator.
+9. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -344,7 +352,10 @@ const clientIp = (req) => req.socket.remoteAddress;
 function script(req, res, file) {
   let f;
   try { f = fs.readFileSync(path.join(AGENT_DIR, file), 'utf8'); } catch { return text(res, 404, 'not found'); }
-  text(res, 200, f.replace(/\r\n/g, '\n').replaceAll('__RELAY__', baseUrl(req)));   // LF whatever the checkout's line endings
+  f = f.replace(/\r\n/g, '\n');
+  // PowerShell cannot redefine a type in a session that already has it: the types of the Windows agent get a name that changes with the script, so running the one-liner again in the same window after an update just works
+  const build = crypto.createHash('sha256').update(f).digest('hex').slice(0, 6);
+  text(res, 200, f.replaceAll('__RELAY__', baseUrl(req)).replaceAll('__BUILD__', build));   // LF whatever the checkout's line endings
 }
 
 function landing(req, res) {

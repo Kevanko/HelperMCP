@@ -4,7 +4,7 @@ $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored a
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
@@ -14,7 +14,7 @@ $Children = @{}   # name -> other MCP servers running on this PC
 $MaxOut = 100000
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-Add-Type -Namespace H -Name U -MemberDefinition @'
+Add-Type -Namespace H -Name U__BUILD__ -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -23,12 +23,45 @@ Add-Type -Namespace H -Name U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
 [StructLayout(LayoutKind.Sequential)] public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
 [DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO f);
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
 [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
 '@
-[void][H.U]::SetProcessDPIAware()   # real pixels, not scaled ones
+[void][H.U__BUILD__]::SetProcessDPIAware()   # real pixels, not scaled ones
+Add-Type -TypeDefinition @"
+using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
+namespace K__BUILD__ {
+  public static class Keys {   // one reader for the keyboard: Esc ends the session at any moment, the other keys answer the questions
+    public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>(); public static volatile bool Esc; public static string Relay, Token;
+    public static void Start() {
+      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true);
+        if (k.Key == ConsoleKey.Escape) { Esc = true;   // tell the relay we are leaving: that also ends the poll that is waiting right now
+          try { var rq = (HttpWebRequest)WebRequest.Create(Relay + "/a/bye"); rq.Method = "POST"; rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/json"; rq.Timeout = 3000;
+                var b = System.Text.Encoding.UTF8.GetBytes("{}"); rq.ContentLength = b.Length; using (var st = rq.GetRequestStream()) st.Write(b, 0, b.Length); rq.GetResponse().Close(); } catch { } }
+        else Q.Enqueue(k.Key); } } catch { } });
+      t.IsBackground = true; t.Start();
+    }
+  }
+  public static class Chime {   // soft bells made on the fly (no files shipped)
+    public static byte[] Make(double[] f, double[] start, double[] dur, double amp) {
+      int sr = 22050; double total = 0; for (int i = 0; i < f.Length; i++) total = Math.Max(total, start[i] + dur[i]);
+      int n = (int)(sr * (total + 0.1)); var buf = new double[n];
+      for (int k = 0; k < f.Length; k++) { int i0 = (int)(start[k] * sr);
+        for (int i = 0; i < (int)(dur[k] * sr) && i0 + i < n; i++) { double t = (double)i / sr; double env = (1 - Math.Exp(-t * 400)) * Math.Exp(-t * 5.5);
+          buf[i0 + i] += amp * env * (Math.Sin(2 * Math.PI * f[k] * t) + 0.28 * Math.Sin(4 * Math.PI * f[k] * t) + 0.08 * Math.Sin(2 * Math.PI * 3.01 * f[k] * t)); } }
+      var ms = new MemoryStream(); var w = new BinaryWriter(ms);
+      w.Write(new char[] { 'R', 'I', 'F', 'F' }); w.Write(36 + n * 2); w.Write(new char[] { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' }); w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(sr); w.Write(sr * 2); w.Write((short)2); w.Write((short)16);
+      w.Write(new char[] { 'd', 'a', 't', 'a' }); w.Write(n * 2);
+      for (int i = 0; i < n; i++) w.Write((short)Math.Max(-32000, Math.Min(32000, buf[i] * 22000)));
+      w.Flush(); return ms.ToArray();
+    }
+  }
+}
+"@
 
 function Api($path, $data, $token, $timeout = 40) {
     $h = @{}
@@ -109,9 +142,9 @@ function Glide($x, $y, $dur) {
     while ($true) {
         $q = $sw.Elapsed.TotalSeconds / $dur; if ($q -ge 1.0) { break }
         $k = Ease $q; $m = 1 - $k
-        [void][H.U]::SetCursorPos([int]($m * $m * $cx + 2 * $m * $k * $qx + $k * $k * $x), [int]($m * $m * $cy + 2 * $m * $k * $qy + $k * $k * $y)); [Threading.Thread]::Sleep(7)
+        [void][H.U__BUILD__]::SetCursorPos([int]($m * $m * $cx + 2 * $m * $k * $qx + $k * $k * $x), [int]($m * $m * $cy + 2 * $m * $k * $qy + $k * $k * $y)); [Threading.Thread]::Sleep(7)
     }
-    [void][H.U]::SetCursorPos([int]$x, [int]$y)
+    [void][H.U__BUILD__]::SetCursorPos([int]$x, [int]$y)
 }
 function Target($a, $kx = 'x', $ky = 'y') { @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
 function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
@@ -124,8 +157,8 @@ function Do-Click($a) {
     $n = if ($a.double) { 2 } else { 1 }
     1..$n | ForEach-Object {
         Overlay-Send "click $($t[0]) $($t[1]) $btn"
-        [H.U]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
-        [H.U]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100
+        [H.U__BUILD__]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
+        [H.U__BUILD__]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100
     }
     @{ text = 'ok' }
 }
@@ -134,10 +167,10 @@ function Do-Click($a) {
 function Do-Drag($a) {
     $t1 = Target $a; $t2 = Target $a 'x2' 'y2'; $btn = if ($a.button) { $a.button } else { 'left' }; $down, $up = Btn $btn
     Overlay-Send 'active'; Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 60
-    [H.U]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "down $($t1[0]) $($t1[1])"; Start-Sleep -Milliseconds 120
+    [H.U__BUILD__]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "down $($t1[0]) $($t1[1])"; Start-Sleep -Milliseconds 120
     $d = [Math]::Sqrt([Math]::Pow($t2[0] - $t1[0], 2) + [Math]::Pow($t2[1] - $t1[1], 2))
     Glide $t2[0] $t2[1] ([Math]::Min(1.4, 0.3 + $d * 0.0007)); Start-Sleep -Milliseconds 100
-    [H.U]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "up $($t2[0]) $($t2[1])"
+    [H.U__BUILD__]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "up $($t2[0]) $($t2[1])"
     @{ text = 'ok' }
 }
 
@@ -147,7 +180,7 @@ function Do-Scroll($a) {
     $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
     Overlay-Send "scroll $n"
     $one = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * [Math]::Sign($n))), 0)
-    1..[Math]::Abs($n) | ForEach-Object { [H.U]::mouse_event(0x0800, 0, 0, $one, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40 }
+    1..[Math]::Abs($n) | ForEach-Object { [H.U__BUILD__]::mouse_event(0x0800, 0, 0, $one, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40 }
     @{ text = 'ok' }
 }
 
@@ -178,9 +211,9 @@ function Do-PressKey($a) {
         elseif ($k.Length -eq 1) { [byte][char]$k.ToUpper() }
         else { throw "Unknown key '$k'" }
     }
-    $codes | ForEach-Object { [H.U]::keybd_event($_, 0, 0, [UIntPtr]::Zero) }
+    $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 0, [UIntPtr]::Zero) }
     [array]::Reverse($codes)
-    $codes | ForEach-Object { [H.U]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }
+    $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }
     @{ text = 'ok' }
 }
 
@@ -778,7 +811,7 @@ function Start-Overlay {
 function Cleanup-Children {
     foreach ($c in $Children.Values) { Stop-Tree $c.p }
     if ($script:OverlayProc) { try { $script:OverlayIn.Close(); if (-not $script:OverlayProc.WaitForExit(3000)) { $script:OverlayProc.Kill() } } catch { try { $script:OverlayProc.Kill() } catch { } } }
-    try { [void][H.U]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
+    try { [void][H.U__BUILD__]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
@@ -788,90 +821,160 @@ $LightTools = 'screenshot', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
 $script:Deferred = New-Object System.Collections.ArrayList
 $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
 
-# ---- ask mode: one key press instead of typing y + Enter, a chime and a flashing window when a question is waiting, "always" per kind of action for this session,
-# Esc ends the session. The console takes the keyboard focus and the friend moves the mouse to answer, so before the next action the window focus and the
-# pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
-$AskGroup = @{ click = 'mouse'; move = 'mouse'; drag = 'mouse'; scroll = 'mouse'; type_text = 'keyboard'; press_key = 'keyboard'; run = 'commands'; start_process = 'commands'
+# ---- the friend's console: a pinned header with the session code (copied to the clipboard), Esc ends the session at any moment, a soft chime and a flashing window
+# when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
+# and after the answer the window focus and the pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
+$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'
     write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
-$script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero
-function Group-Label($g) { switch ($g) { 'mouse' { T 'мышь' 'mouse' } 'keyboard' { T 'клавиатура' 'keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
-function Cut($t, $n) { $t = [string]$t; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
-function Describe-Action($name, $a) {
-    switch ($name) {
-        'click' { T "клик ($($a.x), $($a.y))" "click ($($a.x), $($a.y))" }
-        'move' { T "движение мыши к ($($a.x), $($a.y))" "move the mouse to ($($a.x), $($a.y))" }
-        'drag' { T "перетаскивание ($($a.x), $($a.y)) -> ($($a.x2), $($a.y2))" "drag ($($a.x), $($a.y)) -> ($($a.x2), $($a.y2))" }
-        'scroll' { T "прокрутка ($($a.amount))" "scroll ($($a.amount))" }
-        'type_text' { T ('ввод текста: "' + (Cut $a.text 60) + '"') ('type text: "' + (Cut $a.text 60) + '"') }
-        'press_key' { T "клавиши: $($a.keys)" "keys: $($a.keys)" }
-        'run' { T ('команда: ' + (Cut $a.command 90)) ('command: ' + (Cut $a.command 90)) }
-        default { "$name " + (Cut ($a | ConvertTo-Json -Compress) 90) }
+$script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
+$Quiet = @{ screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
+    read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP') }
+function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
+function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
+function Step-Text($st) {
+    $x = $st.x; $y = $st.y
+    switch ($st.do) {
+        'move' { T "подвинуть мышь к ($x, $y)" "move the mouse to ($x, $y)" }
+        'click' { if ($st.double) { T "двойной клик ($x, $y)" "double-click ($x, $y)" } elseif ($st.button -eq 'right') { T "правый клик ($x, $y)" "right-click ($x, $y)" } elseif ($st.button -eq 'middle') { T "средний клик ($x, $y)" "middle-click ($x, $y)" } else { T "нажать ($x, $y)" "click ($x, $y)" } }
+        'drag' { T "перетащить ($x, $y) -> ($($st.x2), $($st.y2))" "drag ($x, $y) -> ($($st.x2), $($st.y2))" }
+        'scroll' { $am = if ($st.amount) { $st.amount } else { 3 }; T "прокрутить ($am)" "scroll ($am)" }
+        'type' { T ('ввести "' + (Cut $st.text 60) + '"') ('type "' + (Cut $st.text 60) + '"') }
+        'key' { T "нажать клавиши $($st.keys)" "press $($st.keys)" }
+        'wait' { $ms = if ($st.ms) { $st.ms } else { 500 }; T "подождать $ms мс" "wait $ms ms" }
+        default { [string]$st.do }
     }
 }
+function Steps-Of($name, $a) {   # the steps of a tool call; a move right before a click on the same spot shows as one step
+    $raw = if ($name -eq 'actions') { @($a.steps) } else { $m = @{ type_text = 'type'; press_key = 'key' }; $d = if ($m.ContainsKey($name)) { $m[$name] } else { $name }; $o = New-Object psobject -Property @{ do = $d }; foreach ($p in $a.PSObject.Properties) { Add-Member -InputObject $o -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force }; Add-Member -InputObject $o -NotePropertyName do -NotePropertyValue $d -Force; @($o) }
+    $out = New-Object System.Collections.ArrayList
+    foreach ($st in $raw) {
+        if ($out.Count -and $out[$out.Count - 1].do -eq 'move' -and $st.do -eq 'click' -and $out[$out.Count - 1].x -eq $st.x -and $out[$out.Count - 1].y -eq $st.y) { $out.RemoveAt($out.Count - 1) }
+        [void]$out.Add($st)
+    }
+    $out
+}
+function Describe-Action($name, $a) {   # -> array of short sentences
+    if ($AskGroup[$name] -eq 'input') { return @(Steps-Of $name $a | ForEach-Object { Step-Text $_ }) }
+    $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
+    $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } else { ($a | ConvertTo-Json -Compress) }
+    @($pre + (Cut $tail 90))
+}
+function Say-Step($name, $a) {
+    if ($Quiet.ContainsKey($name)) { Write-Host ('  . ' + (T $Quiet[$name][0] $Quiet[$name][1])) -ForegroundColor DarkGray; return }
+    $d = @(Describe-Action $name $a)
+    if ($d.Count -eq 1) { Write-Host '  -> ' -ForegroundColor Cyan -NoNewline; Write-Host $d[0] }
+    else { Write-Host ('  -> ' + (T 'действия:' 'actions:')) -ForegroundColor Cyan; $i = 0; foreach ($x in $d) { $i++; Write-Host "       $i. $x" } }
+}
+function Play-Sound($kind) {
+    try {
+        if (-not $script:Snd.ContainsKey($kind)) {
+            $notes = if ($kind -eq 'ask') { @(@(784.0, 0.0, 0.55), @(1046.5, 0.16, 0.7)) } else { @(@(523.25, 0.0, 0.5), @(659.25, 0.12, 0.5), @(783.99, 0.24, 0.7)) }
+            $w = [K__BUILD__.Chime]::Make([double[]]($notes | ForEach-Object { $_[0] }), [double[]]($notes | ForEach-Object { $_[1] }), [double[]]($notes | ForEach-Object { $_[2] }), $(if ($kind -eq 'ask') { 0.5 } else { 0.4 }))
+            $script:Snd[$kind] = New-Object Media.SoundPlayer (New-Object IO.MemoryStream (, $w))
+        }
+        $script:Snd[$kind].Play()
+    } catch { }
+}
+function Enable-VT { try { $h = [H.U__BUILD__]::GetStdHandle(-11); $m = 0; if ([H.U__BUILD__]::GetConsoleMode($h, [ref]$m) -and [H.U__BUILD__]::SetConsoleMode($h, $m -bor 4)) { $script:VT = $true } } catch { } }
+function Draw-Header($code, $copied) {
+    $e = [char]27; $bar = [string]([char]0x2500) * 56
+    try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+    try { if ($script:VT) { [Console]::Write("$e[2J$e[H") } else { Clear-Host } } catch { }
+    Write-Host ('  ' + [char]0x250C + ' ' + (T 'УДАЛЁННАЯ ПОМОЩЬ' 'REMOTE HELP') + ' ' + $bar) -ForegroundColor Yellow
+    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Код сессии:' 'Session code:') + '  ') -ForegroundColor Yellow -NoNewline; Write-Host " $code " -ForegroundColor Black -BackgroundColor Yellow -NoNewline
+    if ($copied) { Write-Host ('   ' + [char]0x221A + ' ' + (T 'скопирован в буфер обмена' 'copied to the clipboard')) -ForegroundColor Green } else { Write-Host '' }
+    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Скажи этот код тому, кто помогает.' 'Tell this code to the person who helps you.')) -ForegroundColor DarkYellow
+    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Esc - завершить сеанс в любой момент' 'Esc - end the session at any time')) -ForegroundColor DarkYellow
+    Write-Host ('  ' + [char]0x2514 + $bar + [string]([char]0x2500) * 18) -ForegroundColor Yellow
+    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[6;${h}r$e[6;1H") } catch { } }   # the header stays on top, the log scrolls below it
+}
 function Flash-Console {
-    try { $f = New-Object 'H.U+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U]::GetAncestor([H.U]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U]::FlashWindowEx([ref]$f) } catch { }
+    try { $f = New-Object 'H.U__BUILD__+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U__BUILD__]::GetAncestor([H.U__BUILD__]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U__BUILD__]::FlashWindowEx([ref]$f) } catch { }
 }
 function Restore-Focus($h) {
-    if ($h -eq [IntPtr]::Zero -or -not [H.U]::IsWindow($h) -or [H.U]::GetForegroundWindow() -eq $h) { return }
-    [H.U]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [H.U]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # an Alt tap lets SetForegroundWindow through the foreground lock
-    [void][H.U]::SetForegroundWindow($h); Start-Sleep -Milliseconds 200
+    if ($h -eq [IntPtr]::Zero -or -not [H.U__BUILD__]::IsWindow($h) -or [H.U__BUILD__]::GetForegroundWindow() -eq $h) { return }
+    [H.U__BUILD__]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [H.U__BUILD__]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # an Alt tap lets SetForegroundWindow through the foreground lock
+    [void][H.U__BUILD__]::SetForegroundWindow($h); Start-Sleep -Milliseconds 200
 }
-function Is-Console($h) { $c = [H.U]::GetConsoleWindow(); $h -eq $c -or $h -eq [H.U]::GetAncestor($c, 3) }
+function Is-Console($h) { $c = [H.U__BUILD__]::GetConsoleWindow(); $h -eq $c -or $h -eq [H.U__BUILD__]::GetAncestor($c, 3) }
 function Focus-Before-Question {   # the window to give the focus back to: the foreground one, or the last one that was not this console
-    $fg = [H.U]::GetForegroundWindow()
+    $fg = [H.U__BUILD__]::GetForegroundWindow()
     if ((Is-Console $fg) -and $script:AiFg -ne [IntPtr]::Zero) { return $script:AiFg }
     $fg
 }
+function Check-Esc { if ([K__BUILD__.Keys]::Esc) { $script:EndRequested = $true; throw 'The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.' } }
 function Ask-Permission($name, $a) {
     $g = $AskGroup[$name]; if ($script:Allowed[$g]) { return }
-    $fg = Focus-Before-Question; $desc = Describe-Action $name $a
-    try { [Console]::Beep(880, 70); [Console]::Beep(1318, 120) } catch { }
-    Flash-Console; $title = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = '>>> ' + (T 'ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ' 'CONFIRMATION NEEDED')
-    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }   # keys typed before the question must not answer it
+    $fg = Focus-Before-Question; $d = @(Describe-Action $name $a)
+    Play-Sound 'ask'; Flash-Console; $title = $null; try { $title = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = '>> ' + (T 'ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ' 'CONFIRMATION NEEDED') } catch { }
+    [ConsoleKey]$k = [ConsoleKey]::NoName; while ([K__BUILD__.Keys]::Q.TryDequeue([ref]$k)) { }   # keys typed before the question must not answer it
     Write-Host ''
-    Write-Host ('  >>> ' + (T 'Разрешить: ' 'Allow: ') + $desc + '?  ') -ForegroundColor Black -BackgroundColor Yellow
-    Write-Host ('      [Y] ' + (T 'да' 'yes') + '    [A] ' + (T 'всегда' 'always') + ' (' + (Group-Label $g) + ', ' + (T 'до конца сеанса' 'until the session ends') + ')    [N] ' + (T 'нет' 'no') + '    [Esc] ' + (T 'завершить сеанс' 'end the session')) -ForegroundColor Yellow
+    if ($d.Count -eq 1) { Write-Host ('  >> ' + (T 'Разрешить: ' 'Allow: ') + $d[0] + '  ') -ForegroundColor Black -BackgroundColor Yellow }
+    else { Write-Host ('  >> ' + (T 'Разрешить действия:' 'Allow these actions:') + '  ') -ForegroundColor Black -BackgroundColor Yellow; $i = 0; foreach ($x in $d) { $i++; Write-Host "       $i. $x" -ForegroundColor Yellow } }
+    Write-Host ('     [Y] ' + (T 'да' 'yes') + '    [A] ' + (T 'всегда' 'always') + '    [N] ' + (T 'нет' 'no') + '    [Esc] ' + (T 'завершить сеанс' 'end the session')) -ForegroundColor Yellow
+    Write-Host ('     A = ' + (T 'не спрашивать про' 'stop asking about') + ' ' + (Group-Label $g) + ' ' + (T 'до конца сеанса' 'until the session ends')) -ForegroundColor DarkYellow
     $answer = $null
     while (-not $answer) {
-        $k = [Console]::ReadKey($true)
-        switch ($k.Key) { 'Y' { $answer = 'y' } 'Enter' { $answer = 'y' } 'A' { $answer = 'a' } 'N' { $answer = 'n' } 'Escape' { $answer = 'esc' } }
+        Check-Esc
+        if ([K__BUILD__.Keys]::Q.TryDequeue([ref]$k)) { switch ($k) { 'Y' { $answer = 'y' } 'Enter' { $answer = 'y' } 'A' { $answer = 'a' } 'N' { $answer = 'n' } } } else { Start-Sleep -Milliseconds 40 }
     }
-    $Host.UI.RawUI.WindowTitle = $title
-    if ($answer -eq 'esc') { $script:EndRequested = $true; Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; throw 'The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.' }
-    if ($answer -eq 'n') { Write-Host ('  ' + (T 'отклонено' 'denied')) -ForegroundColor DarkYellow; throw 'The user denied this action. Do not repeat it; ask the operator what to do instead.' }
-    if ($answer -eq 'a') { $script:Allowed[$g] = $true; Write-Host ('  ' + (T "дальше без вопросов: $(Group-Label $g)" "no more questions for: $(Group-Label $g)")) -ForegroundColor Green }
-    else { Write-Host ('  ' + (T 'разрешено' 'allowed')) -ForegroundColor Green }
+    if ($title) { try { $Host.UI.RawUI.WindowTitle = $title } catch { } }
+    if ($answer -eq 'n') { Write-Host ('     ' + (T 'отклонено' 'denied')) -ForegroundColor DarkYellow; throw 'The user denied this action. Do not repeat it; ask the operator what to do instead.' }
+    if ($answer -eq 'a') { $script:Allowed[$g] = $true; Write-Host ('     ' + [char]0x221A + ' ' + (T "дальше без вопросов: $(Group-Label $g)" "no more questions for: $(Group-Label $g)")) -ForegroundColor Green }
+    else { Write-Host ('     ' + [char]0x221A + ' ' + (T 'разрешено' 'allowed')) -ForegroundColor Green }
     Restore-Focus $fg
 }
-$GuiTools = 'click', 'move', 'drag', 'scroll', 'type_text', 'press_key'
-function Resume-State($name) {   # put the window focus and the pointer back where the previous AI action left them
+$GuiTools = 'click', 'move', 'drag', 'scroll', 'type_text', 'press_key', 'actions'
+function Resume-State($name, $a) {   # put the window focus and the pointer back where the previous AI action left them
     if ($GuiTools -notcontains $name -or -not $script:AiAt -or ([DateTime]::UtcNow - $script:AiAt).TotalSeconds -gt 90) { return }
-    if ($script:AiFg -ne [IntPtr]::Zero -and [H.U]::GetForegroundWindow() -ne $script:AiFg) { Restore-Focus $script:AiFg }
-    if ($name -in 'type_text', 'press_key', 'scroll') {
+    $first = (Steps-Of $name $a | Select-Object -First 1).do
+    if ($script:AiFg -ne [IntPtr]::Zero -and [H.U__BUILD__]::GetForegroundWindow() -ne $script:AiFg) { Restore-Focus $script:AiFg }
+    if ($first -in 'type', 'key', 'scroll') {
         $p = [Windows.Forms.Cursor]::Position
         if ([Math]::Abs($p.X - $script:AiPos.X) + [Math]::Abs($p.Y - $script:AiPos.Y) -gt 6) { Overlay-Send 'active'; Glide $script:AiPos.X $script:AiPos.Y 0.3 }
     }
 }
 function Mark-State($name) {
     if ($GuiTools -notcontains $name) { return }
-    Start-Sleep -Milliseconds 80; $fg = [H.U]::GetForegroundWindow()
+    Start-Sleep -Milliseconds 80; $fg = [H.U__BUILD__]::GetForegroundWindow()
     $script:AiAt = [DateTime]::UtcNow; $script:AiPos = [Windows.Forms.Cursor]::Position; $script:AiFg = if (Is-Console $fg) { [IntPtr]::Zero } else { $fg }
+}
+function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
+    $done = @(); $i = 0
+    foreach ($st in @($a.steps | Select-Object -First 20)) {
+        $i++
+        try {
+            switch ($st.do) {
+                'move' { [void](Do-Move $st) }
+                'click' { [void](Do-Click $st) }
+                'drag' { [void](Do-Drag $st) }
+                'scroll' { [void](Do-Scroll $st) }
+                'type' { [void](Do-TypeText @{ text = $st.text }) }
+                'key' { [void](Do-PressKey @{ keys = $st.keys }) }
+                'wait' { Start-Sleep -Milliseconds ([Math]::Min(5000, [int]$st.ms)) }
+                default { throw "unknown step '$($st.do)'" }
+            }
+        } catch { throw "step $i ($($st.do)) failed: $($_.Exception.Message). Steps before it were done: $(if ($done) { $done -join ', ' } else { 'none' })." }
+        $done += "${i}:$($st.do)"
+    }
+    @{ text = "ok, $($done.Count) step(s) done" }
 }
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
-    $short = ($cmd.args | ConvertTo-Json -Compress); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) }
-    Write-Host "[helper] $name $short"
+    Say-Step $name $a
     $res = @{ id = $cmd.id }
     try {
+        Check-Esc
         if ($script:Mode -eq 'ask' -and $AskTools -contains $name) { Ask-Permission $name $a }
-        Resume-State $name
+        Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
     } catch { $res.ok = $false; $res.error = $_.Exception.Message }
+    if (-not $Quiet.ContainsKey($name)) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
         try { Post-Result $res $script:Token; break }
         catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
@@ -880,6 +983,7 @@ function Process-Command($cmd) {
 
 # Called from the wait loops of long operations: take a look at the relay without blocking, serve light requests right away.
 function Pump-Light {
+    Check-Esc
     if (-not $script:Token -or ([DateTime]::UtcNow - $script:LastPump).TotalMilliseconds -lt 400) { return }
     $script:LastPump = [DateTime]::UtcNow
     try { $r = Api '/a/poll?w=0' $null $script:Token 10 } catch { return }
@@ -919,25 +1023,28 @@ function Start-Helper {
         catch { Write-Host "[helper] cannot reach the server, retrying ..."; Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
     }
     $token = $r.token; $script:Token = $token; $code = $r.code
-    Write-Host ''
-    Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $code) -ForegroundColor Yellow
-    Write-Host ("  " + (T 'Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.' 'Give this code to your helper. Close this window or press Ctrl+C to stop.'))
-    Write-Host ''
+    $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
+    Enable-VT; Draw-Header $code $copied
+    [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
+    Play-Sound 'ok'
+    Write-Host ('  ' + [char]0x221A + ' ' + (T 'Подключено. Жду действий.' 'Connected. Waiting for actions.')) -ForegroundColor Green
     Start-Overlay
     $fails = 0; $delay = 1.0
     try {
         while ($true) {
+            if ([K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
             else {
                 $failed = $false; $resp = $null
                 try { $resp = Api '/a/poll' $null $script:Token 22 }   # the relay answers within 15 s; anything longer is a dead connection
                 catch {
+                    if ([K__BUILD__.Keys]::Esc) { $script:EndRequested = $true; Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
                     $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
                             $r = Register-Agent $mode $code; $script:Token = $r.token; $code = $r.code
-                            Write-Host "[helper] registered again, session code: $code"
+                            [K__BUILD__.Keys]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { }
                     }
@@ -956,11 +1063,12 @@ function Start-Helper {
             }
             if ($cmd.tool -eq 'bye') { Write-Host 'session closed'; return }
             Process-Command $cmd
-            if ($script:EndRequested) { Write-Host (T 'сессия закрыта' 'session closed'); return }
+            if ($script:EndRequested -or [K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
         }
     } finally {
         Cleanup-Children
         try { [void](Api '/a/bye' @{} $script:Token 5) } catch { }
+        if ($script:VT) { try { $e = [char]27; [Console]::Write("$e[r$e[$([Console]::WindowHeight);1H`n") } catch { } }   # the header's scroll region off, the prompt back at the bottom
     }
 }
 Start-Helper

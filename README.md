@@ -38,6 +38,8 @@ Send the friend your relay link (`https://help.example.com/`): it shows the line
 
 The script runs in memory (Windows) or from a pipe (Linux), asks for a mode and prints a code like `K7M2-QX9P`. Closing the window or Ctrl+C ends access.
 
+* **Friend's console:** a pinned header with the session code (already copied to the clipboard, nothing to select or Ctrl+C), `Esc` to end the session at any moment, a soft chime on connect and when a question is waiting, and a plain-language log of every step (`-> click (500, 400)`, then `done` or the error).
+* **Small steps are asked together:** the `actions` tool takes a short list (move, click, drag, scroll, type, key, wait) that the friend confirms once; a move right before a click on the same spot shows as one step.
 * **Ask mode (default):** for every command, file write, click, keystroke and MCP-server start/call the friend gets a chime, a flashing window and a yellow question, and answers with ONE key: `Y` (or Enter) yes, `A` always for that kind of action (mouse / keyboard / commands / files / MCP) until the session ends, `N` no, `Esc` ends the session at once. After the answer the window focus and the pointer are put back where the AI left them, so a click and the typing that follows land in the same place. Screenshots, file reads and directory listings need no confirmation.
 * **Full mode:** no prompts.
 * Everything the AI does is printed in the friend's console.

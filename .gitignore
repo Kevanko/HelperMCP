@@ -6,3 +6,4 @@ data/
 _h.mjs
 .playwright-mcp/
 **/.playwright-mcp/
+_call.mjs

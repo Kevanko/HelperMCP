@@ -2,13 +2,23 @@ services:
   helpermcp:
     build: .
     restart: unless-stopped
-    user: "0"   # only to read root-owned Let's Encrypt keys; drop it for plain HTTP behind a proxy
-    ports: ["8444:8444"]
+    user: "0"   # only to read root-owned Let's Encrypt keys in TLS_CERT mode; harmless otherwise
+    ports: ["${RELAY_BIND:-0.0.0.0}:${RELAY_PORT:-8444}:8444"]
     environment:
       OPERATOR_KEY: ${OPERATOR_KEY:?set OPERATOR_KEY in .env}
-      PUBLIC_URL: ${PUBLIC_URL:-}          # e.g. https://helper.example.com:8444
-      # TLS terminated by the relay itself (no nginx needed):
-      TLS_CERT: ${TLS_CERT:-}              # /certs/live/<domain>/fullchain.pem
+      PUBLIC_URL: ${PUBLIC_URL:-}   # e.g. https://help.example.com
+      TLS_CERT: ${TLS_CERT:-}       # optional: serve TLS from your own certbot files, e.g. /certs/live/<domain>/fullchain.pem
       TLS_KEY: ${TLS_KEY:-}
     volumes:
       - ${CERTS_DIR:-/etc/letsencrypt}:/certs:ro
+  caddy:                            # automatic HTTPS: enabled by COMPOSE_PROFILES=caddy (install.sh --domain)
+    image: caddy:2
+    profiles: ["caddy"]
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on: [helpermcp]
+volumes:
+  caddy_data:

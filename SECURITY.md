@@ -12,6 +12,8 @@ HelperMCP is a remote-control tool. Treat it like one.
 
 ## Known limits
 
+* **Child MCP servers (`mcp_start`) can do anything their tools allow** (a browser with the friend's logins, a filesystem server, …). In ask mode starting one and every call to it needs approval, in full mode nothing does. Starting one may also download a portable Node.js from nodejs.org into a temp folder.
+
 * **Serve the relay over HTTPS.** Over plain HTTP the traffic (screenshots, file contents) is readable on the network.
 * The one-liner executes code fetched from your relay: whoever controls the relay controls the agent script. Host it yourself and protect the server.
 * *Read-only* tools (screenshot, file read, directory listing) are not confirmed in ask mode. A friend who is not comfortable with that should not run the agent.

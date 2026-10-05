@@ -1,13 +1,13 @@
-// HelperMCP relay: agents (on friends' PCs) long-poll here; Claude talks to /mcp.
+// HelperMCP relay: agents (on friends' PCs) long-poll here; AI clients talk MCP to /mcp or /s/<code>/mcp.
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { z } from 'zod';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 globalThis.crypto ??= crypto.webcrypto; // Node 18 has no global crypto, the MCP SDK needs it
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -39,7 +39,7 @@ const safeEq = (a, b) => {
 
 // ---- session / command plumbing ------------------------------------------
 function call(code, tool, args = {}, timeoutMs = 60_000) {
-  const s = sessions.get(code.toUpperCase());
+  const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}". Use list_sessions.`));
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'ask') timeoutMs += 120_000;
@@ -76,53 +76,102 @@ setInterval(() => {
   for (const [code, s] of sessions) if (Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
 
-// ---- MCP ------------------------------------------------------------------
-const sess = z.string().describe('Session code shown on the user\'s screen, e.g. K7M2-QX9P');
+// ---- MCP tool table -------------------------------------------------------
+// agent:true -> forwarded to the agent on the friend's PC; otherwise handled here.
+const str = (description) => ({ type: 'string', description });
+const num = (description) => ({ type: 'number', description });
+const tools = [
+  { name: 'list_sessions', description: 'List connected remote machines waiting for help.', props: {}, local: true,
+    run: async () => ({
+      text: JSON.stringify([...sessions].map(([code, s]) => ({
+        code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
+        connected_s: Math.round((Date.now() - s.created) / 1000),
+      })), null, 2),
+    }) },
+  { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
+  { name: 'screenshot', agent: true, description: 'Screenshot of the remote screen (what the user sees). Click coordinates refer to this image.', props: {} },
+  { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux). Returns exit code and combined output.',
+    props: { command: str('Command line'), timeout_s: { type: 'integer', minimum: 1, maximum: 600, description: 'default 60' } }, required: ['command'],
+    ms: (a) => ((a.timeout_s || 60) + 10) * 1000 },
+  { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000).',
+    props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 } }, required: ['path'] },
+  { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it.',
+    props: { path: str('File path'), content: str('New content') }, required: ['path', 'content'] },
+  { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
+  { name: 'click', agent: true, description: 'Move the mouse to (x,y) in screenshot coordinates and click.',
+    props: { x: num('x'), y: num('y'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
+  { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
+  { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', props: { keys: str('Key combo') }, required: ['keys'] },
+  { name: 'mcp_start', agent: true, ms: () => 300_000,
+    description: 'Start another MCP server on the remote PC (e.g. name="browser", command="npx", args=["-y","@playwright/mcp@latest"]). If Node is missing a portable copy is downloaded to a temp dir and removed on exit. Returns its tools; call them with mcp_call (or directly as <name>__<tool> on a /s/<code>/mcp connection).',
+    props: { name: str('Short name, e.g. browser'), command: str('Executable, e.g. npx'), args: { type: 'array', items: { type: 'string' } }, env: { type: 'object', additionalProperties: { type: 'string' } } },
+    required: ['name', 'command'] },
+  { name: 'mcp_tools', agent: true, description: 'List tools of the MCP servers started on the remote PC.', props: {} },
+  { name: 'mcp_call', agent: true, ms: () => 120_000, description: 'Call a tool of an MCP server started with mcp_start.',
+    props: { server: str('Name given to mcp_start'), tool: str('Tool name'), arguments: { type: 'object' } }, required: ['server', 'tool'] },
+  { name: 'mcp_stop', agent: true, description: 'Stop an MCP server started with mcp_start.', props: { name: str('Name') }, required: ['name'] },
+  { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
+    run: async (code) => { await call(code, 'bye').catch(() => {}); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },
+];
+const byName = new Map(tools.map((t) => [t.name, t]));
+
 const fmt = (d) => {
+  if (d?.content) return { content: d.content, isError: !!d.isError }; // passthrough from a child MCP server
   const out = [];
   if (d?.text !== undefined) out.push({ type: 'text', text: String(d.text) });
   if (d?.image) out.push({ type: 'image', data: d.image, mimeType: d.mime || 'image/jpeg' });
   return { content: out.length ? out : [{ type: 'text', text: 'ok' }] };
 };
 
-function buildMcp() {
-  const m = new McpServer({ name: 'helpermcp', version: '0.1.0' });
-  const tool = (name, description, shape, fn) =>
-    m.registerTool(name, { description, inputSchema: shape }, async (a) => {
-      try { return fmt(await fn(a)); }
-      catch (e) { return { isError: true, content: [{ type: 'text', text: e.message }] }; }
-    });
-  const agent = (name, argsOf = (a) => a, ms) => async (a) => {
-    const { session, ...rest } = a;
-    return call(session, name, argsOf(rest), ms?.(rest));
-  };
+// fixed = session code for /s/<code>/mcp (tools then have no "session" argument and child tools appear as <server>__<tool>)
+function buildMcp(fixed) {
+  const m = new Server({ name: 'helpermcp', version: '0.2.0' }, { capabilities: { tools: {} } });
+  const sessionProp = { session: str("Session code shown on the user's screen, e.g. K7M2-QX9P") };
 
-  tool('list_sessions', 'List connected remote machines waiting for help.', {}, async () => ({
-    text: JSON.stringify([...sessions].map(([code, s]) => ({
-      code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
-      connected_s: Math.round((Date.now() - s.created) / 1000),
-    })), null, 2),
-  }));
-  tool('sysinfo', 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', { session: sess }, agent('sysinfo'));
-  tool('screenshot', 'Screenshot of the remote screen (what the user sees). Click coordinates refer to this image.', { session: sess }, agent('screenshot'));
-  tool('run', 'Run a shell command (PowerShell on Windows, bash on Linux). Returns exit code and combined output.', {
-    session: sess, command: z.string(), timeout_s: z.number().int().min(1).max(600).default(60).optional(),
-  }, agent('run', (a) => a, (a) => ((a.timeout_s || 60) + 10) * 1000));
-  tool('read_file', 'Read a text file (first max_bytes, default 200000).', {
-    session: sess, path: z.string(), max_bytes: z.number().int().positive().optional(),
-  }, agent('read_file'));
-  tool('write_file', 'Write a text file (UTF-8), overwriting it.', { session: sess, path: z.string(), content: z.string() }, agent('write_file'));
-  tool('list_dir', 'List a directory (name, type, size, modified).', { session: sess, path: z.string() }, agent('list_dir'));
-  tool('click', 'Move the mouse to (x,y) in screenshot coordinates and click.', {
-    session: sess, x: z.number(), y: z.number(),
-    button: z.enum(['left', 'right', 'middle']).default('left').optional(), double: z.boolean().optional(),
-  }, agent('click'));
-  tool('type_text', 'Type text at the current keyboard focus.', { session: sess, text: z.string() }, agent('type_text'));
-  tool('press_key', 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', { session: sess, keys: z.string() }, agent('press_key'));
-  tool('end_session', 'Disconnect the agent and forget the session.', { session: sess }, async ({ session }) => {
-    await call(session, 'bye').catch(() => {});
-    drop(session.toUpperCase(), 'Session ended by operator.');
-    return { text: 'ended' };
+  m.setRequestHandler(ListToolsRequestSchema, async () => {
+    const list = tools
+      .filter((t) => !(fixed && t.local))
+      .map((t) => {
+        const needsSession = (t.agent || t.session) && !fixed;
+        return {
+          name: t.name, description: t.description,
+          inputSchema: {
+            type: 'object',
+            properties: { ...(needsSession ? sessionProp : {}), ...t.props },
+            required: [...(needsSession ? ['session'] : []), ...(t.required || [])],
+          },
+        };
+      });
+    if (fixed) {
+      try {
+        const kids = await call(fixed, 'mcp_tools', {}, 10_000);
+        for (const k of JSON.parse(kids.text)) {
+          list.push({ name: `${k.server}__${k.name}`, description: `[${k.server}] ${k.description || ''}`, inputSchema: k.inputSchema || { type: 'object' } });
+        }
+      } catch { /* agent gone or no children: builtin tools only */ }
+    }
+    return { tools: list };
+  });
+
+  m.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+    const { name } = params;
+    const a = { ...(params.arguments || {}) };
+    try {
+      const session = fixed || a.session;
+      delete a.session;
+      const t = byName.get(name);
+      if (!t && fixed && name.includes('__')) { // child MCP tool, called directly
+        const i = name.indexOf('__');
+        return fmt(await call(session, 'mcp_call', { server: name.slice(0, i), tool: name.slice(i + 2), arguments: a }, 120_000));
+      }
+      if (!t) throw new Error(`Unknown tool ${name}`);
+      if (t.local) return fmt(await t.run());
+      if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
+      if (t.run) return fmt(await t.run(session));
+      return fmt(await call(session, name, a, t.ms?.(a)));
+    } catch (e) {
+      return { isError: true, content: [{ type: 'text', text: e.message }] };
+    }
   });
   return m;
 }
@@ -154,6 +203,20 @@ function script(req, res, file) {
   text(res, 200, f.replaceAll('__RELAY__', baseUrl(req)));
 }
 
+function landing(req, res) {
+  const b = baseUrl(req);
+  const ps = `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${b}/h | iex`;
+  const sh = `python3 <(curl -fsSL ${b}/p)`;
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  text(res, 200, `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Remote help</title>
+<style>body{font:16px system-ui;max-width:42rem;margin:2rem auto;padding:0 1rem}pre{background:#111;color:#eee;padding:.8rem;overflow:auto;border-radius:6px}</style>
+<h1>Remote help</h1>
+<p>Someone is going to help you with your computer. Run <b>one</b> line, then tell them the code it shows. Close the window to stop at any time.</p>
+<h3>Windows 10 / 11</h3><p>Open PowerShell (Start, type "powershell") and paste:</p><pre>${esc(ps)}</pre>
+<h3>Ubuntu / Linux</h3><pre>${esc(sh)}</pre>
+<p><small>Nothing is installed. The script is <a href="${esc(b)}/h">readable here</a>.</small></p>`, 'text/html; charset=utf-8');
+}
+
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /i, '');
 const byToken = (req) => {
   const t = bearer(req);
@@ -168,16 +231,16 @@ async function handler(req, res) {
     if (p === '/health') return text(res, 200, 'ok');
     if (p === '/h') return script(req, res, 'agent.ps1');
     if (p === '/p') return script(req, res, 'agent.py');
-    if (p === '/') {
-      const b = baseUrl(req);
-      return text(res, 200, `HelperMCP relay\n\nWindows (PowerShell):\n  [Net.ServicePointManager]::SecurityProtocol=3072; irm ${b}/h | iex\nLinux:\n  python3 <(curl -fsSL ${b}/p)\n`);
-    }
+    if (p === '/') return landing(req, res);
 
-    if (p === '/mcp') {
+    const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
+    if (mcp) {
       if (!safeEq(bearer(req), OPERATOR_KEY)) return json(res, 401, { error: 'bad operator key' });
       if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+      const fixed = mcp[1] ? mcp[1].toUpperCase() : null;
+      if (fixed && !sessions.has(fixed)) return json(res, 404, { error: `No such session ${fixed}` });
       const raw = await body(req, 1_000_000);
-      const server = buildMcp();
+      const server = buildMcp(fixed);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on('close', () => { transport.close(); server.close(); });
       await server.connect(transport);

@@ -4,7 +4,10 @@ $prevEAP = $ErrorActionPreference; $prevEAP = $ErrorActionPreference; $ErrorActi
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'write_file', 'click', 'type_text', 'press_key'
+$AskTools = 'run', 'write_file', 'click', 'type_text', 'press_key', 'mcp_start', 'mcp_call'
+$NodeVersion = 'v22.11.0'
+$script:NodeDir = $null; $script:NodeBin = $null
+$Children = @{}   # name -> other MCP servers running on this PC
 $MaxOut = 100000
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -135,6 +138,95 @@ function Do-SysInfo($a) {
     } | ConvertTo-Json) }
 }
 
+# npx/node/npm missing? Download a portable Node into a temp dir (removed on exit).
+function Ensure-Node($cmd) {
+    if ($cmd -notmatch '^(npx|npm|node)(\.cmd|\.exe)?$' -or $script:NodeBin -or (Get-Command $cmd -ErrorAction SilentlyContinue)) { return }
+    if (-not [Environment]::Is64BitOperatingSystem) { throw 'Node.js is missing and there is no 32-bit portable build' }
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+    $script:NodeDir = Join-Path $env:TEMP ('helpermcp-node-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory $script:NodeDir)
+    Write-Host '[helper] downloading portable Node.js ...'
+    $zip = Join-Path $script:NodeDir 'n.zip'
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # PS 5.1 progress bar makes downloads ~10x slower
+    try { Invoke-WebRequest "https://nodejs.org/dist/$NodeVersion/node-$NodeVersion-win-$arch.zip" -OutFile $zip -UseBasicParsing } finally { $ProgressPreference = $pp }
+    Expand-Archive $zip $script:NodeDir -Force
+    Remove-Item $zip
+    $script:NodeBin = (Get-ChildItem $script:NodeDir -Directory | Select-Object -First 1).FullName
+}
+
+function Quote-Arg($s) { if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s } }
+
+function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
+    $msg = [ordered]@{ jsonrpc = '2.0'; method = $method }
+    if ($null -ne $params) { $msg.params = $params }
+    if (-not $Notify) { $c.n++; $msg.id = $c.n }
+    $c.w.WriteLine(($msg | ConvertTo-Json -Depth 20 -Compress)); $c.w.Flush()
+    if ($Notify) { return }
+    $end = [DateTime]::UtcNow.AddSeconds($timeoutSec)
+    while ($true) {
+        if (-not $c.read) { $c.read = $c.p.StandardOutput.ReadLineAsync() }
+        $left = [int]($end - [DateTime]::UtcNow).TotalMilliseconds
+        if ($left -lt 0 -or -not $c.read.Wait($left)) { throw "MCP server timed out on $method" }
+        $line = $c.read.Result; $c.read = $null
+        if ($null -eq $line) { throw 'MCP server exited' }
+        try { $m = $line | ConvertFrom-Json } catch { continue }
+        if ($m.id -eq $c.n -and -not $m.method) {
+            if ($m.error) { throw $m.error.message }
+            return $m.result
+        }
+    }
+}
+
+function Do-McpStart($a) {
+    if ($Children.ContainsKey($a.name)) { throw "'$($a.name)' is already running" }
+    Ensure-Node $a.command
+    $exe = $a.command
+    if ($script:NodeBin -and (Test-Path (Join-Path $script:NodeBin "$exe.cmd"))) { $exe = Join-Path $script:NodeBin "$exe.cmd" }
+    elseif ($script:NodeBin -and (Test-Path (Join-Path $script:NodeBin "$exe.exe"))) { $exe = Join-Path $script:NodeBin "$exe.exe" }
+    else {   # full path incl. extension; Get-Command would return npx.ps1, which CreateProcess can't run
+        $found = foreach ($e in '.exe', '.cmd', '.bat', '') { $g = Get-Command ($exe + $e) -CommandType Application -ErrorAction SilentlyContinue; if ($g) { $g.Source; break } }
+        if (-not $found) { throw "Command '$exe' not found" }
+        $exe = @($found)[0]
+    }
+    $psi = New-Object Diagnostics.ProcessStartInfo $exe
+    $psi.Arguments = (@($a.args) | Where-Object { $null -ne $_ } | ForEach-Object { Quote-Arg $_ }) -join ' '
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    if ($script:NodeBin) { $psi.EnvironmentVariables['PATH'] = $script:NodeBin + ';' + $env:PATH }
+    if ($a.env) { foreach ($p in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$p.Name] = [string]$p.Value } }
+    $c = @{ p = [Diagnostics.Process]::Start($psi); n = 0; read = $null; tools = @() }
+    # default stdin encoding is the console codepage; MCP is UTF-8
+    $c.w = New-Object IO.StreamWriter($c.p.StandardInput.BaseStream, (New-Object Text.UTF8Encoding $false))
+    try {
+        [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } 240)
+        Child-Rpc $c 'notifications/initialized' $null -Notify
+        $c.tools = @((Child-Rpc $c 'tools/list' $null 60).tools)
+    } catch { try { $c.p.Kill() } catch { }; throw }
+    $Children[$a.name] = $c
+    @{ text = "$($a.name): $($c.tools.Count) tools: " + (($c.tools | ForEach-Object { $_.name }) -join ', ') }
+}
+function Do-McpTools($a) {
+    $all = @(foreach ($n in $Children.Keys) { foreach ($t in $Children[$n].tools) { $t | Add-Member -NotePropertyName server -NotePropertyValue $n -PassThru -Force } })
+    @{ text = (ConvertTo-Json -InputObject $all -Depth 30 -Compress) }
+}
+function Do-McpCall($a) {
+    $c = $Children[$a.server]
+    if (-not $c) { throw "No MCP server '$($a.server)'. Start it with mcp_start." }
+    $args2 = if ($a.arguments) { $a.arguments } else { @{} }
+    $r = Child-Rpc $c 'tools/call' @{ name = $a.tool; arguments = $args2 } 110
+    @{ content = @($r.content); isError = [bool]$r.isError }
+}
+function Do-McpStop($a) {
+    $c = $Children[$a.name]
+    if ($c) { try { $c.p.Kill() } catch { }; $Children.Remove($a.name) }
+    @{ text = if ($c) { 'stopped' } else { 'not running' } }
+}
+function Cleanup-Children {
+    foreach ($c in $Children.Values) { try { $c.p.Kill() } catch { } }
+    if ($script:NodeDir) { Remove-Item $script:NodeDir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 function Start-Helper {
     $mode = $env:HELPER_MODE
     if ($mode -ne 'ask' -and $mode -ne 'full') {
@@ -169,13 +261,15 @@ function Start-Helper {
                     if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
                 }
                 $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
-                    run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo' }[$name]
+                    run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
+                    mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
                 if (-not $fn) { throw "Unknown tool $name" }
                 $res.ok = $true; $res.data = & $fn $a
             } catch { $res.ok = $false; $res.error = $_.Exception.Message }
             try { [void](Api '/a/result' $res $token) } catch { }
         }
     } finally {
+        Cleanup-Children
         try { [void](Api '/a/bye' @{} $token 5) } catch { }
     }
 }

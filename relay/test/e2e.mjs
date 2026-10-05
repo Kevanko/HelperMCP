@@ -20,6 +20,11 @@ kids.push(relay);
 for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 100)); }
 
 // the real install path: fetch the script from the relay, like `irm | iex` would
+// PORTABLE=1: hide Node from the agent to test the portable-Node download
+const agentEnv = { ...process.env, HELPER_MODE: 'full' };
+if (process.env.PORTABLE) {
+  for (const k of Object.keys(agentEnv)) if (k.toUpperCase() === 'PATH') agentEnv[k] = agentEnv[k].split(path.delimiter).filter((p) => !/node/i.test(p)).join(path.delimiter);
+}
 const useps = (process.env.AGENT || (process.platform === 'win32' ? 'ps' : 'py')) === 'ps';
 const src = await (await fetch(BASE + (useps ? '/h' : '/p'))).text();
 assert.ok(!src.includes('__RELAY__') || src.includes(BASE), 'relay URL must be baked in');
@@ -27,8 +32,8 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-'));
 const file = path.join(tmp, useps ? 'a.ps1' : 'a.py');
 fs.writeFileSync(file, (useps ? '﻿' : '') + src); // PS 5.1 reads BOM-less files as ANSI
 const agent = useps
-  ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env: { ...process.env, HELPER_MODE: 'full' } }) // the real one-liner
-  : spawn('python3', [file], { env: { ...process.env, HELPER_MODE: 'full' } });
+  ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env: agentEnv }) // the real one-liner
+  : spawn('python3', [file], { env: agentEnv });
 kids.push(agent);
 let agentOut = '';
 agent.stdout.on('data', (d) => (agentOut += d));
@@ -60,6 +65,26 @@ assert.match(txt(await tool('list_dir', { session: code, path: tmp })), /f\.txt/
 
 const slow = txt(await tool('run', { session: code, command: useps ? 'Start-Sleep 20' : 'sleep 20', timeout_s: 1 }));
 assert.match(slow, /timeout/); console.log('timeout ok');
+
+// bridge: start another MCP server on the "friend's PC" and use it through the relay
+const echoJs = path.join(root, 'relay/test/echo-mcp.mjs');
+const started = txt(await tool('mcp_start', { session: code, name: 'echo', command: 'node', args: [echoJs] }));
+assert.match(started, /echo: 1 tools: say/); console.log('mcp_start ok');
+if (process.env.PORTABLE) { assert.match(agentOut, /downloading portable Node/); console.log('portable node ok'); }
+assert.equal(txt(await tool('mcp_call', { session: code, server: 'echo', tool: 'say', arguments: { msg: 'привет' } })), 'echo:привет');
+console.log('mcp_call ok (via /mcp)');
+
+// transparent mode: /s/<code>/mcp shows the child tools as native ones, no "session" argument
+const c2 = new Client({ name: 'test2', version: '0' });
+await c2.connect(new StreamableHTTPClientTransport(new URL(`${BASE}/s/${code}/mcp`), { requestInit: { headers: { Authorization: 'Bearer ' + KEY } } }));
+const names = (await c2.listTools()).tools.map((t) => t.name);
+assert.ok(names.includes('echo__say') && names.includes('run') && !names.includes('list_sessions'), names.join());
+assert.ok(!(await c2.listTools()).tools.find((t) => t.name === 'run').inputSchema.properties.session);
+assert.equal((await c2.callTool({ name: 'echo__say', arguments: { msg: 'hi' } })).content[0].text, 'echo:hi');
+assert.match((await c2.callTool({ name: 'run', arguments: { command: 'echo direct' } })).content[0].text, /direct/);
+console.log('transparent /s/<code>/mcp ok');
+await c2.close();
+await tool('mcp_stop', { session: code, name: 'echo' });
 
 const bad = await tool('run', { session: 'NOPE-NOPE', command: 'x' });
 assert.ok(bad.isError); console.log('bad session ok');

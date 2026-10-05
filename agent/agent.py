@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """HelperMCP agent for Linux/macOS. Stdlib only. Run: python3 <(curl -fsSL RELAY/p)"""
-import base64, getpass, json, locale, os, platform, shutil, socket, subprocess, sys, tempfile, time
+import base64, getpass, json, locale, os, platform, queue, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time
 import urllib.request, urllib.error
 
 RELAY = os.environ.get("HELPER_RELAY") or "__RELAY__"
@@ -14,7 +14,11 @@ T = {
     "allow": ("Разрешить? [y/N] ", "Allow? [y/N] "),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "write_file", "click", "type_text", "press_key"}
+ASK_TOOLS = {"run", "write_file", "click", "type_text", "press_key", "mcp_start", "mcp_call"}
+NODE_VERSION = "v22.11.0"
+NODE_DIR = None   # temp dir of the portable Node, if we had to download one
+NODE_BIN = None
+CHILDREN = {}     # name -> Child (other MCP servers running on this PC)
 MAX_OUT = 100_000
 scale = 1.0  # screenshot px -> real px (always 1 here: we never resize)
 
@@ -136,8 +140,103 @@ def sysinfo(_):
     }, indent=2, ensure_ascii=False)}
 
 
+def ensure_node(command):
+    """npx/node/npm missing? Download a portable Node into a temp dir (removed on exit)."""
+    global NODE_DIR, NODE_BIN
+    if command not in ("npx", "node", "npm") or shutil.which(command) or NODE_BIN:
+        return
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
+    osn = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
+    if not (arch and osn):
+        raise RuntimeError("Node.js is missing and no portable build exists for this system")
+    base = f"node-{NODE_VERSION}-{osn}-{arch}"
+    NODE_DIR = tempfile.mkdtemp(prefix="helpermcp-node-")
+    print("[helper] downloading portable Node.js ...", flush=True)
+    pkg = os.path.join(NODE_DIR, "n.tar.xz")
+    urllib.request.urlretrieve(f"https://nodejs.org/dist/{NODE_VERSION}/{base}.tar.xz", pkg)
+    with tarfile.open(pkg) as t:
+        t.extractall(NODE_DIR)
+    NODE_BIN = os.path.join(NODE_DIR, base, "bin")
+
+
+class Child:
+    """One stdio MCP server running on this PC."""
+    def __init__(self, command, args, env):
+        e = dict(os.environ, **(env or {}))
+        if NODE_BIN:
+            e["PATH"] = NODE_BIN + os.pathsep + e.get("PATH", "")
+        self.p = subprocess.Popen([command] + list(args or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=e, text=True, encoding="utf-8", bufsize=1)
+        self.q, self.n, self.tools = queue.Queue(), 0, []
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.p.stdout:
+            self.q.put(line)
+        self.q.put(None)
+
+    def rpc(self, method, params=None, timeout=60, notify=False):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params is not None: msg["params"] = params
+        if not notify:
+            self.n += 1; msg["id"] = self.n
+        self.p.stdin.write(json.dumps(msg) + "\n"); self.p.stdin.flush()
+        if notify: return None
+        end = time.time() + timeout
+        while True:
+            try: line = self.q.get(timeout=max(0.1, end - time.time()))
+            except queue.Empty: raise RuntimeError(f"MCP server timed out on {method}")
+            if line is None: raise RuntimeError("MCP server exited")
+            try: m = json.loads(line)
+            except ValueError: continue
+            if m.get("id") == self.n and "method" not in m:
+                if "error" in m: raise RuntimeError(m["error"].get("message", str(m["error"])))
+                return m["result"]
+
+
+def mcp_start(a):
+    name = a["name"]
+    if name in CHILDREN: raise RuntimeError(f"'{name}' is already running")
+    ensure_node(a["command"])
+    c = Child(a["command"], a.get("args"), a.get("env"))
+    try:
+        c.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                             "clientInfo": {"name": "helpermcp", "version": "0.2"}}, timeout=240)
+        c.rpc("notifications/initialized", notify=True)
+        c.tools = c.rpc("tools/list", timeout=60)["tools"]
+    except Exception:
+        c.p.kill(); raise
+    CHILDREN[name] = c
+    return {"text": f"{name}: {len(c.tools)} tools: " + ", ".join(t["name"] for t in c.tools)}
+
+
+def mcp_tools(_):
+    return {"text": json.dumps([{"server": n, **t} for n, c in CHILDREN.items() for t in c.tools])}
+
+
+def mcp_call(a):
+    c = CHILDREN.get(a["server"])
+    if not c: raise RuntimeError(f"No MCP server '{a['server']}'. Start it with mcp_start.")
+    r = c.rpc("tools/call", {"name": a["tool"], "arguments": a.get("arguments") or {}}, timeout=110)
+    return {"content": r.get("content", []), "isError": r.get("isError", False)}
+
+
+def mcp_stop(a):
+    c = CHILDREN.pop(a["name"], None)
+    if c: c.p.kill()
+    return {"text": "stopped" if c else "not running"}
+
+
+def cleanup():
+    for c in CHILDREN.values():
+        try: c.p.kill()
+        except Exception: pass
+    if NODE_DIR: shutil.rmtree(NODE_DIR, ignore_errors=True)
+
+
 TOOLS = dict(screenshot=screenshot, press_key=press_key, click=click, type_text=type_text, run=run,
-             read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo)
+             read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
+             mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
 def main():
@@ -173,6 +272,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        cleanup()
         try: api("/a/bye", {}, token, timeout=5)
         except Exception: pass
 

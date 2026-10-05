@@ -160,7 +160,9 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
     $msg = [ordered]@{ jsonrpc = '2.0'; method = $method }
     if ($null -ne $params) { $msg.params = $params }
     if (-not $Notify) { $c.n++; $msg.id = $c.n }
-    $c.w.WriteLine(($msg | ConvertTo-Json -Depth 20 -Compress)); $c.w.Flush()
+    $json = $msg | ConvertTo-Json -Depth 20 -Compress
+    if ($env:HELPER_DEBUG) { Write-Host "[debug] > $json" }
+    $c.w.WriteLine($json); $c.w.Flush()
     if ($Notify) { return }
     $end = [DateTime]::UtcNow.AddSeconds($timeoutSec)
     while ($true) {
@@ -168,6 +170,7 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
         $left = [int]($end - [DateTime]::UtcNow).TotalMilliseconds
         if ($left -lt 0 -or -not $c.read.Wait($left)) { throw "MCP server timed out on $method" }
         $line = $c.read.Result; $c.read = $null
+        if ($env:HELPER_DEBUG) { Write-Host "[debug] < $line" }
         if ($null -eq $line) { throw 'MCP server exited' }
         try { $m = $line | ConvertFrom-Json } catch { continue }
         if ($m.id -eq $c.n -and -not $m.method) {
@@ -195,6 +198,7 @@ function Do-McpStart($a) {
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     if ($script:NodeBin) { $psi.EnvironmentVariables['PATH'] = $script:NodeBin + ';' + $env:PATH }
     if ($a.env) { foreach ($p in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$p.Name] = [string]$p.Value } }
+    if ($env:HELPER_DEBUG) { Write-Host "[debug] start $exe $($psi.Arguments)" }
     $c = @{ p = [Diagnostics.Process]::Start($psi); n = 0; read = $null; tools = @() }
     # default stdin encoding is the console codepage; MCP is UTF-8
     $c.w = New-Object IO.StreamWriter($c.p.StandardInput.BaseStream, (New-Object Text.UTF8Encoding $false))

@@ -14,7 +14,9 @@ T = {
              "Give this code to your helper. Close this window or press Ctrl+C to stop."),
     "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ: ",
              "Mode: [1] ask before every action (recommended)  [2] full access: "),
-    "allow": ("Разрешить? [y/N] ", "Allow? [y/N] "),
+    "allow": ("Разрешить: ", "Allow: "),
+    "keys": ("да", "yes"), "always": ("всегда", "always"), "no": ("нет", "no"), "endk": ("завершить сеанс", "end the session"), "until": ("до конца сеанса", "until the session ends"),
+    "ok1": ("разрешено", "allowed"), "ok2": ("дальше без вопросов", "no more questions for"), "den": ("отклонено", "denied"), "esc": ("сеанс завершён (Esc)", "session ended (Esc)"),
     "overlay": ("Удалённое управление", "Remote control"),
     "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
@@ -261,6 +263,89 @@ def press_key(a):
     for kc in codes: X["t"].XTestFakeKeyEvent(X["d"], kc, 1, 0)
     for kc in reversed(codes): X["t"].XTestFakeKeyEvent(X["d"], kc, 0, 0)
     overlay_send("typing"); sync(X); return {"text": "ok"}
+
+
+def focus_window():
+    """the window that has the keyboard focus (None when unknown): the terminal where the friend answers takes it, so it is given back afterwards"""
+    try:
+        X = xlib(); x11 = X["x"]; w = ctypes.c_ulong(); rv = ctypes.c_int()
+        x11.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)]   # without argtypes the Display pointer is cut to 32 bits: segfault
+        x11.XGetInputFocus(X["d"], ctypes.byref(w), ctypes.byref(rv)); return w.value if w.value > 1 else None
+    except Exception: return None
+
+
+def restore_focus(w):
+    if not w: return
+    try:
+        X = xlib(); X["x"].XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        X["x"].XSetInputFocus(X["d"], ctypes.c_ulong(w), 1, 0); sync(X); time.sleep(0.15)
+    except Exception: pass
+
+
+ASK_GROUP = {"click": "mouse", "move": "mouse", "drag": "mouse", "scroll": "mouse", "type_text": "keyboard", "press_key": "keyboard", "run": "commands",
+             "start_process": "commands", "write_file": "files", "fetch_file": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
+GROUP_LABEL = {"mouse": ("мышь", "mouse"), "keyboard": ("клавиатура", "keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
+ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
+END = threading.Event()
+
+
+def cut(x, n): x = str(x); return x if len(x) <= n else x[:n] + "…"
+
+
+def describe(name, a):
+    ru = os.environ.get("LANG", "").startswith("ru")
+    d = {"click": f"клик ({a.get('x')}, {a.get('y')})" if ru else f"click ({a.get('x')}, {a.get('y')})",
+         "move": f"движение мыши к ({a.get('x')}, {a.get('y')})" if ru else f"move the mouse to ({a.get('x')}, {a.get('y')})",
+         "drag": f"перетаскивание ({a.get('x')}, {a.get('y')}) -> ({a.get('x2')}, {a.get('y2')})" if ru else f"drag ({a.get('x')}, {a.get('y')}) -> ({a.get('x2')}, {a.get('y2')})",
+         "type_text": ("ввод текста: " if ru else "type text: ") + '"' + cut(a.get("text", ""), 60) + '"', "press_key": ("клавиши: " if ru else "keys: ") + str(a.get("keys")),
+         "run": ("команда: " if ru else "command: ") + cut(a.get("command", ""), 90)}
+    return d.get(name) or f"{name} {cut(json.dumps(a, ensure_ascii=False), 90)}"
+
+
+def read_key():
+    """one key press, no Enter: y / Enter = yes, a = always, n = no, Esc = end the session"""
+    import termios, tty, select
+    fd = sys.stdin.fileno(); old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH); tty.setcbreak(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\x1b":
+                if select.select([fd], [], [], 0.05)[0]: os.read(fd, 8); continue      # an arrow key or similar: not Esc
+                return "esc"
+            ch = ch.lower()
+            if ch in (b"y", b"\n", b"\r"): return "y"
+            if ch in (b"a", b"n"): return ch.decode()
+    finally: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def ask_permission(name, a):
+    g = ASK_GROUP[name]
+    if g in ALLOWED: return
+    fw = focus_window() or AI["fw"]; label = GROUP_LABEL[g][0 if t("keys") == "да" else 1]
+    sys.stdout.write("\a"); sys.stdout.flush()
+    try: subprocess.Popen(["notify-send", "-u", "critical", "-t", "20000", "HelperMCP", describe(name, a)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception: pass
+    print(f"\n\033[1;30;43m  >>> {t('allow')}{describe(name, a)}?  \033[0m\n\033[33m      [Y] {t('keys')}    [A] {t('always')} ({label}, {t('until')})    [N] {t('no')}    [Esc] {t('endk')}\033[0m", flush=True)
+    k = read_key()
+    if k == "esc": END.set(); print("  " + t("esc"), flush=True); raise RuntimeError("The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.")
+    if k == "n": print("  " + t("den"), flush=True); raise RuntimeError("The user denied this action. Do not repeat it; ask the operator what to do instead.")
+    if k == "a": ALLOWED.add(g); print(f"\033[32m  {t('ok2')}: {label}\033[0m", flush=True)
+    else: print(f"\033[32m  {t('ok1')}\033[0m", flush=True)
+    restore_focus(fw)
+
+
+def resume_state(name):
+    """put the window focus and the pointer back where the previous AI action left them (answering a question moves both)"""
+    if name not in GUI_TOOLS or not AI["pos"] or time.time() - AI["t"] > 90: return
+    if AI["fw"] and focus_window() != AI["fw"]: restore_focus(AI["fw"])
+    if name in ("type_text", "press_key", "scroll"):
+        x, y = pointer_pos()
+        if abs(x - AI["pos"][0]) + abs(y - AI["pos"][1]) > 6: overlay_send("active"); glide(*AI["pos"], 0.3)
+
+
+def mark_state(name):
+    if name in GUI_TOOLS: time.sleep(0.08); AI.update(t=time.time(), pos=pointer_pos(), fw=focus_window())
 
 
 def type_text(a):
@@ -1032,10 +1117,9 @@ def handle(cmd, mode, token):
     res = {"id": cmd["id"]}
     try:
         if mode == "ask" and name in ASK_TOOLS:
-            with ASK_LOCK:
-                if input(t("allow")).strip().lower() not in ("y", "yes", "д", "да"): raise RuntimeError("User denied this action.")
+            with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
-            with GUI_LOCK: res.update(ok=True, data=TOOLS[name](args))
+            with GUI_LOCK: resume_state(name); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)
         else:
             res.update(ok=True, data=TOOLS[name](args))
     except Exception as e:  # report every failure to the operator
@@ -1046,6 +1130,7 @@ def handle(cmd, mode, token):
             if e.code in (401, 410): break
             time.sleep(1 + attempt)
         except Exception: time.sleep(1 + attempt)
+    if END.is_set(): print("session closed", flush=True); os.kill(os.getpid(), signal.SIGTERM)   # Esc: leave at once (the main thread runs the cleanup and says bye)
 
 
 NET = {"s": "ok"}

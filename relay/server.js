@@ -77,7 +77,7 @@ const safeEq = (a, b) => {
 // ---- session / command plumbing ------------------------------------------
 function call(code, tool, args = {}, timeoutMs = 60_000) {
   const s = sessions.get(String(code).toUpperCase());
-  if (!s) return Promise.reject(new Error(`No such session "${code}". Use list_sessions.`));
+  if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
   if (Date.now() - s.lastSeen > ONLINE_MS && !s.pending.size && tool !== 'bye') {
     return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
@@ -232,7 +232,7 @@ const tools = [
     description: 'Get a link to a live view of the remote screen (updates about once a second, plus a log of what the AI is doing). Open it in a browser so the operator can watch; on the operator\'s PC e.g. `start <url>` (Windows), `xdg-open <url>` (Linux), `open <url>` (macOS).',
     run: async (code) => {
       const c = code.toUpperCase();
-      if (!sessions.has(c)) throw new Error(`No such session "${code}". Use list_sessions.`);
+      if (!sessions.has(c)) throw new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`);
       const token = crypto.randomBytes(18).toString('hex');
       viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS }); save();
       return { text: `${lastBase}/v/${token}` };
@@ -520,7 +520,7 @@ async function handler(req, res) {
         files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS });
         return json(res, 200, { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n });
       }
-      if (p === '/a/bye') { console.log(`- ${code} bye`); drop(code, 'Agent left.'); return json(res, 200, {}); }
+      if (p === '/a/bye') { console.log(`- ${code} bye`); drop(code, 'The user closed the helper or pressed Esc. STOP: do not retry, tell the operator.'); return json(res, 200, {}); }
     }
     json(res, 404, { error: 'not found' });
   } catch (e) {

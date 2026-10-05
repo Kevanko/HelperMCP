@@ -17,6 +17,13 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace H -Name U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint f);
+[StructLayout(LayoutKind.Sequential)] public struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+[DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO f);
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
 [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
@@ -781,21 +788,89 @@ $LightTools = 'screenshot', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
 $script:Deferred = New-Object System.Collections.ArrayList
 $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
 
+# ---- ask mode: one key press instead of typing y + Enter, a chime and a flashing window when a question is waiting, "always" per kind of action for this session,
+# Esc ends the session. The console takes the keyboard focus and the friend moves the mouse to answer, so before the next action the window focus and the
+# pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
+$AskGroup = @{ click = 'mouse'; move = 'mouse'; drag = 'mouse'; scroll = 'mouse'; type_text = 'keyboard'; press_key = 'keyboard'; run = 'commands'; start_process = 'commands'
+    write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
+$script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero
+function Group-Label($g) { switch ($g) { 'mouse' { T 'мышь' 'mouse' } 'keyboard' { T 'клавиатура' 'keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
+function Cut($t, $n) { $t = [string]$t; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
+function Describe-Action($name, $a) {
+    switch ($name) {
+        'click' { T "клик ($($a.x), $($a.y))" "click ($($a.x), $($a.y))" }
+        'move' { T "движение мыши к ($($a.x), $($a.y))" "move the mouse to ($($a.x), $($a.y))" }
+        'drag' { T "перетаскивание ($($a.x), $($a.y)) -> ($($a.x2), $($a.y2))" "drag ($($a.x), $($a.y)) -> ($($a.x2), $($a.y2))" }
+        'scroll' { T "прокрутка ($($a.amount))" "scroll ($($a.amount))" }
+        'type_text' { T ('ввод текста: "' + (Cut $a.text 60) + '"') ('type text: "' + (Cut $a.text 60) + '"') }
+        'press_key' { T "клавиши: $($a.keys)" "keys: $($a.keys)" }
+        'run' { T ('команда: ' + (Cut $a.command 90)) ('command: ' + (Cut $a.command 90)) }
+        default { "$name " + (Cut ($a | ConvertTo-Json -Compress) 90) }
+    }
+}
+function Flash-Console {
+    try { $f = New-Object 'H.U+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U]::GetAncestor([H.U]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U]::FlashWindowEx([ref]$f) } catch { }
+}
+function Restore-Focus($h) {
+    if ($h -eq [IntPtr]::Zero -or -not [H.U]::IsWindow($h) -or [H.U]::GetForegroundWindow() -eq $h) { return }
+    [H.U]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [H.U]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # an Alt tap lets SetForegroundWindow through the foreground lock
+    [void][H.U]::SetForegroundWindow($h); Start-Sleep -Milliseconds 200
+}
+function Is-Console($h) { $c = [H.U]::GetConsoleWindow(); $h -eq $c -or $h -eq [H.U]::GetAncestor($c, 3) }
+function Focus-Before-Question {   # the window to give the focus back to: the foreground one, or the last one that was not this console
+    $fg = [H.U]::GetForegroundWindow()
+    if ((Is-Console $fg) -and $script:AiFg -ne [IntPtr]::Zero) { return $script:AiFg }
+    $fg
+}
+function Ask-Permission($name, $a) {
+    $g = $AskGroup[$name]; if ($script:Allowed[$g]) { return }
+    $fg = Focus-Before-Question; $desc = Describe-Action $name $a
+    try { [Console]::Beep(880, 70); [Console]::Beep(1318, 120) } catch { }
+    Flash-Console; $title = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = '>>> ' + (T 'ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ' 'CONFIRMATION NEEDED')
+    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }   # keys typed before the question must not answer it
+    Write-Host ''
+    Write-Host ('  >>> ' + (T 'Разрешить: ' 'Allow: ') + $desc + '?  ') -ForegroundColor Black -BackgroundColor Yellow
+    Write-Host ('      [Y] ' + (T 'да' 'yes') + '    [A] ' + (T 'всегда' 'always') + ' (' + (Group-Label $g) + ', ' + (T 'до конца сеанса' 'until the session ends') + ')    [N] ' + (T 'нет' 'no') + '    [Esc] ' + (T 'завершить сеанс' 'end the session')) -ForegroundColor Yellow
+    $answer = $null
+    while (-not $answer) {
+        $k = [Console]::ReadKey($true)
+        switch ($k.Key) { 'Y' { $answer = 'y' } 'Enter' { $answer = 'y' } 'A' { $answer = 'a' } 'N' { $answer = 'n' } 'Escape' { $answer = 'esc' } }
+    }
+    $Host.UI.RawUI.WindowTitle = $title
+    if ($answer -eq 'esc') { $script:EndRequested = $true; Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; throw 'The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.' }
+    if ($answer -eq 'n') { Write-Host ('  ' + (T 'отклонено' 'denied')) -ForegroundColor DarkYellow; throw 'The user denied this action. Do not repeat it; ask the operator what to do instead.' }
+    if ($answer -eq 'a') { $script:Allowed[$g] = $true; Write-Host ('  ' + (T "дальше без вопросов: $(Group-Label $g)" "no more questions for: $(Group-Label $g)")) -ForegroundColor Green }
+    else { Write-Host ('  ' + (T 'разрешено' 'allowed')) -ForegroundColor Green }
+    Restore-Focus $fg
+}
+$GuiTools = 'click', 'move', 'drag', 'scroll', 'type_text', 'press_key'
+function Resume-State($name) {   # put the window focus and the pointer back where the previous AI action left them
+    if ($GuiTools -notcontains $name -or -not $script:AiAt -or ([DateTime]::UtcNow - $script:AiAt).TotalSeconds -gt 90) { return }
+    if ($script:AiFg -ne [IntPtr]::Zero -and [H.U]::GetForegroundWindow() -ne $script:AiFg) { Restore-Focus $script:AiFg }
+    if ($name -in 'type_text', 'press_key', 'scroll') {
+        $p = [Windows.Forms.Cursor]::Position
+        if ([Math]::Abs($p.X - $script:AiPos.X) + [Math]::Abs($p.Y - $script:AiPos.Y) -gt 6) { Overlay-Send 'active'; Glide $script:AiPos.X $script:AiPos.Y 0.3 }
+    }
+}
+function Mark-State($name) {
+    if ($GuiTools -notcontains $name) { return }
+    Start-Sleep -Milliseconds 80; $fg = [H.U]::GetForegroundWindow()
+    $script:AiAt = [DateTime]::UtcNow; $script:AiPos = [Windows.Forms.Cursor]::Position; $script:AiFg = if (Is-Console $fg) { [IntPtr]::Zero } else { $fg }
+}
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
     $short = ($cmd.args | ConvertTo-Json -Compress); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) }
     Write-Host "[helper] $name $short"
     $res = @{ id = $cmd.id }
     try {
-        if ($script:Mode -eq 'ask' -and $AskTools -contains $name) {
-            $yn = Read-Host (T 'Разрешить? [y/N]' 'Allow? [y/N]')
-            if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
-        }
+        if ($script:Mode -eq 'ask' -and $AskTools -contains $name) { Ask-Permission $name $a }
+        Resume-State $name
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
             fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
+        Mark-State $name
     } catch { $res.ok = $false; $res.error = $_.Exception.Message }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
         try { Post-Result $res $script:Token; break }
@@ -881,6 +956,7 @@ function Start-Helper {
             }
             if ($cmd.tool -eq 'bye') { Write-Host 'session closed'; return }
             Process-Command $cmd
+            if ($script:EndRequested) { Write-Host (T 'сессия закрыта' 'session closed'); return }
         }
     } finally {
         Cleanup-Children

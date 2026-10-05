@@ -26,6 +26,9 @@ if (!OPERATOR_KEY) {
 }
 
 const sessions = new Map(); // code -> session
+const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
+let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
+const VIEWER_TTL_MS = 12 * 3600_000;
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const newCode = () => {
   const b = crypto.randomBytes(8);
@@ -43,6 +46,11 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
   if (!s) return Promise.reject(new Error(`No such session "${code}". Use list_sessions.`));
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'ask') timeoutMs += 120_000;
+  if (!args.view) { // live-viewer frames are not "actions"
+    const a = JSON.stringify(args, (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v));
+    s.log.push({ t: Date.now(), tool, args: a === '{}' ? '' : a.slice(0, 160) });
+    if (s.log.length > 60) s.log.shift();
+  }
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -73,6 +81,7 @@ function drop(code, why) {
 }
 
 setInterval(() => {
+  for (const [t, v] of viewers) if (v.exp < Date.now()) viewers.delete(t);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
@@ -114,6 +123,15 @@ const tools = [
   { name: 'mcp_call', agent: true, ms: () => 120_000, description: 'Call a tool of an MCP server started with mcp_start.',
     props: { server: str('Name given to mcp_start'), tool: str('Tool name'), arguments: { type: 'object' } }, required: ['server', 'tool'] },
   { name: 'mcp_stop', agent: true, description: 'Stop an MCP server started with mcp_start.', props: { name: str('Name') }, required: ['name'] },
+  { name: 'open_viewer', session: true, props: {},
+    description: 'Get a link to a live view of the remote screen (updates about once a second, plus a log of what the AI is doing). Open it in a browser so the operator can watch; on the operator\'s PC e.g. `start <url>` (Windows), `xdg-open <url>` (Linux), `open <url>` (macOS).',
+    run: async (code) => {
+      const c = code.toUpperCase();
+      if (!sessions.has(c)) throw new Error(`No such session "${code}". Use list_sessions.`);
+      const token = crypto.randomBytes(18).toString('hex');
+      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS });
+      return { text: `${lastBase}/v/${token}` };
+    } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
     run: async (code) => { await call(code, 'bye').catch(() => {}); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },
 ];
@@ -221,6 +239,38 @@ function landing(req, res) {
 <p><small>Nothing is installed. The script is <a href="${esc(b)}/h">readable here</a>.</small></p>`, 'text/html; charset=utf-8');
 }
 
+function viewerPage(s) {
+  const who = s ? `${s.info.user}@${s.info.host}` : '';
+  const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Remote screen ${esc(who)}</title>
+<style>html,body{margin:0;height:100%;background:#0b0f16;color:#cfd8e6;font:14px system-ui}
+#top{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#111826;border-bottom:1px solid #26324a}
+#dot{width:9px;height:9px;border-radius:50%;background:#888}#dot.on{background:#4c8dff;box-shadow:0 0 8px #4c8dff}
+#main{display:flex;height:calc(100% - 41px)}#scr{flex:1;display:flex;align-items:center;justify-content:center;min-width:0}
+#scr img{max-width:100%;max-height:100%;box-shadow:0 0 0 1px #26324a}
+#log{width:340px;overflow:auto;border-left:1px solid #26324a;padding:8px 12px;font:12px ui-monospace,monospace}
+#log div{padding:2px 0;border-bottom:1px solid #1a2233;word-break:break-all}#log b{color:#7fb0ff}#log i{color:#6b7a94;font-style:normal}
+@media(max-width:800px){#main{flex-direction:column}#log{width:auto;height:30%;border-left:0;border-top:1px solid #26324a}}</style>
+<div id=top><span id=dot></span><b id=st>…</b><span style="color:#6b7a94">${esc(who)}</span></div>
+<div id=main><div id=scr><img id=img alt=""></div><div id=log></div></div>
+<script>
+const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён'}:{live:'Live',wait:'Waiting for a frame…',end:'Session ended'};
+const dot=document.getElementById('dot'),st=document.getElementById('st'),img=document.getElementById('img'),log=document.getElementById('log');
+let ended=false;
+async function frames(){while(!ended){try{const r=await fetch('frame?'+Date.now());
+ if(r.status===410){ended=true;break}
+ if(r.ok){const u=URL.createObjectURL(await r.blob());const o=img.src;img.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o);dot.className='on';st.textContent=L.live}
+ else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
+ catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,2000))}
+ await new Promise(x=>setTimeout(x,150))}
+ dot.className='';st.textContent=L.end}
+async function logs(){while(!ended){try{const r=await fetch('log');if(r.ok){const a=await r.json();
+ log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+e.tool+'</b> '+(e.args||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('')}}catch(e){}
+ await new Promise(x=>setTimeout(x,1500))}}
+frames();logs();
+</script>`;
+}
+
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /i, '');
 const byToken = (req) => {
   const t = bearer(req);
@@ -237,10 +287,28 @@ async function handler(req, res) {
     if (p === '/p') return script(req, res, 'agent.py');
     if (p === '/') return landing(req, res);
 
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log)?$/);   // live viewer for the operator (link from open_viewer)
+    if (vw) {
+      const v = viewers.get(vw[1]);
+      if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
+      const s = sessions.get(v.code);
+      if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
+      if (!s) return json(res, 410, { error: 'session ended' });
+      if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
+      if (v.busy) { return v.last ? (res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }), res.end(v.last)) : json(res, 429, {}); }
+      v.busy = true;
+      try {
+        const d = await call(v.code, 'screenshot', { view: true }, 20_000);
+        v.last = Buffer.from(d.image, 'base64');
+        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(v.last);
+      } catch (e) { return json(res, 503, { error: e.message }); } finally { v.busy = false; }
+    }
+
     const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
     if (mcp) {
       if (!safeEq(bearer(req), OPERATOR_KEY)) return json(res, 401, { error: 'bad operator key' });
       if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+      lastBase = baseUrl(req);
       const fixed = mcp[1] ? mcp[1].toUpperCase() : null;
       if (fixed && !sessions.has(fixed)) return json(res, 404, { error: `No such session ${fixed}` });
       const raw = await body(req, 1_000_000);
@@ -260,7 +328,7 @@ async function handler(req, res) {
       const s = {
         token: crypto.randomBytes(32).toString('hex'), ip, mode: info.mode === 'ask' ? 'ask' : 'full',
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
-        queue: [], pending: new Map(), waiting: null, waitTimer: null, created: Date.now(), lastSeen: Date.now(),
+        queue: [], pending: new Map(), waiting: null, waitTimer: null, created: Date.now(), lastSeen: Date.now(), log: [],
       };
       sessions.set(code, s);
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);

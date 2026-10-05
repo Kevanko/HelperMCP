@@ -60,6 +60,10 @@ Two ways to connect:
 * **`/mcp`**: connect once, every tool takes a `session` argument (the code). Use `list_sessions` to see who is online.
 * **`/s/<CODE>/mcp`**: one connection per help session. The friend's PC then looks like your own: no `session` argument, and the tools of any started child MCP server show up as native tools named `<server>__<tool>`. Best when your AI client lets you add a server on the fly.
 
+## Watch what is happening
+
+`open_viewer` returns a link (valid 12 h, usable only for that session; it does not expose your operator key). Open it in a browser and you get a **live view of the remote screen** (about 1 frame/s) next to a log of what the AI is doing. Ask your AI to open it for you, e.g. `start <url>` on Windows or `xdg-open <url>` on Linux. The viewer never moves the mouse and does not change the coordinates the AI clicks with.
+
 ## Tools
 
 | Tool | What |
@@ -67,6 +71,7 @@ Two ways to connect:
 | `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs |
 | `click`, `scroll`, `type_text`, `press_key` | mouse and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
 | `mcp_start`, `mcp_tools`, `mcp_call`, `mcp_stop` | run and use **other MCP servers on the friend's PC** |
+| `open_viewer` | link to a live view of the remote screen + action log |
 | `list_sessions`, `end_session` | session management |
 
 ### Using other MCP servers (e.g. their browser)

@@ -126,22 +126,23 @@ def monitors():
 def screenshot(a):
     global SCALE, ORIGIN
     if not GUI["type"]: raise RuntimeError("No graphical session found (nobody is logged in to a desktop).")
-    mons, want = monitors(), (a or {}).get("monitor")
+    mons, want, view = monitors(), (a or {}).get("monitor"), bool((a or {}).get("view"))   # view: the live viewer's frame, must not change click coordinates
     if want is not None and not (0 <= int(want) < len(mons)): raise RuntimeError(f"No monitor {want}. Monitors: {mons}")
     d = tempfile.mkdtemp()
     try:
         path = capture_file(d)
-        try:  # crop to one monitor if asked, downscale to <=1920 px wide, remember offset+factor for click coordinates
+        try:  # crop to one monitor if asked, downscale to <=1920 px wide (1280 for the viewer), remember offset+factor for click coordinates
             import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
-            pb = GdkPixbuf.Pixbuf.new_from_file(path); ORIGIN = (0, 0)
+            pb = GdkPixbuf.Pixbuf.new_from_file(path); org = (0, 0); cap = 1280 if view else 1920
             if want is not None:
-                x, y, w, h = mons[int(want)]; pb = pb.new_subpixbuf(x, y, w, h); ORIGIN = (x, y)
-            w = pb.get_width(); SCALE = max(1.0, w / 1920)
-            if SCALE > 1: pb = pb.scale_simple(1920, int(pb.get_height() / SCALE), GdkPixbuf.InterpType.BILINEAR)
-            _, buf = pb.save_to_bufferv("jpeg", ["quality"], ["70"])
+                x, y, w, h = mons[int(want)]; pb = pb.new_subpixbuf(x, y, w, h); org = (x, y)
+            w = pb.get_width(); sc = max(1.0, w / cap)
+            if sc > 1: pb = pb.scale_simple(cap, int(pb.get_height() / sc), GdkPixbuf.InterpType.BILINEAR)
+            if not view: SCALE, ORIGIN = sc, org
+            _, buf = pb.save_to_bufferv("jpeg", ["quality"], ["65" if view else "70"])
             return {"image": base64.b64encode(buf).decode(), "mime": "image/jpeg"}
         except Exception:
-            SCALE, ORIGIN = 1.0, (0, 0)
+            if not view: SCALE, ORIGIN = 1.0, (0, 0)
             with open(path, "rb") as f:
                 return {"image": base64.b64encode(f.read()).decode(), "mime": "image/jpeg" if path.endswith("jpg") else "image/png"}
     finally:
@@ -385,7 +386,8 @@ label, ppid = sys.argv[1], int(sys.argv[2])
 R, G, B = 0x4C / 255, 0x8D / 255, 0xFF / 255
 wins = []
 def make(mon):                       # one overlay window per monitor: every screen the helper can see is marked
-    g = mon.get_geometry(); W, H = g.width, g.height
+    g = mon.get_geometry()
+    W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
     w = Gtk.Window(type=Gtk.WindowType.POPUP)
     w.set_app_paintable(True)
     vis = w.get_screen().get_rgba_visual()

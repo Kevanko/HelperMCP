@@ -91,6 +91,16 @@ await tool('mcp_stop', { session: code, name: 'echo' });
 const busy = txt(await tool('run', { session: code, command: useps ? 'Start-Sleep 6; echo done' : 'sleep 6; echo done', timeout_s: 30 }));
 assert.match(busy, /done/); console.log('long call survives idle limit ok');
 
+// live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)
+const vurl = txt(await tool('open_viewer', { session: code }));
+assert.match(vurl, new RegExp(`^${BASE}/v/[0-9a-f]{36}$`));
+assert.match(await (await fetch(vurl)).text(), /Remote screen/);
+const vlog = await (await fetch(vurl + '/log')).json();
+assert.ok(vlog.some((e) => e.tool === 'run') && !vlog.some((e) => e.args.includes('view')), 'log shows actions, not viewer frames');
+assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);
+if (process.env.GUI) { const fr = await fetch(vurl + '/frame'); assert.equal(fr.headers.get('content-type'), 'image/jpeg'); assert.ok((await fr.arrayBuffer()).byteLength > 1000); }
+console.log('viewer ok');
+
 const bad = await tool('run', { session: 'NOPE-NOPE', command: 'x' });
 assert.ok(bad.isError); console.log('bad session ok');
 

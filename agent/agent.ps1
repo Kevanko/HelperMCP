@@ -42,14 +42,16 @@ function Do-Screenshot($a) {
         if ([int]$a.monitor -lt 0 -or [int]$a.monitor -ge $all.Count) { throw "No monitor $($a.monitor). Monitors: 0..$($all.Count - 1)" }
         $s = $all[[int]$a.monitor].Bounds
     }
-    $script:OriginX = $s.Left; $script:OriginY = $s.Top
+    $view = [bool]$a.view   # the live viewer's frames must not change the coordinates the AI clicks with
+    if (-not $view) { $script:OriginX = $s.Left; $script:OriginY = $s.Top }
     $bmp = New-Object Drawing.Bitmap $s.Width, $s.Height
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
-    $w = [Math]::Min(1920, $s.Width)
-    $script:Scale = $s.Width / $w
-    $out = New-Object Drawing.Bitmap $w, ([int]($s.Height / $script:Scale))
+    $w = [Math]::Min($(if ($view) { 1280 } else { 1920 }), $s.Width)
+    $sc = $s.Width / $w
+    if (-not $view) { $script:Scale = $sc }
+    $out = New-Object Drawing.Bitmap $w, ([int]($s.Height / $sc))
     $g = [Drawing.Graphics]::FromImage($out)
     $g.InterpolationMode = 'HighQualityBicubic'
     $g.DrawImage($bmp, 0, 0, $out.Width, $out.Height)

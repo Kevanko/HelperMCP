@@ -168,10 +168,13 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
     while ($true) {
         if (-not $c.read) { $c.read = $c.p.StandardOutput.ReadLineAsync() }
         $left = [int]($end - [DateTime]::UtcNow).TotalMilliseconds
-        if ($left -lt 0 -or -not $c.read.Wait($left)) { throw "MCP server timed out on $method" }
+        if ($left -lt 0 -or -not $c.read.Wait($left)) {
+            $why = if ($c.p.HasExited) { "exited with code $($c.p.ExitCode): " + $c.err.Result } else { 'still running, no reply' }
+            throw "MCP server timed out on $method ($why)"
+        }
         $line = $c.read.Result; $c.read = $null
         if ($env:HELPER_DEBUG) { Write-Host "[debug] < $line" }
-        if ($null -eq $line) { throw 'MCP server exited' }
+        if ($null -eq $line) { [void]$c.p.WaitForExit(2000); throw ('MCP server exited: ' + $(if ($c.p.HasExited) { $c.err.Result } else { '' })) }
         try { $m = $line | ConvertFrom-Json } catch { continue }
         if ($m.id -eq $c.n -and -not $m.method) {
             if ($m.error) { throw $m.error.message }
@@ -193,17 +196,18 @@ function Do-McpStart($a) {
     }
     $psi = New-Object Diagnostics.ProcessStartInfo $exe
     $psi.Arguments = (@($a.args) | Where-Object { $null -ne $_ } | ForEach-Object { Quote-Arg $_ }) -join ' '
-    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
     if ($script:NodeBin) { $psi.EnvironmentVariables['PATH'] = $script:NodeBin + ';' + $env:PATH }
     if ($a.env) { foreach ($p in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$p.Name] = [string]$p.Value } }
     if ($env:HELPER_DEBUG) { Write-Host "[debug] start $exe $($psi.Arguments)" }
     $c = @{ p = [Diagnostics.Process]::Start($psi); n = 0; read = $null; tools = @() }
+    $c.err = $c.p.StandardError.ReadToEndAsync()   # drained in the background (also keeps the pipe from filling); shown if the server dies. ponytail: grows with a chatty server's stderr
     # default stdin encoding is the console codepage; MCP is UTF-8
     $c.w = New-Object IO.StreamWriter($c.p.StandardInput.BaseStream, (New-Object Text.UTF8Encoding $false))
     try {
-        [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } 240)
+        [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } $(if ($env:HELPER_INIT_TIMEOUT) { [int]$env:HELPER_INIT_TIMEOUT } else { 240 }))
         Child-Rpc $c 'notifications/initialized' $null -Notify
         $c.tools = @((Child-Rpc $c 'tools/list' $null 60).tools)
     } catch { try { $c.p.Kill() } catch { }; throw }

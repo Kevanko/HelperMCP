@@ -59,7 +59,7 @@ class HelperService : AccessibilityService() {
         if (running) return
         running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; phase = "connecting"
         fx.onEnd = { endSession() }
-        Thread { try { loop(relay) } finally { running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
+        Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
     }
 
     fun endSession() { ended = true; fx.hide() }

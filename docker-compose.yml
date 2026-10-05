@@ -2,6 +2,12 @@ services:
   helpermcp:
     build: .
     restart: unless-stopped
+    read_only: true               # the relay writes only to /data (state, encrypted files) and /tmp
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]               # root only to read the root-owned certificate files: no capabilities, no new privileges
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 1g
     user: "0"   # only to read root-owned Let's Encrypt keys in TLS_CERT mode; harmless otherwise
     ports: ["${RELAY_BIND:-0.0.0.0}:${RELAY_PORT:-8444}:8444"]
     environment:

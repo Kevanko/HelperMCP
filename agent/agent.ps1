@@ -1109,6 +1109,7 @@ function Start-Helper {
     } finally {
         Cleanup-Children
         try { [void](Api '/a/bye' @{} $script:Token 5) } catch { }
+        try { if ((Get-Clipboard -Raw).Trim() -eq $code) { Set-Clipboard -Value ' ' } } catch { }   # the session code does not stay in the clipboard
         if ($script:VT) { try { $e = [char]27; [Console]::Write("$e[r$e[$([Console]::WindowHeight);1H`n") } catch { } }   # the header's scroll region off, the prompt back at the bottom
     }
 }

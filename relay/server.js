@@ -35,6 +35,14 @@ if (!OPERATOR_KEY) {
 const sessions = new Map(); // code -> session
 const STATE_FILE = process.env.STATE_FILE || '';   // e.g. /data/state.json; empty = keep everything in memory only
 const sha = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');   // agent tokens are stored hashed
+// the state file is encrypted (AES-256-GCM, key derived from OPERATOR_KEY): a copy of data/ alone reveals nothing, and it only holds live sessions
+const STATE_KEY = crypto.scryptSync(String(process.env.OPERATOR_KEY || ''), 'helpermcp-state-v1', 32);
+const seal = (txt) => { const iv = crypto.randomBytes(12), c = crypto.createCipheriv('aes-256-gcm', STATE_KEY, iv); const ct = Buffer.concat([c.update(txt, 'utf8'), c.final()]); return Buffer.concat([Buffer.from('HM1'), iv, c.getAuthTag(), ct]); };
+const unseal = (buf) => {
+  if (buf.subarray(0, 3).toString() !== 'HM1') return buf.toString('utf8');   // an old plain state file: read once, saved encrypted from then on
+  const d = crypto.createDecipheriv('aes-256-gcm', STATE_KEY, buf.subarray(3, 15)); d.setAuthTag(buf.subarray(15, 31));
+  return Buffer.concat([d.update(buf.subarray(31)), d.final()]).toString('utf8');
+};
 let saveTimer = null;
 function save() {
   if (!STATE_FILE || saveTimer) return;
@@ -46,7 +54,7 @@ function save() {
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp })),
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-      fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(out), { mode: 0o600 });
+      fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
       fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
     } catch (e) { console.error('state save failed:', e.message); }
   }, 300);
@@ -61,8 +69,9 @@ const APK_FILE = process.env.APK_FILE || (STATE_FILE ? path.join(path.dirname(ST
 const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
 const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
 const FILE_TTL_MS = 24 * 3600_000;
-const files = new Map();   // id -> { path, name, size, exp }
+const files = new Map();   // id -> { path, name, size, exp, code, key, iv, tag }: encrypted on disk with a key that lives only in memory, deleted with the session
 try { fs.rmSync(FILES_DIR, { recursive: true, force: true }); fs.mkdirSync(FILES_DIR, { recursive: true }); } catch { /* best effort */ }
+const regRate = new Map();               // ip -> { n, t }: registrations per minute
 const authFails = new Map();             // ip -> { n, until }: wrong operator keys
 const AUTH_MAX_FAILS = 20, AUTH_WINDOW_MS = 10 * 60_000;
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
@@ -115,7 +124,10 @@ function flush(s) {
 function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
-  sessions.delete(code); save();
+  sessions.delete(code); s.log.length = 0; s.queue.length = 0;
+  for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }   // files fetched in this session die with it
+  for (const [t, v] of viewers) if (v.code === code) { v.last = null; viewers.delete(t); }                          // so do viewer links and their last frame
+  save();
   for (const p of s.pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)); }
   if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 410, { error: why }); }
 }
@@ -124,6 +136,7 @@ setInterval(() => {
   for (const [t, v] of viewers) if (v.exp < Date.now()) viewers.delete(t);
   for (const [id, f] of files) if (f.exp < Date.now()) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
+  for (const [ip, r] of regRate) if (Date.now() - r.t > 60_000) regRate.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
@@ -468,6 +481,8 @@ async function handler(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
   try {
+    res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('referrer-policy', 'no-referrer'); res.setHeader('strict-transport-security', 'max-age=31536000');
+    res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
     if (p === '/health') return text(res, 200, 'ok');
     if (p === '/apk') {   // the Android app (people scan the QR code on the landing page)
       if (!fs.existsSync(APK_FILE)) return text(res, 404, 'The Android app is not installed on this server');
@@ -502,8 +517,9 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
     if (fm) {
       const f = files.get(fm[1]);
       if (!f || f.exp < Date.now()) return text(res, 404, 'file expired or invalid');
-      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${f.name}"` });
-      return fs.createReadStream(f.path).pipe(res);
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${f.name}"`, 'cache-control': 'no-store' });
+      const dec = crypto.createDecipheriv('aes-256-gcm', f.key, f.iv); dec.setAuthTag(f.tag);
+      return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
     const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log)?$/);   // live viewer for the operator (link from open_viewer)
@@ -550,6 +566,8 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const ip = clientIp(req);
       const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
       if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
+      const rl = regRate.get(ip) || { n: 0, t: Date.now() }; if (Date.now() - rl.t > 60_000) { rl.n = 0; rl.t = Date.now(); }   // a client PC cannot flood the server with registrations
+      if (++rl.n > 20) return json(res, 429, { error: 'slow down' }); regRate.set(ip, rl);
       const info = JSON.parse((await body(req, 10_000)) || '{}');
       let code = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(info.resume || '') && !sessions.has(info.resume) ? info.resume : null;   // same code after a server reset
       if (!code) do code = newCode(); while (sessions.has(code));
@@ -596,9 +614,10 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         const id = crypto.randomBytes(12).toString('hex'), fp = path.join(FILES_DIR, id);
         let n = 0;
         const cap = new Transform({ transform(chunk, _e, cb) { n += chunk.length; n > MAX_FILE ? cb(new Error('file too large')) : cb(null, chunk); } });
-        try { await pipeline(req, cap, fs.createWriteStream(fp)); }
+        const key = crypto.randomBytes(32), iv = crypto.randomBytes(12), enc = crypto.createCipheriv('aes-256-gcm', key, iv);
+        try { await pipeline(req, cap, enc, fs.createWriteStream(fp, { mode: 0o600 })); }
         catch (e) { fs.rmSync(fp, { force: true }); return json(res, 413, { error: e.message }); }
-        files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS });
+        files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS, code, key, iv, tag: enc.getAuthTag() });
         return json(res, 200, { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n });
       }
       if (p === '/a/bye') { console.log(`- ${code} bye`); drop(code, 'The user closed the helper or pressed Esc. STOP: do not retry, tell the operator.'); return json(res, 200, {}); }
@@ -611,7 +630,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
 
 if (STATE_FILE && fs.existsSync(STATE_FILE)) {
   try {
-    const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    const st = JSON.parse(unseal(fs.readFileSync(STATE_FILE)));
     for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp });
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);

@@ -131,6 +131,12 @@ const furl = /(http\S+\/f\/\S+)\s+\(300000 bytes/.exec(ff)?.[1];
 assert.ok(furl, 'fetch_file must return a link, got: ' + ff);
 assert.ok(Buffer.from(await (await fetch(furl)).arrayBuffer()).equals(blob), 'downloaded file must be identical');
 assert.equal((await fetch(BASE + '/f/' + '0'.repeat(24) + '/x')).status, 404); console.log('fetch_file ok');
+// privacy: files rest encrypted on the relay's disk, the state file is encrypted, and both are gone with the session
+globalThis.__furl = furl;
+const FDIR = path.join(path.dirname(STATE), 'files');
+for (const f of fs.readdirSync(FDIR)) assert.ok(!fs.readFileSync(path.join(FDIR, f)).includes(blob.subarray(1000, 1064)), 'a fetched file must not be readable on the relay disk');
+await new Promise((r) => setTimeout(r, 500));
+assert.ok(!fs.readFileSync(STATE, 'utf8').includes(code), 'the state file must be encrypted');
 
 // responsiveness: a light request is answered while a long command is still running (viewer frames never freeze behind installs/renders)
 const long1 = raw('run', { session: code, command: useps ? 'Start-Sleep 12; echo long-done' : 'sleep 12; echo long-done', timeout_s: 40 });
@@ -236,6 +242,7 @@ if (process.env.GUI) {
 await tool('end_session', { session: code });
 await new Promise((r) => setTimeout(r, 500));
 assert.equal(JSON.parse(txt(await tool('list_sessions'))).length, 0); console.log('end ok');
+assert.equal((await fetch(globalThis.__furl)).status, 404, 'files of an ended session must be deleted'); console.log('privacy ok');
 // brute-force guard: many wrong operator keys get locked out (run last: it blocks this IP for a while)
 let last = 0;
 for (let i = 0; i < 22; i++) last = (await fetch(BASE + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer wrong-' + i } })).status;

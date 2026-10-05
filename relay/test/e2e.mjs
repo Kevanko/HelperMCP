@@ -123,6 +123,15 @@ fs.writeFileSync(png, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJA
 const imgRes = await tool('read_file', { session: code, path: png });
 assert.ok(imgRes.content.some((c) => c.type === 'image' && c.data.length > 100), 'read_file must return an image for .png'); console.log('read_file image ok');
 
+// fetch_file: a file travels from the remote PC to the operator through the relay
+const blob = Buffer.alloc(300_000); for (let i = 0; i < blob.length; i++) blob[i] = (i * 7 + 3) & 255;
+const blobPath = path.join(tmp, 'blob.bin'); fs.writeFileSync(blobPath, blob);
+const ff = txt(await tool('fetch_file', { session: code, path: blobPath }));
+const furl = /(http\S+\/f\/\S+)\s+\(300000 bytes/.exec(ff)?.[1];
+assert.ok(furl, 'fetch_file must return a link, got: ' + ff);
+assert.ok(Buffer.from(await (await fetch(furl)).arrayBuffer()).equals(blob), 'downloaded file must be identical');
+assert.equal((await fetch(BASE + '/f/' + '0'.repeat(24) + '/x')).status, 404); console.log('fetch_file ok');
+
 // responsiveness: a light request is answered while a long command is still running (viewer frames never freeze behind installs/renders)
 const long1 = raw('run', { session: code, command: useps ? 'Start-Sleep 12; echo long-done' : 'sleep 12; echo long-done', timeout_s: 40 });
 await new Promise((x) => setTimeout(x, 1500));

@@ -18,7 +18,7 @@ T = {
     "overlay": ("Удалённое управление", "Remote control"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "write_file", "click", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -30,6 +30,7 @@ SCALE = 1.0                               # screenshot px -> real px
 ORIGIN = (0, 0)                           # real px of the screenshot's top-left corner (non-zero for a single monitor)
 GUI = {"type": None}                      # filled by find_gui()
 OVERLAY_PROC = None
+TOKEN = None                              # this agent's relay token (set in main)
 
 
 # ---- graphical session --------------------------------------------------------------------
@@ -272,6 +273,16 @@ def start_process(a):
     tail = open(log, "r", errors="replace").read()[-1500:]
     if rc is not None: return {"text": f"[exited with code {rc} right away]\n{tail}"}
     return {"text": f"[started pid {p.pid}, still running]\n{tail}"}
+
+
+def fetch_file(a):
+    """Upload a file to the relay and return a download link for the operator."""
+    path = os.path.expanduser(a["path"]); size = os.path.getsize(path)
+    req = urllib.request.Request(RELAY + "/a/file?name=" + urllib.parse.quote(os.path.basename(path)), method="POST")
+    req.add_header("Authorization", "Bearer " + TOKEN); req.add_header("Content-Length", str(size)); req.add_header("Content-Type", "application/octet-stream")
+    with open(path, "rb") as f, urllib.request.urlopen(req, f, timeout=3600) as resp:
+        d = json.loads(resp.read())
+    return {"text": f"{d['url']}  ({d['size']} bytes, link valid 24 h)"}
 
 
 def read_file(a):
@@ -557,7 +568,7 @@ def post_result(res, token):
         api("/a/result", res, token, timeout=60)
 
 
-TOOLS = dict(screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
+TOOLS = dict(fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
@@ -597,6 +608,7 @@ def main():
         mode = "full" if input(t("mode")).strip() == "2" else "ask"
     _, reg = api("/a/register", {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode})
     token = reg["token"]
+    global TOKEN; TOKEN = token
     print(f"\n  {t('banner')}  {reg['code']}\n  {t('tell')}\n", flush=True)
     overlay_start()
     pool = ThreadPoolExecutor(max_workers=8)

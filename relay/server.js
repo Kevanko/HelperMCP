@@ -4,6 +4,9 @@ import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import os from 'node:os';
+import { pipeline } from 'node:stream/promises';
+import { Transform } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -50,6 +53,12 @@ const newSession = (o) => ({ ...o, queue: [], pending: new Map(), waiting: null,
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
+// files copied from a remote PC to the operator: unguessable link, kept 24 h
+const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
+const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
+const FILE_TTL_MS = 24 * 3600_000;
+const files = new Map();   // id -> { path, name, size, exp }
+try { fs.rmSync(FILES_DIR, { recursive: true, force: true }); fs.mkdirSync(FILES_DIR, { recursive: true }); } catch { /* best effort */ }
 const authFails = new Map();             // ip -> { n, until }: wrong operator keys
 const AUTH_MAX_FAILS = 20, AUTH_WINDOW_MS = 10 * 60_000;
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
@@ -106,6 +115,7 @@ function drop(code, why) {
 
 setInterval(() => {
   for (const [t, v] of viewers) if (v.exp < Date.now()) viewers.delete(t);
+  for (const [id, f] of files) if (f.exp < Date.now()) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
@@ -174,6 +184,9 @@ const tools = [
     props: { command: str('Executable name or full path'), args: { type: 'array', items: { type: 'string' } }, cwd: str('working directory'), env: { type: 'object', additionalProperties: { type: 'string' } }, wait_s: { type: 'number', description: 'seconds to watch for an immediate crash, default 2' } }, required: ['command'] },
   { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000). Image files (png, jpg, gif, bmp, webp) come back as images, scaled down to max_width: use it to look at renders and saved screenshots.',
     props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 }, max_width: { type: 'integer', minimum: 64, maximum: 4096, description: 'images only, default 1600' } }, required: ['path'] },
+  { name: 'fetch_file', agent: true, ms: (a) => 3_700_000,
+    description: 'Copy a file from the remote PC to the operator: returns a download link (valid 24 h). Use it to hand over results (renders, .blend files, logs, archives).',
+    props: { path: str('File path on the remote PC') }, required: ['path'] },
   { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it.',
     props: { path: str('File path'), content: str('New content') }, required: ['path', 'content'] },
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
@@ -387,6 +400,14 @@ async function handler(req, res) {
     if (p === '/p') return script(req, res, 'agent.py');
     if (p === '/') return landing(req, res);
 
+    const fm = p.match(/^\/f\/([0-9a-f]{24})\/[^/]+$/);   // download of a file fetched from a remote PC
+    if (fm) {
+      const f = files.get(fm[1]);
+      if (!f || f.exp < Date.now()) return text(res, 404, 'file expired or invalid');
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${f.name}"` });
+      return fs.createReadStream(f.path).pipe(res);
+    }
+
     const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
@@ -470,6 +491,16 @@ async function handler(req, res) {
           r.ok ? pend.resolve(r.data) : pend.reject(new Error(r.error || 'agent error'));
         }
         return json(res, 200, {});
+      }
+      if (p === '/a/file' && req.method === 'POST') {
+        const name = (url.searchParams.get('name') || 'file').replace(/[^\w.\-]+/g, '_').slice(0, 100) || 'file';
+        const id = crypto.randomBytes(12).toString('hex'), fp = path.join(FILES_DIR, id);
+        let n = 0;
+        const cap = new Transform({ transform(chunk, _e, cb) { n += chunk.length; n > MAX_FILE ? cb(new Error('file too large')) : cb(null, chunk); } });
+        try { await pipeline(req, cap, fs.createWriteStream(fp)); }
+        catch (e) { fs.rmSync(fp, { force: true }); return json(res, 413, { error: e.message }); }
+        files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS });
+        return json(res, 200, { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n });
       }
       if (p === '/a/bye') { console.log(`- ${code} bye`); drop(code, 'Agent left.'); return json(res, 200, {}); }
     }

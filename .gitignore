@@ -4,3 +4,5 @@ node_modules/
 Caddyfile
 data/
 _h.mjs
+.playwright-mcp/
+**/.playwright-mcp/

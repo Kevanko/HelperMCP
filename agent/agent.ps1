@@ -4,7 +4,7 @@ $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored a
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null
@@ -172,6 +172,17 @@ function Do-ReadFile($a) {
     $fs = [IO.File]::Open($a.path, 'Open', 'Read', 'ReadWrite')
     try { $buf = New-Object byte[] ([Math]::Min($max, $fs.Length)); [void]$fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
     @{ text = [Text.Encoding]::UTF8.GetString($buf) }
+}
+# Upload a file to the relay and return a download link for the operator.
+function Do-FetchFile($a) {
+    $f = (Resolve-Path -LiteralPath $a.path).Path
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try {
+        $resp = Invoke-WebRequest -Uri ("$RELAY/a/file?name=" + [Uri]::EscapeDataString((Split-Path $f -Leaf))) -Method Post -InFile $f `
+            -Headers @{ Authorization = "Bearer $script:Token" } -ContentType 'application/octet-stream' -TimeoutSec 3600 -UseBasicParsing
+    } finally { $ProgressPreference = $pp }
+    $d = $resp.Content | ConvertFrom-Json
+    @{ text = "$($d.url)  ($($d.size) bytes, link valid 24 h)" }
 }
 function Do-WriteFile($a) {
     [IO.File]::WriteAllText($a.path, $a.content, (New-Object Text.UTF8Encoding $false))
@@ -461,7 +472,7 @@ function Process-Command($cmd) {
         }
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
     } catch { $res.ok = $false; $res.error = $_.Exception.Message }

@@ -509,11 +509,20 @@ $trailDots = @(); 1..9 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse
 $ring = New-Object Windows.Shapes.Ellipse; $ring.Width = 46; $ring.Height = 46; $ring.StrokeThickness = 2.4; $ring.Visibility = 'Collapsed'
 [Windows.Controls.Canvas]::SetLeft($ring, $HX - 23); [Windows.Controls.Canvas]::SetTop($ring, $HY - 23); [void]$cv.Children.Add($ring)
 # soft light around the (real, replaced) pointer, like Codex; it squeezes a little on a click
-$arrow = New-Object Windows.Shapes.Ellipse; $arrow.Width = 92; $arrow.Height = 92; $arrow.IsHitTestVisible = $false
+$halo = New-Object Windows.Shapes.Ellipse; $halo.Width = 104; $halo.Height = 104; $halo.IsHitTestVisible = $false
 $haloBrush = New-Object Windows.Media.RadialGradientBrush; $haloStops = @(); foreach ($o in @(0.0, 0.5, 1.0)) { $gs = New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(0, 76, 141, 255)), $o; [void]$haloBrush.GradientStops.Add($gs); $haloStops += $gs }
-$arrow.Fill = $haloBrush
-$arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrow.RenderTransform = $arrowScale; $arrow.RenderTransformOrigin = New-Object Windows.Point 0.5, 0.5
-[Windows.Controls.Canvas]::SetLeft($arrow, $HX - 40); [Windows.Controls.Canvas]::SetTop($arrow, $HY - 38); [void]$cv.Children.Add($arrow)
+$halo.Fill = $haloBrush
+$haloScale = New-Object Windows.Media.ScaleTransform 1, 1; $halo.RenderTransform = $haloScale; $halo.RenderTransformOrigin = New-Object Windows.Point 0.5, 0.5
+[Windows.Controls.Canvas]::SetLeft($halo, $HX - 46); [Windows.Controls.Canvas]::SetTop($halo, $HY - 44); [void]$cv.Children.Add($halo)
+# the AI's arrow (the real pointer is blanked while the AI works): soft rounded, leans into the direction of movement
+$arrow = New-Object Windows.Shapes.Polygon; $pts = New-Object Windows.Media.PointCollection
+foreach ($q in @(@(0, 0), @(0, 23), @(5.2, 18.2), @(8.8, 26.5), @(12.3, 25), @(8.7, 16.8), @(15.6, 16.8))) { $pts.Add((New-Object Windows.Point ($q[0] * 1.4), ($q[1] * 1.4))) }
+$arrow.Points = $pts; $arrow.StrokeLineJoin = 'Round'; $arrow.StrokeThickness = 1.4; $arrow.Stroke = Brush (C 76 141 255 170)
+$ab = New-Object Windows.Media.LinearGradientBrush ([Windows.Media.Color]::FromArgb(255, 255, 255, 255)), ([Windows.Media.Color]::FromArgb(255, 209, 227, 255)), 90; $arrow.Fill = $ab
+$arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrowRot = New-Object Windows.Media.RotateTransform 0
+$tg = New-Object Windows.Media.TransformGroup; [void]$tg.Children.Add($arrowScale); [void]$tg.Children.Add($arrowRot); $arrow.RenderTransform = $tg; $arrow.RenderTransformOrigin = New-Object Windows.Point 0, 0
+$aglow = New-Object Windows.Media.Effects.DropShadowEffect; $aglow.ShadowDepth = 2; $aglow.Direction = 270; $aglow.BlurRadius = 9; $aglow.Opacity = 0.45; $arrow.Effect = $aglow
+[Windows.Controls.Canvas]::SetLeft($arrow, $HX); [Windows.Controls.Canvas]::SetTop($arrow, $HY); [void]$cv.Children.Add($arrow)
 $typeDots = @(); 0..2 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 6.4; $e.Height = 6.4; $e.Visibility = 'Collapsed'
     [Windows.Controls.Canvas]::SetLeft($e, $HX + 27 + $_ * 9); [Windows.Controls.Canvas]::SetTop($e, $HY + 37); [void]$cv.Children.Add($e); $typeDots += $e }
 $chev = @(); 0..2 | ForEach-Object { $l = New-Object Windows.Shapes.Polyline; $l.StrokeThickness = 3; $l.StrokeStartLineCap = 'Round'; $l.StrokeEndLineCap = 'Round'; $l.StrokeLineJoin = 'Round'
@@ -548,6 +557,19 @@ function Make-SoftCur($file) {
     $w.Write((New-Object byte[] $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
 }
 $CurIds = @{ pointer = 32512; beam = 32513; busy = 32514; precision = 32515; alternate = 32516; dgn1 = 32642; dgn2 = 32643; horz = 32644; vert = 32645; move = 32646; unavailable = 32648; link = 32649; working = 32650; help = 32651 }
+function Make-BlankCur($file) {
+    $S = 32; $mask = (($S + 31) -shr 5) * 4 * $S; $size = 40 + $S * $S * 4 + $mask; $ms = New-Object IO.MemoryStream; $w = New-Object IO.BinaryWriter $ms
+    $w.Write([uint16]0); $w.Write([uint16]2); $w.Write([uint16]1); $w.Write([byte]$S); $w.Write([byte]$S); $w.Write([byte]0); $w.Write([byte]0); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([uint32]$size); $w.Write([uint32]22)
+    $w.Write([uint32]40); $w.Write([int32]$S); $w.Write([int32](2 * $S)); $w.Write([uint16]1); $w.Write([uint16]32); $w.Write([uint32]0); $w.Write([uint32]($S * $S * 4)); $w.Write([int32]0); $w.Write([int32]0); $w.Write([uint32]0); $w.Write([uint32]0)
+    $w.Write((New-Object byte[] ($S * $S * 4))); $w.Write([byte[]](,[byte]255 * $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
+}
+$script:CurFiles = @{}; $script:BlankFile = $null; $script:Blanked = $false
+function Set-Pointers($blank) {   # blank = hide the real pointer (the AI's own arrow is drawn instead), else the session cursors
+    if ($script:Blanked -eq $blank -or -not $script:CurFiles.Count) { return }
+    $script:Blanked = $blank
+    if ($blank) { foreach ($id in @($CurIds.Values)) { $h = [O.C]::LoadCursorFromFile($script:BlankFile); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$id) } } }
+    else { Restore-Cursors; foreach ($k in @($script:CurFiles.Keys)) { $h = [O.C]::LoadCursorFromFile($script:CurFiles[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } } }
+}
 function Restore-Cursors { [void][O.C]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) }
 function Apply-Cursors {
     try {
@@ -562,14 +584,14 @@ function Apply-Cursors {
         }
         if (-not $got.ContainsKey('pointer')) { $f = Join-Path $dir 'pointer.cur'; Make-SoftCur $f; $got['pointer'] = $f }
         foreach ($k in @($got.Keys)) { $h = [O.C]::LoadCursorFromFile($got[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } }
-        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        $script:CurFiles = $got; $script:BlankFile = Join-Path $dir 'blank.cur'; Make-BlankCur $script:BlankFile; $script:CurDir = $dir
     } catch { Restore-Cursors }
 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
 $script:scrollDir = 0; $script:scrollT = -99.0; $script:typingT = -99.0; $script:rip = $null; $script:cursorShown = $false; $script:ripShown = $false
 $trail = New-Object System.Collections.ArrayList
-$script:lastPtr = $null
+$script:lastPtr = $null; $script:lean = 0.0
 
 function On-Line($line) {
     $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
@@ -597,6 +619,9 @@ $timer.Add_Tick({
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
     $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
     $tgt = if ($active) { 1.0 } else { 0.0 }
+    if ($script:lastPtr) { $lt = [Math]::Max(-28.0, [Math]::Min(28.0, ($p.X - $script:lastPtr.X) * 2.4)); $script:lean += ($lt - $script:lean) * 0.22 }   # the nose leans into the direction of movement
+    $script:lastPtr = $p; $arrowRot.Angle = $script:lean
+    Set-Pointers $active
     $script:opacity += ($tgt - $script:opacity) * 0.22
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
     else {
@@ -605,7 +630,7 @@ $timer.Add_Tick({
         $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
         $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
-        $arrowScale.ScaleX = $s; $arrowScale.ScaleY = $s
+        $arrowScale.ScaleX = $s; $arrowScale.ScaleY = $s; $haloScale.ScaleX = $s; $haloScale.ScaleY = $s
         if ($script:dragging) { $ring.Visibility = 'Visible'; $ring.Stroke = $br; $ring.Fill = Brush (C $c.R $c.G $c.B 46); $rr = 23 + 3 * [Math]::Sin($now * 8); Place $ring $HX $HY $rr } else { $ring.Visibility = 'Collapsed' }
         for ($i = 0; $i -lt $trailDots.Count; $i++) {   # comet tail
             $e = $trailDots[$i]; $k = $trail.Count - 2 - $i
@@ -656,6 +681,7 @@ $wd.Add_Tick({
 $wd.Start()
 [Windows.Threading.Dispatcher]::Run()
 Restore-Cursors
+if ($script:CurDir) { Remove-Item $script:CurDir -Recurse -Force -ErrorAction SilentlyContinue }
 '@
 function Start-Overlay {
     if ($env:HELPER_NO_OVERLAY) { return }

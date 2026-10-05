@@ -191,6 +191,7 @@ def click(a):
     X = xlib(); x, y = _target(a); btn = a.get("button", "left"); b = {"left": 1, "middle": 2, "right": 3}[btn]
     overlay_send("active"); glide(x, y); time.sleep(0.05)
     for i in range(2 if a.get("double") else 1):
+        if i == 0: overlay_send("pre"); time.sleep(0.08)
         overlay_send(f"click {x} {y} {btn}")
         X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); sync(X); time.sleep(0.08)
         X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); time.sleep(0.1)
@@ -200,7 +201,7 @@ def click(a):
 def drag(a):
     """Press at (x,y), glide to (x2,y2) with the button held, release (moving windows, selecting, sliders ...)."""
     X = xlib(); x1, y1 = _target(a); x2, y2 = _target(a, "x2", "y2"); b = {"left": 1, "middle": 2, "right": 3}[a.get("button", "left")]
-    overlay_send("active"); glide(x1, y1); time.sleep(0.06)
+    overlay_send("active"); glide(x1, y1); time.sleep(0.06); overlay_send("pre"); time.sleep(0.08)
     X["t"].XTestFakeButtonEvent(X["d"], b, 1, 0); sync(X); overlay_send(f"down {x1} {y1}"); time.sleep(0.12)
     glide(x2, y2, min(1.4, 0.3 + math.hypot(x2 - x1, y2 - y1) * 0.0007)); time.sleep(0.1)
     X["t"].XTestFakeButtonEvent(X["d"], b, 0, 0); sync(X); overlay_send(f"up {x2} {y2}")
@@ -537,6 +538,11 @@ def new_window(w, h, x, y):
     win.set_default_size(w, h); win.move(x, y); win.set_keep_above(True); win.set_accept_focus(False)
     return win
 
+def new_popup(w, h, x, y):
+    win = Gtk.Window(type=Gtk.WindowType.POPUP); win.set_app_paintable(True); win.set_visual(scr.get_rgba_visual())
+    win.set_default_size(w, h); win.move(x, y); win.set_keep_above(True); win.set_accept_focus(False)
+    return win
+
 def click_through(win): win.get_window().input_shape_combine_region(cairo.Region(), 0, 0)
 
 # ---- glow: alpha of every pixel is a fade of its distance to the NEAREST screen edge (no strips: nothing overlaps, no seams)
@@ -580,19 +586,17 @@ def make_monitor(mon):
     # (work area smaller than the monitor) an override-redirect strip repeats the same glow right over the panel, so the light runs
     # along the whole monitor. Shell does not let clicks through such a window, so the strip hides while the pointer is on it
     # (see tick): the panel stays clickable, the glow only blinks out where the mouse actually is.
-    wa = mon.get_workarea(); sides = []; D = 26      # only the brightest outer part of the glow goes over the panel; its inner edge fades out
-    if wa.y > g.y: sides.append((0, 0, W, D, (0, D, 0, 0)))
-    if wa.y + wa.height < g.y + g.height - 1: sides.append((0, H - D, W, D, (0, 0, 0, D)))
-    if wa.x > g.x: sides.append((0, 0, D, H, (D, 0, 0, 0)))
-    if wa.x + wa.width < g.x + g.width - 1: sides.append((W - D, 0, D, H, (0, 0, D, 0)))
-    for (sx, sy, sw, sh, gr) in sides:
+    wa = mon.get_workarea(); sides = []
+    top, bot, lef, rig = wa.y - g.y, g.y + g.height - (wa.y + wa.height), wa.x - g.x, g.x + g.width - (wa.x + wa.width)
+    if top > 0: sides.append((0, 0, W, min(S_DEPTH, top + 2)))
+    if bot > 1: sides.append((0, H - min(S_DEPTH, bot + 1), W, min(S_DEPTH, bot + 1)))
+    if lef > 0: sides.append((0, 0, min(S_DEPTH, lef + 2), H))
+    if rig > 1: sides.append((W - min(S_DEPTH, rig + 1), 0, min(S_DEPTH, rig + 1), H))
+    for (sx, sy, sw, sh) in sides:
         sw_ = Gtk.Window(type=Gtk.WindowType.POPUP); sw_.set_app_paintable(True); sw_.set_visual(scr.get_rgba_visual())
         sw_.set_default_size(sw, sh); sw_.move(g.x + sx, g.y + sy); sw_.set_keep_above(True); sw_.set_accept_focus(False)
-        def sdraw(_, cr, sx=sx, sy=sy, gr=gr):
-            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
-            cr.set_operator(cairo.OPERATOR_OVER); cr.set_source_surface(surf(), -sx, -sy)
-            fade = cairo.LinearGradient(*gr); fade.add_color_stop_rgba(0, 0, 0, 0, 0); fade.add_color_stop_rgba(0.3, 0, 0, 0, 1); fade.add_color_stop_rgba(1, 0, 0, 0, 1)
-            cr.mask(fade)
+        def sdraw(_, cr, sx=sx, sy=sy):
+            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), -sx, -sy); cr.paint()
         sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
         strips.append([sw_, (g.x + sx - 6, g.y + sy - 6, sw + 12, sh + 12), True])
     # the label is its own small window: it pulses without repainting the full-screen glow
@@ -615,10 +619,10 @@ for i in range(disp.get_n_monitors()): make_monitor(disp.get_monitor(i))
 
 # ---- the big cursor, click ripples, drag / scroll / typing indicators
 CW = 140; HX = HY = 44               # cursor window size and where the arrow tip sits in it
-cursor = new_window(CW, CW, -500, -500)
+cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-last_active = 0.0; opacity = 0.0
+last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -739,6 +743,23 @@ import threading
 threading.Thread(target=theme_worker, daemon=True).start()
 GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, lambda: (Gtk.main_quit(), False)[1])
 
+try:
+    import ctypes
+    _xl = ctypes.CDLL("libX11.so.6"); _xf = ctypes.CDLL("libXfixes.so.3")
+    _xl.XOpenDisplay.restype = ctypes.c_void_p; _xl.XOpenDisplay.argtypes = [ctypes.c_char_p]; _xl.XDefaultRootWindow.restype = ctypes.c_ulong; _xl.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    _xl.XFlush.argtypes = [ctypes.c_void_p]; _xf.XFixesHideCursor.argtypes = _xf.XFixesShowCursor.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    _xd = _xl.XOpenDisplay(None); _xroot = _xl.XDefaultRootWindow(_xd)
+except Exception: _xd = None
+real_hidden = [False]
+def real_pointer(hide):
+    if _xd and hide != real_hidden[0]:
+        try: (_xf.XFixesHideCursor if hide else _xf.XFixesShowCursor)(_xd, _xroot); _xl.XFlush(_xd)
+        except Exception: pass
+        real_hidden[0] = hide
+
+def in_panel(x, y):
+    return any(st[1][0] <= x < st[1][0] + st[1][2] and st[1][1] <= y < st[1][1] + st[1][3] for st in strips)
+
 def ease_out(p): return 1 - (1 - p) ** 3
 
 
@@ -758,11 +779,11 @@ def draw_cursor(_, cr):
         rr = 22 + 3 * math.sin(now * 8)
         cr.arc(HX, HY, rr, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, 0.18); cr.fill_preserve()
         cr.set_source_rgba(r_, g_, b_, 0.85); cr.set_line_width(2.4); cr.stroke()
-    halo = cairo.RadialGradient(HX + 6, HY + 8, 2, HX + 6, HY + 8, 46)   # soft light around the pointer, like Codex
-    halo.add_color_stop_rgba(0, r_, g_, b_, 0.5); halo.add_color_stop_rgba(0.5, r_, g_, b_, 0.16); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
-    cr.set_source(halo); cr.arc(HX + 6, HY + 8, 46, 0, 2 * math.pi); cr.fill()
-    if not SYS:   # the real pointer is already replaced: no second arrow
-        cr.save(); cr.translate(HX, HY); cr.scale(s, s)
+    halo = cairo.RadialGradient(HX + 6, HY + 8, 2, HX + 6, HY + 8, 52)   # soft light around the pointer, like Codex
+    halo.add_color_stop_rgba(0, r_, g_, b_, 0.78); halo.add_color_stop_rgba(0.45, r_, g_, b_, 0.34); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
+    cr.set_source(halo); cr.arc(HX + 6, HY + 8, 52, 0, 2 * math.pi); cr.fill()
+    if True:   # the real pointer is hidden while the AI works: this arrow takes its place
+        cr.save(); cr.translate(HX, HY); cr.rotate(lean); cr.scale(s, s)
         cr.move_to(*ARROW[0])
         for p in ARROW[1:]: cr.line_to(*p)
         cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
@@ -817,11 +838,14 @@ def tick():
     global opacity, rip
     now = time.monotonic(); px, py = pointer()
     if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
+    global lean, lastp
+    if lastp: lean += (max(-0.5, min(0.5, (px - lastp[0]) * 0.045)) - lean) * 0.22      # the nose leans into the direction of movement
+    lastp = (px, py)
     target = 1.0 if (now - last_active < 8.0 or dragging) else 0.0
     opacity += (target - opacity) * 0.22
-    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
+    if (opacity < 0.03 and target == 0.0) or now < pre_until: hide(cursor, "cursor"); real_pointer(False)   # pre_until: a click on the panel needs the pointer free for a moment
     else:
-        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
+        real_pointer(True); show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
     for st in strips:   # over-the-panel glow strips: out of the way while the pointer is on them
         x, y, w_, h_ = st[1]; inside = x <= px < x + w_ and y <= py < y + h_
         if inside and st[2]: st[0].hide(); st[2] = False
@@ -840,10 +864,14 @@ def set_state(s):
     for w in pills: w.queue_draw()
 
 def on_line(line):
-    global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip
+    global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip, pre_until
     f = line.split(); now = time.monotonic()
     if not f: return
     if f[0] == "state" and len(f) > 1: set_state(f[1]); return
+    if f[0] == "pre":                               # about to click: over the panel the arrow window would swallow the click
+        px, py = pointer()
+        if in_panel(px, py): pre_until = now + 0.5
+        return
     last_active = now
     if f[0] == "click" and len(f) >= 4:
         pressed_t = now; rip = (float(f[1]), float(f[2]), now, VIOLET if f[3] == "right" else col())

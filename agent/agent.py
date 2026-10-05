@@ -575,6 +575,20 @@ def make_monitor(mon):
     def draw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
     w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
+    # GNOME Shell draws its panel / dock above every normal window, so the glow would vanish under it. Where the panel takes space
+    # (work area smaller than the monitor) a thin override-redirect strip repeats the glow along that screen edge, above the panel.
+    # It sits only on the outermost pixels, so the panel's buttons stay clickable.
+    wa = mon.get_workarea(); STRIP = 12; sides = []
+    if wa.y > g.y: sides.append((0, 0, W, STRIP))
+    if wa.y + wa.height < g.y + g.height - 1: sides.append((0, H - STRIP, W, STRIP))
+    if wa.x > g.x: sides.append((0, 0, STRIP, H))
+    if wa.x + wa.width < g.x + g.width - 1: sides.append((W - STRIP, 0, STRIP, H))
+    for (sx, sy, sw, sh) in sides:
+        sw_ = Gtk.Window(type=Gtk.WindowType.POPUP); sw_.set_app_paintable(True); sw_.set_visual(scr.get_rgba_visual())
+        sw_.set_default_size(sw, sh); sw_.move(g.x + sx, g.y + sy); sw_.set_keep_above(True); sw_.set_accept_focus(False)
+        def sdraw(_, cr, sx=sx, sy=sy):
+            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), -sx, -sy); cr.paint()
+        sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
     # the label is its own small window: it pulses without repainting the full-screen glow
     pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
     def pdraw(_, cr):

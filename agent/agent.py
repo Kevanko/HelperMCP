@@ -862,15 +862,22 @@ def make_monitor(mon):
         sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
         strips.append([sw_, (g.x + sx - 6, g.y + sy - 6, sw + 12, sh + 12), True])
     # the label is its own small window: it pulses without repainting the full-screen glow
-    pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
+    PM = 26   # room around the label for its halo
+    pw = new_window(PILL_W + 2 * PM, 36 + 2 * PM, g.x + (g.width - PILL_W) // 2 - PM, g.y + 12 - PM)
     def pdraw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER); cr.translate(PM, PM)
         r_, g_, b_ = col(); lost = state in ("lost", "wait"); text = lost_label if state == "lost" else wait_label if state == "wait" else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         ext = cr.text_extents(text); ph, rr, pad = 34, 17, 18
         w_ = pad + 10 + 9 + ext.x_advance + pad; x0, y0 = (PILL_W - w_) / 2, 1          # the pill hugs its content and sits in the middle of the window
-        cr.new_sub_path(); cr.arc(x0 + w_ - rr, y0 + rr, rr, -math.pi / 2, math.pi / 2); cr.arc(x0 + rr, y0 + rr, rr, math.pi / 2, 3 * math.pi / 2); cr.close_path()
+        def rrect(e):
+            cr.new_sub_path(); cr.arc(x0 + w_ - rr, y0 + rr, rr + e, -math.pi / 2, math.pi / 2); cr.arc(x0 + rr, y0 + rr, rr + e, math.pi / 2, 3 * math.pi / 2); cr.close_path()
+        if busy_fx:   # working: a soft halo that fades out in every direction and breathes
+            br = 0.5 + 0.5 * math.sin(time.monotonic() * 6)
+            for i in range(PM, 0, -2):
+                rrect(i * 0.9 + 0.0); a = (1 - i / PM) ** 2 * (0.20 + 0.22 * br); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(2.2); cr.stroke()
+        rrect(0)
         cr.set_source_rgba(0.06, 0.09, 0.14, 0.9); cr.fill_preserve(); cr.set_source_rgba(r_, g_, b_, 0.95); cr.set_line_width(1.5); cr.stroke()
         cr.arc(x0 + pad + 5, y0 + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, pulse); cr.fill()
         fe = cr.font_extents()
@@ -884,7 +891,7 @@ CW = 140; HX = HY = 44               # cursor window size and where the arrow ti
 cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
+busy_fx = False; last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -1161,6 +1168,8 @@ def on_line(line):
     f = line.split(); now = time.monotonic()
     if not f: return
     if f[0] == "state" and len(f) > 1: set_state(f[1]); return
+    if f[0] in ("busy", "idle"):
+        global busy_fx; busy_fx = f[0] == "busy"; [w.queue_draw() for w in pills]; return
     if f[0] == "clip" and len(f) > 1:
         cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD); cb.set_text(f[1], -1); cb.store(); return
     if f[0] == "pre":                               # about to click: over the panel the arrow window would swallow the click
@@ -1200,7 +1209,7 @@ chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)
 chan.set_close_on_unref(False)
 GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
 GLib.timeout_add(16, tick)
-GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state in ("lost", "wait") else None) or True)   # orange label pulses
+GLib.timeout_add(60, lambda: ([w.queue_draw() for w in pills] if (state in ("lost", "wait") or busy_fx) else None) or True)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
 GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()
@@ -1274,6 +1283,8 @@ def handle(cmd, mode, token):
     name, args = cmd["tool"], cmd["args"]
     if not OP["seen"]: OP["seen"] = True; overlay_send("state ok"); show_status(); print(c("32", "  ● " + t("st_ok")), flush=True)
     print(line_for(name, args), flush=True)
+    quiet_ = name in QUIET
+    if not quiet_: overlay_send("busy")
     res = {"id": cmd["id"]}
     try:
         if mode == "ask" and name in ASK_TOOLS:
@@ -1284,6 +1295,7 @@ def handle(cmd, mode, token):
             res.update(ok=True, data=TOOLS[name](args))
     except Exception as e:  # report every failure to the operator
         res.update(ok=False, error=f"{type(e).__name__}: {e}")
+    if not quiet_: overlay_send("idle")
     if name not in QUIET: print((c("32", "    ✔ " + ("готово" if RU else "done")) if res.get("ok") else c("31", "    ✘ " + cut(res.get("error"), 120))), flush=True)
     for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
         try: post_result(res, TOKEN or token); break
@@ -1334,7 +1346,6 @@ def main():
     play("ok")
     if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()
     overlay_send("state wait")
-    print(c(ORANGE, "  ◌ " + t("st_wait")), flush=True)
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0
     def watchdog():   # a connection can die silently (the poll just hangs): do not stay blue for long

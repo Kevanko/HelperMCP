@@ -167,7 +167,7 @@ let back = [];
 for (let i = 0; i < 40 && !back.some((x) => x.code === code); i++) { await new Promise((x) => setTimeout(x, 500)); back = JSON.parse(txt(await tool('list_sessions'))); }
 assert.ok(back.some((x) => x.code === code && x.online), `agent must re-register with the same code, got ${JSON.stringify(back)}`);
 assert.match(txt(await tool('run', { session: code, command: 'echo after-reset' })), /after-reset/);
-assert.match(agentOut, /connection lost/i); assert.match(agentOut, /connection restored|registered again/i);
+assert.match(agentOut, /connection lost|Связь потеряна|Connection lost/i); assert.match(agentOut, /connection restored|registered again|Связь восстановлена|Connection restored/i);
 console.log('outage + fresh server: agent reconnects with the same code ok');
 
 // live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)

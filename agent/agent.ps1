@@ -83,6 +83,10 @@ $Scale = 1.0
 $script:OriginX = [Windows.Forms.SystemInformation]::VirtualScreen.Left; $script:OriginY = [Windows.Forms.SystemInformation]::VirtualScreen.Top   # real px of the screenshot's top-left
 
 function Do-Screenshot($a) {
+    Overlay-Send 'cap'; Start-Sleep -Milliseconds 180   # the glow, label and pointer are not part of what the operator sees
+    try { Do-Screenshot-Inner $a } finally { Overlay-Send 'uncap' }
+}
+function Do-Screenshot-Inner($a) {
     $s = [Windows.Forms.SystemInformation]::VirtualScreen   # all monitors, or just one with "monitor"
     if ($null -ne $a.monitor) {
         $all = [Windows.Forms.Screen]::AllScreens
@@ -469,7 +473,7 @@ function Do-McpStop($a) {
 # process (needs a message loop), ignores the mouse, and quits when the agent's PowerShell is gone.
 $OverlayScript = @'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
-Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); [DllImport("user32.dll")] public static extern bool SetWindowDisplayAffinity(IntPtr h, uint a); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);'
 [void][O.W]::SetProcessDPIAware()
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading;
@@ -533,11 +537,20 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $tb.FontWeight = 'SemiBold'; $tb.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'; $tb.Margin = New-Object Windows.Thickness 9, 0, 0, 0
     [void]$sp.Children.Add($dot); [void]$sp.Children.Add($tb); $pill.Child = $sp; [void]$g.Children.Add($pill)
     $win.Content = $g
-    $m = @{ win = $win; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
+    $pshadow = New-Object Windows.Media.Effects.DropShadowEffect; $pshadow.ShadowDepth = 0; $pshadow.BlurRadius = 26; $pshadow.Opacity = 0; $pshadow.Color = $BLUE; $pill.Effect = $pshadow
+    $m = @{ win = $win; shadow = $pshadow; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
     $win.Show(); Click-Through $win; $mons += $m
 }
 function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
+$script:busy = $false; $script:capHide = $false
+function Set-Busy($b) {   # working: the label's halo breathes; waiting for a command: a plain outline
+    $script:busy = $b
+    foreach ($m in $mons) {
+        if ($b) { $m.shadow.Color = (Cur); $an = New-Object Windows.Media.Animation.DoubleAnimation 0.3, 1.0, ([TimeSpan]::FromMilliseconds(600)); $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever; $m.shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $an) }
+        else { $m.shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $null); $m.shadow.Opacity = 0 }
+    }
+}
 function Apply-State {
     $c = Cur; $key = $script:state
     foreach ($m in $mons) {
@@ -700,6 +713,10 @@ function On-Line($line) {
     $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
     if (-not $f -or -not $f[0]) { return }
     if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { $script:state = $f[1]; Apply-State }; return }
+    if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
+    if ($f[0] -eq 'uncap') { $script:capHide = $false; foreach ($m in $mons) { $m.win.Opacity = 1 }; $rwin.Opacity = 1; return }
+    if ($f[0] -eq 'busy') { Set-Busy $true; return }
+    if ($f[0] -eq 'idle') { Set-Busy $false; return }
     $script:lastActive = $now
     switch ($f[0]) {
         'click' { $script:pressedT = $now; $c = if ($f[3] -eq 'right') { $VIOLET } else { Cur }; $script:rip = @{ x = [double]$f[1]; y = [double]$f[2]; t = $now; c = $c } }
@@ -712,7 +729,8 @@ function On-Line($line) {
 }
 
 $timer = New-Object Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromMilliseconds(16)
+$cwinH = (New-Object Windows.Interop.WindowInteropHelper $cwin).Handle
+$timer.Interval = [TimeSpan]::FromMilliseconds(8)
 $timer.Add_Tick({
     $line = $null
     while ([O.Pump]::Q.TryDequeue([ref]$line)) { On-Line $line }
@@ -735,7 +753,8 @@ $timer.Add_Tick({
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
     else {
         if (-not $script:cursorShown) { $cwin.Show(); $script:cursorShown = $true }
-        $to = Type-Offset $now; $cwin.Left = ($p.X + $to[0]) / $dpi - $HX; $cwin.Top = ($p.Y + $to[1]) / $dpi - $HY; $cwin.Opacity = [Math]::Min(1.0, $script:opacity)
+        $to = Type-Offset $now; [void][O.W]::SetWindowPos($cwinH, [IntPtr]::Zero, [int]($p.X + $to[0] - $HX * $dpi), [int]($p.Y + $to[1] - $HY * $dpi), 0, 0, 0x15);   # a direct window move: much smoother than setting Left/Top through WPF
+         $cwin.Opacity = $(if ($script:capHide) { 0 } else { [Math]::Min(1.0, $script:opacity) })
         $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
         $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
@@ -982,6 +1001,7 @@ function Process-Command($cmd) {
     if (-not $script:OperatorSeen) { $script:OperatorSeen = $true; Overlay-Send 'state ok'; Show-Status; Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
     Say-Step $name $a
     $res = @{ id = $cmd.id }
+    $quietCall = $Quiet.ContainsKey($name); if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
         if ($script:Mode -eq 'ask' -and $AskTools -contains $name) { Ask-Permission $name $a }
@@ -993,6 +1013,7 @@ function Process-Command($cmd) {
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
     } catch { $res.ok = $false; $res.error = $_.Exception.Message }
+    if (-not $quietCall) { Overlay-Send 'idle' }
     if (-not $Quiet.ContainsKey($name)) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
         try { Post-Result $res $script:Token; break }
@@ -1047,7 +1068,6 @@ function Start-Helper {
     Enable-VT; Draw-Header $code $copied
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     Play-Sound 'ok'
-    Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Ожидание помощника… назови ему код' 'Waiting for the helper… give them the code'))
     Start-Overlay
     Overlay-Send 'state wait'
     $fails = 0; $delay = 1.0

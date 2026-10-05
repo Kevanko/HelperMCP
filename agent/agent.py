@@ -168,15 +168,34 @@ def pointer_pos():
     return rx.value, ry.value
 
 
+def _ease(p):
+    """cubic-bezier(0.45, 0, 0.15, 1): a slow start, a quick middle, a long soft landing on the target (what a hand does)"""
+    x1, y1, x2, y2 = 0.45, 0.0, 0.15, 1.0; lo, hi = 0.0, 1.0
+    for _ in range(18):
+        t = (lo + hi) / 2
+        if 3 * (1 - t) ** 2 * t * x1 + 3 * (1 - t) * t * t * x2 + t ** 3 < p: lo = t
+        else: hi = t
+    t = (lo + hi) / 2
+    return 3 * (1 - t) ** 2 * t * y1 + 3 * (1 - t) * t * t * y2 + t ** 3
+
+
 def glide(x, y, dur=None):
-    """Move the real pointer like a hand would: eased, about 60 steps/s, speed depends on the distance (the overlay cursor follows it)."""
-    X = xlib(); cx, cy = pointer_pos(); dist = math.hypot(x - cx, y - cy)
+    """Move the real pointer like a hand would: a slightly curved path, slow start, fast middle, soft landing; paced by the clock (not by sleeps),
+    about 120 steps/s. The overlay arrow follows it and turns its tip into the direction of movement."""
+    X = xlib(); cx, cy = pointer_pos(); dx, dy = x - cx, y - cy; dist = math.hypot(dx, dy)
     if dist < 2: return
-    dur = dur or min(0.7, 0.14 + dist * 0.00034)
-    n = max(4, int(dur / 0.016))
-    for i in range(1, n + 1):
-        p = i / n; k = 4 * p ** 3 if p < 0.5 else 1 - (-2 * p + 2) ** 3 / 2     # ease in-out cubic
-        X["t"].XTestFakeMotionEvent(X["d"], -1, int(round(cx + (x - cx) * k)), int(round(cy + (y - cy) * k)), 0); sync(X); time.sleep(dur / n)
+    dur = dur or min(1.3, 0.34 + dist * 0.0006)
+    nx, ny = -dy / dist, dx / dist
+    if ny > 0: nx, ny = -nx, -ny                      # the arc bulges upwards
+    bend = min(90.0, dist * 0.12); qx, qy = (cx + x) / 2 + nx * bend, (cy + y) / 2 + ny * bend
+    t0 = time.monotonic(); last = None
+    while True:
+        p = (time.monotonic() - t0) / dur
+        if p >= 1.0: break
+        k = _ease(p); px_ = int(round((1 - k) ** 2 * cx + 2 * (1 - k) * k * qx + k * k * x)); py_ = int(round((1 - k) ** 2 * cy + 2 * (1 - k) * k * qy + k * k * y))
+        if (px_, py_) != last: X["t"].XTestFakeMotionEvent(X["d"], -1, px_, py_, 0); sync(X); last = (px_, py_)
+        time.sleep(0.007)
+    X["t"].XTestFakeMotionEvent(X["d"], -1, x, y, 0); sync(X)
 
 
 def _target(a, kx="x", ky="y"):
@@ -623,7 +642,7 @@ CW = 140; HX = HY = 44               # cursor window size and where the arrow ti
 cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; type_anim = None   # (t0, dur, [line lengths])
+last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -866,8 +885,12 @@ def tick():
     global opacity, rip
     now = time.monotonic(); px, py = pointer()
     if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
-    global lean, lastp
-    if lastp: lean += (max(-0.5, min(0.5, (px - lastp[0]) * 0.045)) - lean) * 0.22      # the nose leans into the direction of movement
+    global lean, lastp, vel, rot_tgt, moving_t
+    if lastp:   # the tip turns into the direction of movement (the arrow points up-left at rest), and settles back when the pointer stops
+        vel = (vel[0] * 0.6 + (px - lastp[0]) * 0.4, vel[1] * 0.6 + (py - lastp[1]) * 0.4)
+        if math.hypot(*vel) > 1.6: rot_tgt = math.atan2(vel[1], vel[0]) + 3 * math.pi / 4; moving_t = now
+        elif now - moving_t > 0.45: rot_tgt = 0.0
+        d = (rot_tgt - lean + math.pi) % (2 * math.pi) - math.pi; lean += d * 0.2
     lastp = (px, py)
     target = 1.0 if (now - last_active < 8.0 or dragging) else 0.0
     opacity += (target - opacity) * 0.22

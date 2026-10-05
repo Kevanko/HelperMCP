@@ -85,16 +85,26 @@ function Post-Result($res, $token) {
     } else { [void](Api '/a/result' $res $token 60) }
 }
 
-# Move the real pointer like a hand would: eased, about 60 steps/s, speed depends on the distance (the overlay cursor follows it).
+# Move the real pointer like a hand would: a slightly curved path, slow start, fast middle, soft landing (cubic-bezier 0.45, 0, 0.15, 1), paced by the clock.
+# The overlay arrow follows it and turns its tip into the direction of movement.
+function Ease($p) {
+    $lo = 0.0; $hi = 1.0
+    for ($i = 0; $i -lt 18; $i++) { $t = ($lo + $hi) / 2; if ((3 * [Math]::Pow(1 - $t, 2) * $t * 0.45 + 3 * (1 - $t) * $t * $t * 0.15 + $t * $t * $t) -lt $p) { $lo = $t } else { $hi = $t } }
+    $t = ($lo + $hi) / 2; 3 * (1 - $t) * $t * $t + $t * $t * $t
+}
 function Glide($x, $y, $dur) {
-    $p0 = [Windows.Forms.Cursor]::Position; $cx = $p0.X; $cy = $p0.Y
-    $dist = [Math]::Sqrt([Math]::Pow($x - $cx, 2) + [Math]::Pow($y - $cy, 2)); if ($dist -lt 2) { return }
-    if (-not $dur) { $dur = [Math]::Min(0.7, 0.14 + $dist * 0.00034) }
-    $n = [Math]::Max(4, [int]($dur / 0.016))
-    for ($i = 1; $i -le $n; $i++) {
-        $q = $i / $n; $k = if ($q -lt 0.5) { 4 * $q * $q * $q } else { 1 - [Math]::Pow(-2 * $q + 2, 3) / 2 }   # ease in-out cubic
-        [void][H.U]::SetCursorPos([int]($cx + ($x - $cx) * $k), [int]($cy + ($y - $cy) * $k)); [Threading.Thread]::Sleep([int](($dur / $n) * 1000))
+    $p0 = [Windows.Forms.Cursor]::Position; $cx = $p0.X; $cy = $p0.Y; $dx = $x - $cx; $dy = $y - $cy
+    $dist = [Math]::Sqrt($dx * $dx + $dy * $dy); if ($dist -lt 2) { return }
+    if (-not $dur) { $dur = [Math]::Min(1.3, 0.34 + $dist * 0.0006) }
+    $nx = -$dy / $dist; $ny = $dx / $dist; if ($ny -gt 0) { $nx = -$nx; $ny = -$ny }   # the arc bulges upwards
+    $bend = [Math]::Min(90.0, $dist * 0.12); $qx = ($cx + $x) / 2 + $nx * $bend; $qy = ($cy + $y) / 2 + $ny * $bend
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $q = $sw.Elapsed.TotalSeconds / $dur; if ($q -ge 1.0) { break }
+        $k = Ease $q; $m = 1 - $k
+        [void][H.U]::SetCursorPos([int]($m * $m * $cx + 2 * $m * $k * $qx + $k * $k * $x), [int]($m * $m * $cy + 2 * $m * $k * $qy + $k * $k * $y)); [Threading.Thread]::Sleep(7)
     }
+    [void][H.U]::SetCursorPos([int]$x, [int]$y)
 }
 function Target($a, $kx = 'x', $ky = 'y') { @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
 function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
@@ -637,7 +647,7 @@ $clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
 $script:scrollDir = 0; $script:scrollT = -99.0; $script:typingT = -99.0; $script:rip = $null; $script:cursorShown = $false; $script:ripShown = $false
 $trail = New-Object System.Collections.ArrayList
-$script:lastPtr = $null; $script:lean = 0.0; $script:typeAnim = $null
+$script:lastPtr = $null; $script:lean = 0.0; $script:vx = 0.0; $script:vy = 0.0; $script:rotTgt = 0.0; $script:movingT = -99.0; $script:typeAnim = $null
 
 function Type-Offset($now) {   # where the arrow stands while text is typed: it follows the caret (about 7.5 px per character, 20 px per line) just below the text
     $a = $script:typeAnim; if (-not $a -or -not $a.lines.Count) { return @(0, 0) }
@@ -673,7 +683,12 @@ $timer.Add_Tick({
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
     $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
     $tgt = if ($active) { 1.0 } else { 0.0 }
-    if ($script:lastPtr) { $lt = [Math]::Max(-28.0, [Math]::Min(28.0, ($p.X - $script:lastPtr.X) * 2.4)); $script:lean += ($lt - $script:lean) * 0.22 }   # the nose leans into the direction of movement
+    if ($script:lastPtr) {   # the tip turns into the direction of movement (the arrow points up-left at rest), and settles back when the pointer stops
+        $script:vx = $script:vx * 0.6 + ($p.X - $script:lastPtr.X) * 0.4; $script:vy = $script:vy * 0.6 + ($p.Y - $script:lastPtr.Y) * 0.4
+        if ([Math]::Sqrt($script:vx * $script:vx + $script:vy * $script:vy) -gt 1.6) { $script:rotTgt = [Math]::Atan2($script:vy, $script:vx) * 180 / [Math]::PI + 135; $script:movingT = $now }
+        elseif ($now - $script:movingT -gt 0.45) { $script:rotTgt = 0.0 }
+        $d = (($script:rotTgt - $script:lean + 540) % 360) - 180; $script:lean += $d * 0.2
+    }
     $script:lastPtr = $p; $arrowRot.Angle = $script:lean
     Set-Pointers $active
     $script:opacity += ($tgt - $script:opacity) * 0.22

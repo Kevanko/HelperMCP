@@ -12,17 +12,18 @@ import java.io.File
 /** checks the relay for a newer APK and installs it (the system asks the user to confirm) */
 object Update {
     @Volatile var available: JSONObject? = null
+    @Volatile var checked = ""        // what the last check saw, shown under the version
     @Volatile var progress = ""          // "" | "downloading 40%" | error text
     private var lastCheck = 0L
 
     fun check(relay: String, force: Boolean = false) {
-        if (!force && System.currentTimeMillis() - lastCheck < 30 * 60 * 1000) return
+        if (!force && System.currentTimeMillis() - lastCheck < 15 * 1000) return
         lastCheck = System.currentTimeMillis()
         Thread {
             try {
                 val (st, b) = Net.req(relay, "GET", "/apk/version", null, timeoutMs = 8000)
-                if (st == 200) { val j = JSONObject(String(b)); available = if (j.optInt("versionCode") > BuildConfig.VERSION_CODE) j else null }
-            } catch (_: Throwable) { }
+                if (st == 200) { val j = JSONObject(String(b)); checked = "ok"; available = if (j.optInt("versionCode") > BuildConfig.VERSION_CODE) j else null }
+            } catch (e: Throwable) { checked = "error: " + e.message }
         }.start()
     }
 

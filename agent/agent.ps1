@@ -202,10 +202,17 @@ function Do-McpStart($a) {
     if ($script:NodeBin) { $psi.EnvironmentVariables['PATH'] = $script:NodeBin + ';' + $env:PATH }
     if ($a.env) { foreach ($p in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$p.Name] = [string]$p.Value } }
     if ($env:HELPER_DEBUG) { Write-Host "[debug] start $exe $($psi.Arguments)" }
+    # .NET Framework builds the child's stdin writer from the console input encoding. If that is UTF-8 *with BOM*
+    # (e.g. chcp 65001), a BOM is written at process start and corrupts the first JSON line. Use a BOM-less encoding.
+    $oldIn = $null
+    try { $oldIn = [Console]::InputEncoding; [Console]::InputEncoding = New-Object Text.UTF8Encoding $false } catch { }
     $c = @{ p = [Diagnostics.Process]::Start($psi); n = 0; read = $null; tools = @() }
+    try { if ($oldIn) { [Console]::InputEncoding = $oldIn } } catch { }
     $c.err = $c.p.StandardError.ReadToEndAsync()   # drained in the background (also keeps the pipe from filling); shown if the server dies. ponytail: grows with a chatty server's stderr
     # default stdin encoding is the console codepage; MCP is UTF-8
     $c.w = New-Object IO.StreamWriter($c.p.StandardInput.BaseStream, (New-Object Text.UTF8Encoding $false))
+    # setting the console encoding can fail without a console: if a BOM went out anyway, isolate it on its own (empty) line
+    if ($c.p.StandardInput.Encoding.GetPreamble().Length -gt 0) { $c.w.WriteLine(''); $c.w.Flush() }
     try {
         [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } $(if ($env:HELPER_INIT_TIMEOUT) { [int]$env:HELPER_INIT_TIMEOUT } else { 240 }))
         Child-Rpc $c 'notifications/initialized' $null -Notify

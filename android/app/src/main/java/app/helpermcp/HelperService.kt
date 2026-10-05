@@ -135,10 +135,13 @@ class HelperService : AccessibilityService() {
         if (tool == "bye") { ended = true; return }
         if (!opSeen) { opSeen = true; phase = "ok"; fx.setState("ok") }
         var data: Any? = null; var error: String? = null
+        val quiet = tool == "screenshot" || tool == "sysinfo"
+        if (!quiet) fx.setBusy(true)
         try {
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
             data = exec(tool, args)
         } catch (e: Throwable) { error = e.message ?: e.javaClass.simpleName }
+        if (!quiet) fx.setBusy(false)
         for (attempt in 0 until 4) {
             try {
                 if (data is Shot) Net.req(relay, "POST", "/a/result", token, data.jpeg, "image/jpeg", 60000, mapOf("X-Result-Id" to id, "X-Result-Meta" to URLEncoder.encode(data.meta.toString(), "UTF-8")))
@@ -242,11 +245,13 @@ class HelperService : AccessibilityService() {
 
     private fun screenshot(a: JSONObject): Shot {
         val maxW = a.optInt("max_width", 900).coerceIn(200, 4000); val q = a.optInt("quality", 70).coerceIn(20, 95)
-        val bmp = capture()
+        val view = a.optBoolean("view")
+        fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
+        val bmp = try { capture() } finally { fx.captureMode(false) }
         val sc = if (bmp.width > maxW) bmp.width.toFloat() / maxW else 1f
         val out = if (sc > 1f) Bitmap.createScaledBitmap(bmp, (bmp.width / sc).toInt(), (bmp.height / sc).toInt(), true) else bmp
         val bo = ByteArrayOutputStream(); out.compress(Bitmap.CompressFormat.JPEG, q, bo)
-        scale = sc
+        if (!view) scale = sc   // a live-viewer frame must not change the coordinates the AI works with
         return Shot(bo.toByteArray(), JSONObject().put("width", out.width).put("height", out.height).put("scale", sc.toDouble()))
     }
 
@@ -316,9 +321,11 @@ class HelperService : AccessibilityService() {
         val amount = a.optInt("amount", 3); val h = fx.height.toFloat(); val w = fx.width.toFloat()
         val x = if (a.has("x")) px(a, "x") else w / 2; val y = if (a.has("y")) py(a, "y") else h / 2
         val dist = (amount.coerceIn(-20, 20) * h * 0.1f).coerceIn(-h * 0.6f, h * 0.6f)
-        fx.active(); fx.glideBlocking(x, y)
-        // positive = down = the content moves up: the finger goes up
+        fx.active(); fx.glideBlocking(x, y + dist / 2); Thread.sleep(40)
+        // positive = down = the content moves up: the finger goes up (the pointer travels with it)
+        fx.dragging(true); fx.glide(x, y - dist / 2)
         val ok = gesture(Path().apply { moveTo(x, y + dist / 2); lineTo(x, y - dist / 2) }, 380)
+        fx.dragging(false)
         if (!ok) throw RuntimeException("The scroll was not delivered")
     }
 

@@ -75,7 +75,7 @@ class FxView(ctx: Context) : View(ctx) {
             if (p0 in 0f..1f) { paint.style = Paint.Style.FILL; paint.color = withAlpha(Color.WHITE, 0.9f * (1 - p0)); c.drawCircle(r.x, r.y, (9 * (1 - p0) + 2) * d, paint) }
         }
         val age = now - lastActive
-        val alpha = if (cx < 0) 0f else if (dragging || age < 8000) 1f else max(0f, 1f - (age - 8000) / 400f)
+        val alpha = if (cx < 0) 0f else if (dragging || age < 2500) 1f else max(0f, 1f - (age - 2500) / 500f)
         if (alpha > 0.01f) {
             busy = true
             val k = d * 1.25f
@@ -113,6 +113,7 @@ class FxView(ctx: Context) : View(ctx) {
     private fun withAlpha(col: Int, a: Float) = (col and 0x00FFFFFF) or ((a.coerceIn(0f, 1f) * 255).toInt() shl 24)
 }
 
+const val SECURE_WORKS = false
 class Fx(private val svc: AccessibilityService) {
     private val main = Handler(Looper.getMainLooper())
     private val wm = svc.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -121,6 +122,15 @@ class Fx(private val svc: AccessibilityService) {
     private var pill: TextView? = null
     private var card: View? = null
     var state = "wait"            // wait | ok | lost
+    private var busy = false
+    private var pulse: ValueAnimator? = null
+    private var pulseV = 0f
+    fun captureMode(on: Boolean) { if (SECURE_WORKS) return; val l = CountDownLatch(1); main.post { for (v in listOf<View?>(view, pill, card)) v?.visibility = if (on) View.INVISIBLE else View.VISIBLE; l.countDown() }; l.await(1, TimeUnit.SECONDS); if (on) Thread.sleep(60) }
+    fun setBusy(b: Boolean) = main.post {
+        if (busy == b) return@post; busy = b; pulse?.cancel()
+        if (b) pulse = ValueAnimator.ofFloat(0f, 1f).apply { duration = 700; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; addUpdateListener { pulseV = it.animatedValue as Float; pill?.let { p -> updatePill(p) } }; start() }
+        else { pulseV = 0f; pill?.let { updatePill(it) } }
+    }
     private var startedAt = 0L
     var onEnd: (() -> Unit)? = null
     private var vel = floatArrayOf(0f, 0f); private var rotTgt = 0f; private var movingAt = -9999L
@@ -160,7 +170,12 @@ class Fx(private val svc: AccessibilityService) {
             "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…") + "   ✕"
             else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…") + "   ✕"
         }
-        p.background = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(0xE60F1724.toInt()); setStroke(dp(2), colorOf()) }
+        val col = colorOf(); val inner = GradientDrawable().apply { cornerRadius = dp(20).toFloat(); setColor(0xE60F1724.toInt()); setStroke(dp(2), col) }
+        if (busy) {   // working: the outline breathes and a soft halo pulses around the label
+            val halo = GradientDrawable().apply { cornerRadius = dp(26).toFloat(); setColor(0); setStroke(dp(6), (col and 0x00FFFFFF) or ((30 + 120 * pulseV).toInt() shl 24)) }
+            val halo2 = GradientDrawable().apply { cornerRadius = dp(30).toFloat(); setColor(0); setStroke(dp(4), (col and 0x00FFFFFF) or ((10 + 60 * pulseV).toInt() shl 24)) }
+            p.background = android.graphics.drawable.LayerDrawable(arrayOf(halo2, halo, inner)).apply { setLayerInset(0, -dp(10), -dp(10), -dp(10), -dp(10)); setLayerInset(1, -dp(5), -dp(5), -dp(5), -dp(5)) }
+        } else p.background = inner
     }
 
     fun setState(s: String) = main.post { if (state != s) { state = s; applyState() } }

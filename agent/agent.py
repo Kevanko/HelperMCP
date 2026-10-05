@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """HelperMCP agent for Linux. Python 3 stdlib only (GTK via python3-gi is used if present, for the overlay).
 Run: python3 <(curl -fsSL RELAY/p)"""
-import base64, ctypes, ctypes.util, getpass, json, locale, os, platform, queue, shutil, signal, socket
+import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, locale, os, platform, queue, shutil, signal, socket
 import subprocess, sys, tarfile, tempfile, threading, time
-import urllib.request, urllib.error
+import urllib.parse, urllib.request, urllib.error
 
 RELAY = os.environ.get("HELPER_RELAY") or "__RELAY__"
 RU = (locale.getlocale()[0] or os.environ.get("LANG", "")).lower().startswith("ru")
@@ -17,10 +17,12 @@ T = {
     "overlay": ("Удалённое управление", "Remote control"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "write_file", "click", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "write_file", "click", "type_text", "press_key", "scroll", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
+EXTRA_PATH = []                           # dirs of portable runtimes (node, uv) put in front of PATH for everything we start
+STARTED = []                              # processes launched with start_process (listed by sysinfo, left running on exit)
 CHILDREN = {}                             # name -> Child (other MCP servers running on this PC)
 TMP = []                                  # temp files/dirs removed on exit
 SCALE = 1.0                               # screenshot px -> real px
@@ -125,26 +127,30 @@ def monitors():
 
 def screenshot(a):
     global SCALE, ORIGIN
+    a = a or {}
     if not GUI["type"]: raise RuntimeError("No graphical session found (nobody is logged in to a desktop).")
-    mons, want, view = monitors(), (a or {}).get("monitor"), bool((a or {}).get("view"))   # view: the live viewer's frame, must not change click coordinates
+    mons, want, view = monitors(), a.get("monitor"), bool(a.get("view"))   # view: the live viewer's frame, must not change click coordinates
+    cap, qual = int(a.get("max_width") or (1280 if view else 1920)), int(a.get("quality") or (65 if view else 70))
     if want is not None and not (0 <= int(want) < len(mons)): raise RuntimeError(f"No monitor {want}. Monitors: {mons}")
     d = tempfile.mkdtemp()
     try:
         path = capture_file(d)
-        try:  # crop to one monitor if asked, downscale to <=1920 px wide (1280 for the viewer), remember offset+factor for click coordinates
+        try:  # crop to one monitor if asked, downscale, remember offset+factor for click coordinates
             import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
-            pb = GdkPixbuf.Pixbuf.new_from_file(path); org = (0, 0); cap = 1280 if view else 1920
+            pb = GdkPixbuf.Pixbuf.new_from_file(path); org = (0, 0)
             if want is not None:
                 x, y, w, h = mons[int(want)]; pb = pb.new_subpixbuf(x, y, w, h); org = (x, y)
             w = pb.get_width(); sc = max(1.0, w / cap)
             if sc > 1: pb = pb.scale_simple(cap, int(pb.get_height() / sc), GdkPixbuf.InterpType.BILINEAR)
             if not view: SCALE, ORIGIN = sc, org
-            _, buf = pb.save_to_bufferv("jpeg", ["quality"], ["65" if view else "70"])
-            return {"image": base64.b64encode(buf).decode(), "mime": "image/jpeg"}
+            _, buf = pb.save_to_bufferv("jpeg", ["quality"], [str(qual)]); mime = "image/jpeg"
         except Exception:
             if not view: SCALE, ORIGIN = 1.0, (0, 0)
-            with open(path, "rb") as f:
-                return {"image": base64.b64encode(f.read()).decode(), "mime": "image/jpeg" if path.endswith("jpg") else "image/png"}
+            with open(path, "rb") as f: buf = f.read()
+            mime = "image/jpeg" if path.endswith("jpg") else "image/png"
+        h = hashlib.md5(buf).hexdigest()
+        if a.get("prev") and a["prev"] == h: return {"same": True, "h": h}   # nothing changed: send nothing
+        return {"jpeg": bytes(buf), "mime": mime, "h": h}
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -225,12 +231,35 @@ def clip(s):
     return s if len(s) <= MAX_OUT else s[:MAX_OUT] + f"\n...[truncated {len(s) - MAX_OUT} chars]"
 
 
+def with_path(env=None):
+    e = dict(os.environ, **(env or {}))
+    if EXTRA_PATH: e["PATH"] = os.pathsep.join(EXTRA_PATH + [e.get("PATH", "")])
+    return e
+
+
 def run(a):
     try:
-        code, out = sh(["bash", "-c", a["command"]], a.get("timeout_s", 60))
+        p = subprocess.run(["bash", "-c", a["command"]], capture_output=True, text=True, timeout=a.get("timeout_s", 60), errors="replace", env=with_path(), cwd=a.get("cwd"))
+        code, out = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
         return {"text": f"[timeout after {a.get('timeout_s', 60)}s]\n" + clip(str(e.stdout or ""))}
     return {"text": f"[exit {code}]\n" + clip(out)}
+
+
+def start_process(a):
+    """Launch a program detached (GUI apps like Blender/Unity, servers) and return at once; it keeps running after this call."""
+    cmd = shutil.which(a["command"], path=with_path()["PATH"]) or a["command"]
+    log = os.path.join(tempfile.gettempdir(), f"helpermcp-start-{os.getpid()}-{len(STARTED)}.log")
+    with open(log, "wb") as lf:
+        p = subprocess.Popen([cmd] + list(a.get("args") or []), cwd=a.get("cwd"), env=with_path(a.get("env")), stdin=subprocess.DEVNULL,
+                             stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+    STARTED.append(p)
+    try: p.wait(timeout=min(float(a.get("wait_s", 2)), 30))   # returns early if it crashes right away
+    except subprocess.TimeoutExpired: pass
+    rc = p.poll()
+    tail = open(log, "r", errors="replace").read()[-1500:]
+    if rc is not None: return {"text": f"[exited with code {rc} right away]\n{tail}"}
+    return {"text": f"[started pid {p.pid}, still running]\n{tail}"}
 
 
 def read_file(a):
@@ -261,7 +290,8 @@ def sysinfo(_):
         "python": platform.python_version(), "cpus": os.cpu_count(), "root": os.geteuid() == 0,
         "display": os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"), "session": GUI["type"],
         "monitors": [f"{i}: {w}x{h} at {x},{y}" for i, (x, y, w, h) in enumerate(monitors())],
-        "node": sh("node -v 2>/dev/null")[1].strip() or None,
+        "node": sh("node -v 2>/dev/null")[1].strip() or None, "uv": sh("uv --version 2>/dev/null")[1].strip() or None,
+        "started": [{"pid": p.pid, "running": p.poll() is None} for p in STARTED],
         "uptime": sh("uptime -p")[1].strip(), "mem": sh("free -h | sed -n 2p")[1].strip(), "disk": sh("df -h / | tail -1")[1].strip(),
     }, indent=2, ensure_ascii=False)}
 
@@ -272,11 +302,16 @@ def node_major():
     except Exception: return 0
 
 
+def _download(url, dest):
+    urllib.request.urlretrieve(url, dest)
+
+
 def ensure_node(command):
     """npx/node/npm missing or older than 20? Download a portable Node into a temp dir (removed on exit)."""
     global NODE_DIR, NODE_BIN
-    if os.path.basename(command) not in ("npx", "node", "npm") or NODE_BIN or node_major() >= NODE_MIN:
-        return
+    base = os.path.basename(command)
+    if base not in ("npx", "node", "npm") or NODE_BIN or (base == "node" and shutil.which("node")) or node_major() >= NODE_MIN:
+        return   # a plain `node script.js` runs on whatever Node is installed; npx/npm packages usually need >= 20
     arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine().lower())
     osn = {"Linux": "linux", "Darwin": "darwin"}.get(platform.system())
     if not (arch and osn): raise RuntimeError("Node.js >= 20 is missing and no portable build exists for this system")
@@ -284,10 +319,26 @@ def ensure_node(command):
     NODE_DIR = tempfile.mkdtemp(prefix="helpermcp-node-"); TMP.append(NODE_DIR)
     print("[helper] downloading portable Node.js ...", flush=True)
     pkg = os.path.join(NODE_DIR, "n.tar.xz")
-    urllib.request.urlretrieve(f"https://nodejs.org/dist/{NODE_VERSION}/{base}.tar.xz", pkg)
+    _download(f"https://nodejs.org/dist/{NODE_VERSION}/{base}.tar.xz", pkg)
     with tarfile.open(pkg) as tf: tf.extractall(NODE_DIR)
     os.remove(pkg)
-    NODE_BIN = os.path.join(NODE_DIR, base, "bin")
+    NODE_BIN = os.path.join(NODE_DIR, base, "bin"); EXTRA_PATH.insert(0, NODE_BIN)
+
+
+def ensure_uv(command):
+    """uv/uvx (how most Python MCP servers are started) missing? Download the portable uv into a temp dir."""
+    if os.path.basename(command) not in ("uv", "uvx") or shutil.which(command, path=with_path()["PATH"]): return
+    arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine().lower())
+    tgt = {("Linux", "x86_64"): "x86_64-unknown-linux-gnu", ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+           ("Darwin", "x86_64"): "x86_64-apple-darwin", ("Darwin", "aarch64"): "aarch64-apple-darwin"}.get((platform.system(), arch))
+    if not tgt: raise RuntimeError("uv is missing and no portable build exists for this system")
+    d = tempfile.mkdtemp(prefix="helpermcp-uv-"); TMP.append(d)
+    print("[helper] downloading portable uv ...", flush=True)
+    pkg = os.path.join(d, "uv.tar.gz")
+    _download(f"https://github.com/astral-sh/uv/releases/latest/download/uv-{tgt}.tar.gz", pkg)
+    with tarfile.open(pkg) as tf: tf.extractall(d)
+    os.remove(pkg)
+    EXTRA_PATH.insert(0, os.path.join(d, f"uv-{tgt}"))
 
 
 def playwright_preset(a):
@@ -304,16 +355,20 @@ def playwright_preset(a):
 
 class Child:
     """One stdio MCP server running on this PC."""
-    def __init__(self, command, args, env):
-        e = dict(os.environ, **(env or {}))
-        if NODE_BIN:
-            e["PATH"] = NODE_BIN + os.pathsep + e.get("PATH", "")
-            if command in ("npx", "node", "npm"): command = os.path.join(NODE_BIN, command)
+    def __init__(self, command, args, env, cwd=None):
+        e = with_path(env)
+        command = shutil.which(command, path=e["PATH"]) or command
         self.p = subprocess.Popen([command] + list(args or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=e, text=True, encoding="utf-8", bufsize=1)
+                                  stderr=subprocess.PIPE, env=e, text=True, encoding="utf-8", bufsize=1, cwd=cwd, start_new_session=True)
         self.q, self.n, self.tools, self.err = queue.Queue(), 0, [], []
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=lambda: [self.err.append(l) for l in self.p.stderr], daemon=True).start()
+
+    def kill(self):  # the whole process group: uvx/npx start the real server as a grandchild
+        try: os.killpg(self.p.pid, signal.SIGKILL)
+        except Exception:
+            try: self.p.kill()
+            except Exception: pass
 
     def why(self):  # last stderr lines, for error messages
         return "".join(self.err[-8:]).strip()[:1500]
@@ -345,15 +400,15 @@ def mcp_start(a):
     name, command, args = a["name"], a["command"], a.get("args")
     if name in CHILDREN: raise RuntimeError(f"'{name}' is already running")
     if command == "playwright": command, args = playwright_preset(a)
-    ensure_node(command)
-    c = Child(command, args, a.get("env"))
+    ensure_node(command); ensure_uv(command)
+    c = Child(command, args, a.get("env"), a.get("cwd"))
     try:
         c.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
-                             "clientInfo": {"name": "helpermcp", "version": "0.3"}}, timeout=240)
+                             "clientInfo": {"name": "helpermcp", "version": "0.4"}}, timeout=a.get("timeout_s", 240))
         c.rpc("notifications/initialized", notify=True)
         c.tools = c.rpc("tools/list", timeout=60)["tools"]
     except Exception:
-        c.p.kill(); raise
+        c.kill(); raise
     CHILDREN[name] = c
     return {"text": f"{name}: {len(c.tools)} tools: " + ", ".join(t["name"] for t in c.tools)}
 
@@ -365,13 +420,13 @@ def mcp_tools(_):
 def mcp_call(a):
     c = CHILDREN.get(a["server"])
     if not c: raise RuntimeError(f"No MCP server '{a['server']}'. Start it with mcp_start.")
-    r = c.rpc("tools/call", {"name": a["tool"], "arguments": a.get("arguments") or {}}, timeout=110)
+    r = c.rpc("tools/call", {"name": a["tool"], "arguments": a.get("arguments") or {}}, timeout=a.get("timeout_s", 110))
     return {"content": r.get("content", []), "isError": r.get("isError", False)}
 
 
 def mcp_stop(a):
     c = CHILDREN.pop(a["name"], None)
-    if c: c.p.kill()
+    if c: c.kill()
     return {"text": "stopped" if c else "not running"}
 
 
@@ -444,9 +499,7 @@ def overlay_start():
 
 
 def cleanup():
-    for c in CHILDREN.values():
-        try: c.p.kill()
-        except Exception: pass
+    for c in CHILDREN.values(): c.kill()
     if OVERLAY_PROC:
         try: OVERLAY_PROC.kill()
         except Exception: pass
@@ -459,14 +512,28 @@ def api(path, data=None, token=None, timeout=40):
     if token: req.add_header("Authorization", "Bearer " + token)
     if data is not None:
         req.add_header("Content-Type", "application/json"); data = json.dumps(data).encode()
+        if len(data) > 2048: data = gzip.compress(data, 5); req.add_header("Content-Encoding", "gzip")   # weak links: big outputs shrink a lot
     with urllib.request.urlopen(req, data, timeout=timeout) as r:
         raw = r.read()
         return (r.status, json.loads(raw) if raw else None)
 
 
+def post_result(res, token):
+    """Send a tool result. Screenshots go as the raw JPEG body (no base64 inflation), everything else as (gzipped) JSON."""
+    d = res.get("data") if res.get("ok") else None
+    if isinstance(d, dict) and isinstance(d.get("jpeg"), (bytes, bytearray)):
+        meta = {k: v for k, v in d.items() if k not in ("jpeg", "mime")}
+        req = urllib.request.Request(RELAY + "/a/result", data=bytes(d["jpeg"]), method="POST")
+        req.add_header("Authorization", "Bearer " + token); req.add_header("Content-Type", d.get("mime") or "image/jpeg")
+        req.add_header("X-Result-Id", res["id"]); req.add_header("X-Result-Meta", urllib.parse.quote(json.dumps(meta)))
+        urllib.request.urlopen(req, timeout=60).read()
+    else:
+        api("/a/result", res, token, timeout=60)
+
+
 TOOLS = dict(screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
-             mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
+             start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
 def main():
@@ -484,7 +551,7 @@ def main():
             try:
                 status, cmd = api("/a/poll", token=token, timeout=40)
             except urllib.error.HTTPError as e:
-                if e.code in (401, 410): print("session closed"); return
+                if e.code in (401, 410): print("session closed (ended by the helper, or the helper server was reset: run the command again)"); return
                 time.sleep(3); continue
             except (urllib.error.URLError, OSError, TimeoutError):
                 time.sleep(3); continue
@@ -499,8 +566,12 @@ def main():
                 res.update(ok=True, data=TOOLS[name](args))
             except Exception as e:  # report every failure to the operator
                 res.update(ok=False, error=f"{type(e).__name__}: {e}")
-            try: api("/a/result", res, token)
-            except Exception: pass
+            for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
+                try: post_result(res, token); break
+                except urllib.error.HTTPError as e:
+                    if e.code in (401, 410): break
+                    time.sleep(1 + attempt)
+                except Exception: time.sleep(1 + attempt)
     except KeyboardInterrupt:
         pass
     finally:

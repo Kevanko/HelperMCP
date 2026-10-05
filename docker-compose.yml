@@ -9,8 +9,10 @@ services:
       PUBLIC_URL: ${PUBLIC_URL:-}   # e.g. https://help.example.com
       TLS_CERT: ${TLS_CERT:-}       # optional: serve TLS from your own certbot files, e.g. /certs/live/<domain>/fullchain.pem
       TLS_KEY: ${TLS_KEY:-}
+      STATE_FILE: /data/state.json  # sessions + viewer links survive restarts and updates; agents just keep going
     volumes:
       - ${CERTS_DIR:-/etc/letsencrypt}:/certs:ro
+      - ./data:/data
   caddy:                            # automatic HTTPS: enabled by COMPOSE_PROFILES=caddy (install.sh --domain)
     image: caddy:2
     profiles: ["caddy"]

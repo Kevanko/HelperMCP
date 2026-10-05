@@ -4,10 +4,12 @@ $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored a
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null
+$script:ExtraPath = @()   # dirs of portable runtimes (node, uv) put in front of PATH for everything we start
+$script:Started = @()    # processes launched with start_process (listed by sysinfo, left running on exit)
 $Children = @{}   # name -> other MCP servers running on this PC
 $MaxOut = 100000
 
@@ -25,6 +27,10 @@ function Api($path, $data, $token, $timeout = 40) {
     if ($token) { $h.Authorization = "Bearer $token" }
     if ($null -ne $data) {
         $b = [Text.Encoding]::UTF8.GetBytes(($data | ConvertTo-Json -Depth 6 -Compress))
+        if ($b.Length -gt 2048) {   # weak links: big outputs shrink a lot
+            $ms = New-Object IO.MemoryStream; $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
+            $gz.Write($b, 0, $b.Length); $gz.Close(); $b = $ms.ToArray(); $h['Content-Encoding'] = 'gzip'
+        }
         Invoke-WebRequest -Uri "$RELAY$path" -Method Post -Headers $h -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec $timeout -UseBasicParsing
     } else {
         Invoke-WebRequest -Uri "$RELAY$path" -Headers $h -TimeoutSec $timeout -UseBasicParsing
@@ -48,7 +54,9 @@ function Do-Screenshot($a) {
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
-    $w = [Math]::Min($(if ($view) { 1280 } else { 1920 }), $s.Width)
+    $cap = if ($a.max_width) { [int]$a.max_width } elseif ($view) { 1280 } else { 1920 }
+    $qual = if ($a.quality) { [long]$a.quality } elseif ($view) { 65L } else { 70L }
+    $w = [Math]::Min($cap, $s.Width)
     $sc = $s.Width / $w
     if (-not $view) { $script:Scale = $sc }
     $out = New-Object Drawing.Bitmap $w, ([int]($s.Height / $sc))
@@ -58,10 +66,22 @@ function Do-Screenshot($a) {
     $g.Dispose(); $bmp.Dispose()
     $enc = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'
     $p = New-Object Drawing.Imaging.EncoderParameters 1
-    $p.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), 70L
+    $p.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), $qual
     $ms = New-Object IO.MemoryStream
     $out.Save($ms, $enc, $p); $out.Dispose()
-    @{ image = [Convert]::ToBase64String($ms.ToArray()); mime = 'image/jpeg' }
+    $bytes = $ms.ToArray()
+    $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)).Replace('-', '').ToLower()
+    if ($a.prev -and $a.prev -eq $hash) { return @{ same = $true; h = $hash } }   # nothing changed: send nothing
+    @{ jpeg = $bytes; mime = 'image/jpeg'; h = $hash }
+}
+
+# Screenshots go as the raw JPEG body (no base64 inflation), everything else as (gzipped) JSON.
+function Post-Result($res, $token) {
+    if ($res.ok -and $res.data -is [hashtable] -and $res.data.jpeg) {
+        $meta = @{}; foreach ($k in $res.data.Keys) { if ($k -ne 'jpeg' -and $k -ne 'mime') { $meta[$k] = $res.data[$k] } }
+        $h = @{ Authorization = "Bearer $token"; 'X-Result-Id' = $res.id; 'X-Result-Meta' = [Uri]::EscapeDataString(($meta | ConvertTo-Json -Compress)) }
+        [void](Invoke-WebRequest -Uri "$RELAY/a/result" -Method Post -Headers $h -Body ([byte[]]$res.data.jpeg) -ContentType $res.data.mime -TimeoutSec 60 -UseBasicParsing)
+    } else { [void](Api '/a/result' $res $token 60) }
 }
 
 function Do-Click($a) {
@@ -109,6 +129,8 @@ function Do-Run($a) {
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
+    if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
@@ -143,7 +165,8 @@ function Do-SysInfo($a) {
         os = "$($os.Caption) build $($os.BuildNumber)"; host = $env:COMPUTERNAME; user = $env:USERNAME; admin = $admin
         powershell = $PSVersionTable.PSVersion.ToString(); cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
         ram_gb = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 1); free_ram_gb = [Math]::Round($os.FreePhysicalMemory / 1MB, 1)
-        monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) }); boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name
+        monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) }); boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name; node = (& { try { (& node -v 2>$null) } catch { $null } }); uv = (& { try { (& uv --version 2>$null) } catch { $null } })
+        started = @($script:Started | ForEach-Object { '{0} running={1}' -f $_.Id, (-not $_.HasExited) })
     } | ConvertTo-Json) }
 }
 
@@ -153,6 +176,46 @@ function Do-Scroll($a) {
     $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * $n)), 0)
     [H.U]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
     @{ text = 'ok' }
+}
+
+# Launch a program detached (GUI apps like Blender/Unity, servers) and return at once; it keeps running after this call.
+function Resolve-Exe($cmd) {
+    if (Test-Path -LiteralPath $cmd -PathType Leaf) { return (Resolve-Path -LiteralPath $cmd).Path }
+    foreach ($d in $script:ExtraPath) { foreach ($e in '.exe', '.cmd', '.bat', '') { $f = Join-Path $d ($cmd + $e); if (Test-Path -LiteralPath $f -PathType Leaf) { return $f } } }
+    foreach ($e in '.exe', '.cmd', '.bat', '') { $g = Get-Command ($cmd + $e) -CommandType Application -ErrorAction SilentlyContinue; if ($g) { return @($g)[0].Source } }
+    $null
+}
+function Do-StartProcess($a) {
+    $exe = Resolve-Exe $a.command
+    if (-not $exe) { throw "Command '$($a.command)' not found" }
+    $log = Join-Path $env:TEMP ("helpermcp-start-$PID-$($script:Started.Count).log")
+    $argl = (@($a.args) | Where-Object { $null -ne $_ } | ForEach-Object { Quote-Arg $_ }) -join ' '
+    $psi = New-Object Diagnostics.ProcessStartInfo 'cmd.exe'   # cmd keeps a log of the output; GUI windows still open normally
+    $psi.Arguments = '/d /c ""' + $exe + '" ' + $argl + ' > "' + $log + '" 2>&1"'
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    if ($a.env) { foreach ($q in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$q.Name] = [string]$q.Value } }
+    if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
+    $proc = [Diagnostics.Process]::Start($psi); $script:Started += $proc
+    $w = if ($null -ne $a.wait_s) { [Math]::Min([double]$a.wait_s, 30) } else { 2 }
+    [void]$proc.WaitForExit([int]($w * 1000))
+    $tail = if (Test-Path $log) { $t = Get-Content $log -Raw -ErrorAction SilentlyContinue; if ($t) { $t.Substring([Math]::Max(0, $t.Length - 1500)) } else { '' } } else { '' }
+    if ($proc.HasExited) { @{ text = "[exited with code $($proc.ExitCode) right away]`n$tail" } } else { @{ text = "[started pid $($proc.Id), still running]`n$tail" } }
+}
+
+# uv/uvx (how most Python MCP servers are started) missing? Download the portable uv into a temp dir.
+function Ensure-Uv($cmd) {
+    if ($cmd -notmatch '^(uv|uvx)(\.exe)?$' -or (Resolve-Exe $cmd)) { return }
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+    $dir = Join-Path $env:TEMP ('helpermcp-uv-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory $dir); $script:TmpDirs += $dir
+    Write-Host '[helper] downloading portable uv ...'
+    $zip = Join-Path $dir 'uv.zip'
+    $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
+    try { Invoke-WebRequest "https://github.com/astral-sh/uv/releases/latest/download/uv-$arch-pc-windows-msvc.zip" -OutFile $zip -UseBasicParsing } finally { $ProgressPreference = $pp }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dir); Remove-Item $zip
+    $script:ExtraPath = @($dir) + $script:ExtraPath
 }
 
 function Node-Major { try { [int](((& node -v 2>$null) -as [string]).TrimStart('v').Split('.')[0]) } catch { 0 } }
@@ -173,7 +236,7 @@ function Playwright-Preset($a) {
 
 # npx/node/npm missing or older than 20? Download a portable Node into a temp dir (removed on exit).
 function Ensure-Node($cmd) {
-    if ($cmd -notmatch '^(npx|npm|node)(\.cmd|\.exe)?$' -or $script:NodeBin -or (Node-Major) -ge $NodeMin) { return }
+    if ($cmd -notmatch '^(npx|npm|node)(\.cmd|\.exe)?$' -or $script:NodeBin -or ($cmd -match '^node(\.exe)?$' -and (Resolve-Exe $cmd)) -or (Node-Major) -ge $NodeMin) { return }   # a plain `node script.js` runs on whatever Node is installed; npx/npm packages usually need >= 20
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'Node.js is missing and there is no 32-bit portable build' }
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
     $script:NodeDir = Join-Path $env:TEMP ('helpermcp-node-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -186,6 +249,7 @@ function Ensure-Node($cmd) {
     [IO.Compression.ZipFile]::ExtractToDirectory($zip, $script:NodeDir)
     Remove-Item $zip
     $script:NodeBin = (Get-ChildItem $script:NodeDir -Directory | Select-Object -First 1).FullName
+    $script:ExtraPath = @($script:NodeBin) + $script:ExtraPath
 }
 
 function Quote-Arg($s) { if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s } }
@@ -220,22 +284,17 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
 function Do-McpStart($a) {
     if ($Children.ContainsKey($a.name)) { throw "'$($a.name)' is already running" }
     if ($a.command -eq 'playwright') { $pre = Playwright-Preset $a; $a = @{ name = $a.name; command = $pre.command; args = $pre.args; env = $a.env } }
-    Ensure-Node $a.command
-    $exe = $a.command
-    if ($script:NodeBin -and (Test-Path (Join-Path $script:NodeBin "$exe.cmd"))) { $exe = Join-Path $script:NodeBin "$exe.cmd" }
-    elseif ($script:NodeBin -and (Test-Path (Join-Path $script:NodeBin "$exe.exe"))) { $exe = Join-Path $script:NodeBin "$exe.exe" }
-    else {   # full path incl. extension; Get-Command would return npx.ps1, which CreateProcess can't run
-        $found = foreach ($e in '.exe', '.cmd', '.bat', '') { $g = Get-Command ($exe + $e) -CommandType Application -ErrorAction SilentlyContinue; if ($g) { $g.Source; break } }
-        if (-not $found) { throw "Command '$exe' not found" }
-        $exe = @($found)[0]
-    }
+    Ensure-Node $a.command; Ensure-Uv $a.command
+    $exe = Resolve-Exe $a.command   # full path incl. extension (npx.cmd, uvx.exe ...); Get-Command alone would return npx.ps1
+    if (-not $exe) { throw "Command '$($a.command)' not found" }
     $psi = New-Object Diagnostics.ProcessStartInfo $exe
     $psi.Arguments = (@($a.args) | Where-Object { $null -ne $_ } | ForEach-Object { Quote-Arg $_ }) -join ' '
     $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
-    if ($script:NodeBin) { $psi.EnvironmentVariables['PATH'] = $script:NodeBin + ';' + $env:PATH }
-    if ($a.env) { foreach ($p in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$p.Name] = [string]$p.Value } }
+    if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    if ($a.env) { foreach ($q in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$q.Name] = [string]$q.Value } }
+    if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     if ($env:HELPER_DEBUG) { Write-Host "[debug] start $exe $($psi.Arguments)" }
     # .NET Framework builds the child's stdin writer from the console input encoding. If that is UTF-8 *with BOM*
     # (e.g. chcp 65001), a BOM is written at process start and corrupts the first JSON line. Use a BOM-less encoding.
@@ -249,10 +308,10 @@ function Do-McpStart($a) {
     # setting the console encoding can fail without a console: if a BOM went out anyway, isolate it on its own (empty) line
     if ($c.p.StandardInput.Encoding.GetPreamble().Length -gt 0) { $c.w.WriteLine(''); $c.w.Flush() }
     try {
-        [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } $(if ($env:HELPER_INIT_TIMEOUT) { [int]$env:HELPER_INIT_TIMEOUT } else { 240 }))
+        [void](Child-Rpc $c 'initialize' @{ protocolVersion = '2024-11-05'; capabilities = @{}; clientInfo = @{ name = 'helpermcp'; version = '0.2' } } $(if ($env:HELPER_INIT_TIMEOUT) { [int]$env:HELPER_INIT_TIMEOUT } elseif ($a.timeout_s) { [int]$a.timeout_s } else { 240 }))
         Child-Rpc $c 'notifications/initialized' $null -Notify
         $c.tools = @((Child-Rpc $c 'tools/list' $null 60).tools)
-    } catch { try { $c.p.Kill() } catch { }; throw }
+    } catch { Stop-Tree $c.p; throw }
     $Children[$a.name] = $c
     @{ text = "$($a.name): $($c.tools.Count) tools: " + (($c.tools | ForEach-Object { $_.name }) -join ', ') }
 }
@@ -264,12 +323,17 @@ function Do-McpCall($a) {
     $c = $Children[$a.server]
     if (-not $c) { throw "No MCP server '$($a.server)'. Start it with mcp_start." }
     $args2 = if ($a.arguments) { $a.arguments } else { @{} }
-    $r = Child-Rpc $c 'tools/call' @{ name = $a.tool; arguments = $args2 } 110
+    $r = Child-Rpc $c 'tools/call' @{ name = $a.tool; arguments = $args2 } $(if ($a.timeout_s) { [int]$a.timeout_s } else { 110 })
     @{ content = @($r.content); isError = [bool]$r.isError }
+}
+# uvx/npx start the real server as a grandchild: kill the whole tree, not just the wrapper
+function Stop-Tree($proc) {
+    try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+    try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
 }
 function Do-McpStop($a) {
     $c = $Children[$a.name]
-    if ($c) { try { $c.p.Kill() } catch { }; $Children.Remove($a.name) }
+    if ($c) { Stop-Tree $c.p; $Children.Remove($a.name) }
     @{ text = if ($c) { 'stopped' } else { 'not running' } }
 }
 # "Remote control" overlay: glowing screen edges that fade out + a label on top, on every monitor. Runs as its own
@@ -344,7 +408,7 @@ function Start-Overlay {
 }
 
 function Cleanup-Children {
-    foreach ($c in $Children.Values) { try { $c.p.Kill() } catch { } }
+    foreach ($c in $Children.Values) { Stop-Tree $c.p }
     if ($script:OverlayProc) { try { $script:OverlayProc.Kill() } catch { } }
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
@@ -368,7 +432,7 @@ function Start-Helper {
             try { $resp = Api '/a/poll' $null $token 40 }
             catch {
                 $code = [int]$_.Exception.Response.StatusCode
-                if ($code -eq 401 -or $code -eq 410) { Write-Host 'session closed'; return }
+                if ($code -eq 401 -or $code -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её или сервер помощи перезапущен): запусти команду заново' 'session closed (ended by the helper, or the helper server was reset: run the command again)'); return }
                 Start-Sleep 3; continue
             }
             if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
@@ -385,11 +449,14 @@ function Start-Helper {
                 }
                 $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
                     run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-                    mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+                    start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
                 if (-not $fn) { throw "Unknown tool $name" }
                 $res.ok = $true; $res.data = & $fn $a
             } catch { $res.ok = $false; $res.error = $_.Exception.Message }
-            try { [void](Api '/a/result' $res $token) } catch { }
+            for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
+                try { Post-Result $res $token; break }
+                catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
+            }
         }
     } finally {
         Cleanup-Children

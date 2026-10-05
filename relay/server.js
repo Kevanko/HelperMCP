@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -26,6 +27,25 @@ if (!OPERATOR_KEY) {
 }
 
 const sessions = new Map(); // code -> session
+const STATE_FILE = process.env.STATE_FILE || '';   // e.g. /data/state.json; empty = keep everything in memory only
+const sha = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');   // agent tokens are stored hashed
+let saveTimer = null;
+function save() {
+  if (!STATE_FILE || saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      const out = {
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created })),
+        viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp })),
+      };
+      fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+      fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify(out), { mode: 0o600 });
+      fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
+    } catch (e) { console.error('state save failed:', e.message); }
+  }, 300);
+}
+const newSession = (o) => ({ ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
@@ -46,6 +66,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
   if (!s) return Promise.reject(new Error(`No such session "${code}". Use list_sessions.`));
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'ask') timeoutMs += 120_000;
+  if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   if (!args.view) { // live-viewer frames are not "actions"
     const a = JSON.stringify(args, (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v));
     s.log.push({ t: Date.now(), tool, args: a === '{}' ? '' : a.slice(0, 160) });
@@ -57,7 +78,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
       s.pending.delete(id);
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
     }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer });
+    s.pending.set(id, { resolve, reject, timer, t0: Date.now(), tool, view: !!args.view });
     s.queue.push({ id, tool, args });
     flush(s);
   });
@@ -75,7 +96,7 @@ function flush(s) {
 function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
-  sessions.delete(code);
+  sessions.delete(code); save();
   for (const p of s.pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)); }
   if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 410, { error: why }); }
 }
@@ -85,6 +106,45 @@ setInterval(() => {
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
+
+// ---- adapting to the network: viewer frames step through quality levels, "lite" mode shrinks the AI's screenshots on slow links
+const LEVELS = [{ max_width: 480, quality: 35 }, { max_width: 640, quality: 45 }, { max_width: 800, quality: 50 }, { max_width: 960, quality: 55 }, { max_width: 1280, quality: 65 }];
+const viewParams = (s) => LEVELS[s.vl ?? 3];
+function adapt(s, pend, bytes) {
+  const dur = Date.now() - pend.t0;
+  if (pend.view) {                                   // aim for a frame about every second
+    s.vl = s.vl ?? 3;
+    if (dur > 1800 && s.vl > 0) { s.vl--; s.fast = 0; }
+    else if (dur < 700 && bytes && ++s.fast >= 3 && s.vl < LEVELS.length - 1) { s.vl++; s.fast = 0; }
+    else if (dur >= 700) s.fast = 0;
+  } else if (pend.tool === 'screenshot' && bytes) {
+    s.lite = bytes / Math.max(dur, 1) < 60 && dur > 3000 ? true : (dur < 1500 ? false : s.lite);   // < ~60 KB/s and slow => lite
+  }
+}
+
+// ---- background jobs: MCP clients time out after ~60 s, remote work (installs, renders, first start of an MCP server) can take minutes
+const jobs = new Map();
+const SYNC_MS = Number(process.env.JOB_SYNC_MS || 45_000);
+async function settle(id, j, ms) {
+  let timer;
+  const r = await Promise.race([j.p.then(() => 'done'), new Promise((res) => { timer = setTimeout(() => res('pending'), ms); })]);
+  clearTimeout(timer);
+  if (r === 'done') { jobs.delete(id); if (j.error) throw j.error; return j.result; }
+  return { text: `Still running after ${Math.round((Date.now() - j.started) / 1000)} s (job ${id}, ${j.tool}). The work continues on the remote PC: call wait_job {"job":"${id}"} to get the result.` };
+}
+async function callJob(session, tool, args, ms) {
+  const id = crypto.randomBytes(4).toString('hex');
+  const j = { started: Date.now(), tool };
+  j.p = call(session, tool, args, ms).then((r) => { j.result = r; }, (e) => { j.error = e; });
+  jobs.set(id, j);
+  return settle(id, j, SYNC_MS);
+}
+async function waitJob(id, ms) {
+  const j = jobs.get(id);
+  if (!j) throw new Error(`Unknown or already delivered job "${id}".`);
+  return settle(id, j, ms);
+}
+setInterval(() => { for (const [id, j] of jobs) if (Date.now() - j.started > 3600_000) jobs.delete(id); }, 60_000).unref();
 
 // ---- MCP tool table -------------------------------------------------------
 // agent:true -> forwarded to the agent on the friend's PC; otherwise handled here.
@@ -100,10 +160,14 @@ const tools = [
     }) },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
   { name: 'screenshot', agent: true, description: 'Screenshot of the remote screen (what the user sees): all monitors side by side, or a single one with "monitor" (0-based, see sysinfo). Click/scroll coordinates refer to the last screenshot.',
-    props: { monitor: { type: 'integer', minimum: 0, description: 'omit for all monitors' } } },
-  { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux). Returns exit code and combined output.',
-    props: { command: str('Command line'), timeout_s: { type: 'integer', minimum: 1, maximum: 600, description: 'default 60' } }, required: ['command'],
+    props: { monitor: { type: 'integer', minimum: 0, description: 'omit for all monitors' },
+      max_width: { type: 'integer', minimum: 320, maximum: 3840, description: 'downscale to this width (default 1920; use less on slow links)' },
+      quality: { type: 'integer', minimum: 10, maximum: 95, description: 'JPEG quality (default 70)' } } },
+  { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux) and wait for it. Returns exit code and combined output. Portable node/uv fetched by this bridge are on PATH. For GUI apps or anything long-lived use start_process instead.',
+    props: { command: str('Command line'), timeout_s: { type: 'integer', minimum: 1, maximum: 3600, description: 'default 60' }, cwd: str('working directory') }, required: ['command'],
     ms: (a) => ((a.timeout_s || 60) + 10) * 1000 },
+  { name: 'start_process', agent: true, description: 'Start a program detached and return immediately; it keeps running (use this for GUI apps such as Blender, Unity, Substance, or servers). Returns pid, whether it is still running, and the first output.',
+    props: { command: str('Executable name or full path'), args: { type: 'array', items: { type: 'string' } }, cwd: str('working directory'), env: { type: 'object', additionalProperties: { type: 'string' } }, wait_s: { type: 'number', description: 'seconds to watch for an immediate crash, default 2' } }, required: ['command'] },
   { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000).',
     props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 } }, required: ['path'] },
   { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it.',
@@ -115,13 +179,17 @@ const tools = [
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
   { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
   { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', props: { keys: str('Key combo') }, required: ['keys'] },
-  { name: 'mcp_start', agent: true, ms: () => 300_000,
+  { name: 'mcp_start', agent: true, ms: (a) => ((a.timeout_s || 240) + 30) * 1000,
     description: 'Start another MCP server on the remote PC and use it through this bridge (any stdio MCP server: browser, Blender via uvx blender-mcp, filesystem, ...). Browser: name="browser", command="playwright" opens a real, visible Chrome/Edge window on the user\'s screen with sound on. Any other server: command="npx", args=["-y","<package>"] (or uvx, python, an exe). If Node >= 20 is missing a portable copy is downloaded to a temp dir and removed on exit. Returns its tools; call them with mcp_call (or directly as <name>__<tool> on a /s/<code>/mcp connection).',
-    props: { name: str('Short name, e.g. browser'), command: str('Executable, e.g. npx'), args: { type: 'array', items: { type: 'string' } }, env: { type: 'object', additionalProperties: { type: 'string' } } },
+    props: { name: str('Short name, e.g. browser'), command: str('Executable, e.g. npx'), args: { type: 'array', items: { type: 'string' } }, env: { type: 'object', additionalProperties: { type: 'string' } }, cwd: str('working directory'), timeout_s: { type: 'integer', minimum: 10, maximum: 1800, description: 'time allowed for the server to start (first start may download packages), default 240' } },
     required: ['name', 'command'] },
   { name: 'mcp_tools', agent: true, description: 'List tools of the MCP servers started on the remote PC.', props: {} },
-  { name: 'mcp_call', agent: true, ms: () => 120_000, description: 'Call a tool of an MCP server started with mcp_start.',
-    props: { server: str('Name given to mcp_start'), tool: str('Tool name'), arguments: { type: 'object' } }, required: ['server', 'tool'] },
+  { name: 'mcp_call', agent: true, ms: (a) => ((a.timeout_s || 110) + 15) * 1000, description: 'Call a tool of an MCP server started with mcp_start.',
+    props: { server: str('Name given to mcp_start'), tool: str('Tool name'), arguments: { type: 'object' }, timeout_s: { type: 'integer', minimum: 5, maximum: 3600, description: 'default 110; raise it for renders, imports, long generations' } }, required: ['server', 'tool'] },
+  { name: 'wait_job', always: true, local: true,
+    description: 'Long operations return "still running (job X)" after about 45 s so the call does not time out. Call this with that job id to wait for the result; the work keeps going on the remote PC meanwhile.',
+    props: { job: str('Job id from the "still running" message'), wait_s: { type: 'integer', minimum: 1, maximum: 55, description: 'default 40' } }, required: ['job'],
+    run: async (a) => waitJob(a.job, (a.wait_s || 40) * 1000) },
   { name: 'mcp_stop', agent: true, description: 'Stop an MCP server started with mcp_start.', props: { name: str('Name') }, required: ['name'] },
   { name: 'open_viewer', session: true, props: {},
     description: 'Get a link to a live view of the remote screen (updates about once a second, plus a log of what the AI is doing). Open it in a browser so the operator can watch; on the operator\'s PC e.g. `start <url>` (Windows), `xdg-open <url>` (Linux), `open <url>` (macOS).',
@@ -129,7 +197,7 @@ const tools = [
       const c = code.toUpperCase();
       if (!sessions.has(c)) throw new Error(`No such session "${code}". Use list_sessions.`);
       const token = crypto.randomBytes(18).toString('hex');
-      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS });
+      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS }); save();
       return { text: `${lastBase}/v/${token}` };
     } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
@@ -141,18 +209,29 @@ const fmt = (d) => {
   if (d?.content) return { content: d.content, isError: !!d.isError }; // passthrough from a child MCP server
   const out = [];
   if (d?.text !== undefined) out.push({ type: 'text', text: String(d.text) });
-  if (d?.image) out.push({ type: 'image', data: d.image, mimeType: d.mime || 'image/jpeg' });
+  if (d?.jpeg) out.push({ type: 'image', data: d.jpeg.toString('base64'), mimeType: d.mime || 'image/jpeg' });
+  if (d?.same) out.push({ type: 'text', text: 'screen unchanged' });
   return { content: out.length ? out : [{ type: 'text', text: 'ok' }] };
 };
 
 // fixed = session code for /s/<code>/mcp (tools then have no "session" argument and child tools appear as <server>__<tool>)
+const INSTRUCTIONS = `You are connected to a REMOTE computer (a friend's PC or server) through HelperMCP. Work on it as if it were your own machine.
+Workflow for any task:
+1. Look first: sysinfo, then screenshot (what the user sees). Use open_viewer so the operator can watch live.
+2. Need an application or MCP server (Blender, Unity, Substance, a browser, ...)? Check whether it is installed (run: Get-Command / where / which / winget list / registry / apt), install it if missing (winget install -e --id ..., apt/flatpak; an installer that needs administrator rights shows a UAC prompt the user must accept: tell them), then continue.
+3. GUI apps and anything long-lived: start_process (detached, keeps running). Do not use run for them.
+4. MCP servers: mcp_start (command npx / uvx / python / an exe). Portable Node and uv are fetched automatically when missing. command="playwright" opens a real visible browser with sound. Then mcp_call (or <server>__<tool> on /s/<code>/mcp). Prefer a dedicated MCP server over clicking the GUI.
+5. Operations that take longer than ~45 s return "Still running (job X)": call wait_job with that id. Raise timeout_s on mcp_start / mcp_call / run for installs and renders.
+6. The network may be slow: take screenshots only when needed (monitor=N crops to one screen), avoid huge command output.
+7. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
+
 function buildMcp(fixed) {
-  const m = new Server({ name: 'helpermcp', version: '0.2.0' }, { capabilities: { tools: {} } });
+  const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
   const sessionProp = { session: str("Session code shown on the user's screen, e.g. K7M2-QX9P") };
 
   m.setRequestHandler(ListToolsRequestSchema, async () => {
     const list = tools
-      .filter((t) => !(fixed && t.local))
+      .filter((t) => !(fixed && t.local && !t.always))
       .map((t) => {
         const needsSession = (t.agent || t.session) && !fixed;
         return {
@@ -184,13 +263,13 @@ function buildMcp(fixed) {
       const t = byName.get(name);
       if (!t && fixed && name.includes('__')) { // child MCP tool, called directly
         const i = name.indexOf('__');
-        return fmt(await call(session, 'mcp_call', { server: name.slice(0, i), tool: name.slice(i + 2), arguments: a }, 120_000));
+        return fmt(await callJob(session, 'mcp_call', { server: name.slice(0, i), tool: name.slice(i + 2), arguments: a }, 125_000));
       }
       if (!t) throw new Error(`Unknown tool ${name}`);
-      if (t.local) return fmt(await t.run());
+      if (t.local) return fmt(await t.run(a));
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
       if (t.run) return fmt(await t.run(session));
-      return fmt(await call(session, name, a, t.ms?.(a)));
+      return fmt(await callJob(session, name, a, t.ms?.(a)));
     } catch (e) {
       return { isError: true, content: [{ type: 'text', text: e.message }] };
     }
@@ -208,14 +287,19 @@ const text = (res, code, s, type = 'text/plain; charset=utf-8') => {
   res.writeHead(code, { 'content-type': type });
   res.end(s);
 };
-function body(req, limit) {
+function bodyBuf(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = []; let n = 0;
     req.on('data', (c) => { n += c.length; if (n > limit) { reject(new Error('too large')); req.destroy(); } else chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks);
+      if (req.headers['content-encoding'] !== 'gzip') return resolve(raw);
+      try { resolve(zlib.gunzipSync(raw, { maxOutputLength: limit * 4 })); } catch (e) { reject(e); }   // agents gzip big JSON; cap the inflated size
+    });
     req.on('error', reject);
   });
 }
+const body = async (req, limit) => (await bodyBuf(req, limit)).toString('utf8');
 const baseUrl = (req) => PUBLIC_URL || `${req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')}://${req.headers.host}`;
 const clientIp = (req) => req.socket.remoteAddress;
 
@@ -260,7 +344,8 @@ const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: t
 let ended=false;
 async function frames(){while(!ended){try{const r=await fetch(base+'/frame?'+Date.now());
  if(r.status===410){ended=true;break}
- if(r.ok){const u=URL.createObjectURL(await r.blob());const o=img.src;img.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o);dot.className='on';st.textContent=L.live}
+ if(r.status===204){dot.className='on';st.textContent=L.live;await new Promise(x=>setTimeout(x,600));continue}
+ if(r.ok){const b=await r.blob();const u=URL.createObjectURL(b);const o=img.src;img.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o);dot.className='on';st.textContent=L.live+' · '+Math.round(b.size/1024)+' KB'}
  else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
  catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,2000))}
  await new Promise(x=>setTimeout(x,150))}
@@ -275,7 +360,8 @@ frames();logs();
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /i, '');
 const byToken = (req) => {
   const t = bearer(req);
-  for (const [code, s] of sessions) if (safeEq(s.token, t)) return [code, s];
+  const h = sha(t);
+  for (const [code, s] of sessions) if (safeEq(h, s.th)) return [code, s];
   return [];
 };
 
@@ -296,12 +382,13 @@ async function handler(req, res) {
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
-      if (v.busy) { return v.last ? (res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }), res.end(v.last)) : json(res, 429, {}); }
+      if (v.busy) { res.writeHead(204); return res.end(); }
       v.busy = true;
       try {
-        const d = await call(v.code, 'screenshot', { view: true }, 20_000);
-        v.last = Buffer.from(d.image, 'base64');
-        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(v.last);
+        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...viewParams(s) }, 20_000);
+        if (d.same) { res.writeHead(204, { 'x-same': '1' }); return res.end(); }   // unchanged screen: nothing to send
+        v.hash = d.h; v.last = d.jpeg;
+        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-quality': `${s.vl ?? 3}` }); return res.end(d.jpeg);
       } catch (e) { return json(res, 503, { error: e.message }); } finally { v.busy = false; }
     }
 
@@ -326,14 +413,14 @@ async function handler(req, res) {
       if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const info = JSON.parse((await body(req, 10_000)) || '{}');
       let code; do code = newCode(); while (sessions.has(code));
-      const s = {
-        token: crypto.randomBytes(32).toString('hex'), ip, mode: info.mode === 'ask' ? 'ask' : 'full',
+      const token = crypto.randomBytes(32).toString('hex');
+      const s = newSession({
+        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(),
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
-        queue: [], pending: new Map(), waiting: null, waitTimer: null, created: Date.now(), lastSeen: Date.now(), log: [],
-      };
-      sessions.set(code, s);
+      });
+      sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
-      return json(res, 200, { code, token: s.token });
+      return json(res, 200, { code, token });
     }
 
     if (p.startsWith('/a/')) {
@@ -348,10 +435,17 @@ async function handler(req, res) {
         return flush(s);
       }
       if (p === '/a/result' && req.method === 'POST') {
-        const r = JSON.parse(await body(req, 25_000_000));
+        let r;
+        const ct = req.headers['content-type'] || '';
+        if (ct.startsWith('image/')) {   // screenshots arrive as raw JPEG: no base64 inflation
+          const buf = await bodyBuf(req, 25_000_000);
+          let meta = {}; try { meta = JSON.parse(decodeURIComponent(req.headers['x-result-meta'] || '{}')); } catch { /* optional */ }
+          r = { id: req.headers['x-result-id'], ok: true, data: { ...meta, jpeg: buf, mime: ct } };
+        } else r = JSON.parse(await body(req, 25_000_000));
         const pend = s.pending.get(r.id);
         if (pend) {
           s.pending.delete(r.id); clearTimeout(pend.timer);
+          adapt(s, pend, r.data?.jpeg?.length || 0);
           r.ok ? pend.resolve(r.data) : pend.reject(new Error(r.error || 'agent error'));
         }
         return json(res, 200, {});
@@ -362,6 +456,15 @@ async function handler(req, res) {
   } catch (e) {
     if (!res.headersSent) json(res, 400, { error: e.message });
   }
+}
+
+if (STATE_FILE && fs.existsSync(STATE_FILE)) {
+  try {
+    const st = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
+    for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp });
+    console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
+  } catch (e) { console.error('state load failed:', e.message); }
 }
 
 const { TLS_CERT, TLS_KEY } = process.env;

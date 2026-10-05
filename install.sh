@@ -27,6 +27,7 @@ mkdir -p "$DIR"
 if [ -n "${HM_SRC:-}" ]; then cp -a "$HM_SRC"/. "$DIR"/   # local source (testing)
 else curl -fsSL "https://github.com/$REPO/archive/refs/heads/$BRANCH.tar.gz" | tar xz --strip-components=1 -C "$DIR"; fi
 cd "$DIR"
+mkdir -p data && chmod 700 data
 
 if [ -f .env ]; then KEY="$(grep '^OPERATOR_KEY=' .env | cut -d= -f2-)"; else KEY="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"; fi
 if [ -n "$DOMAIN" ]; then

@@ -15,9 +15,15 @@ const kids = [];
 const stop = () => kids.forEach((k) => k.kill());
 process.on('exit', stop);
 
-const relay = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000' }, stdio: 'inherit' });
-kids.push(relay);
-for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 100)); }
+const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`);
+fs.rmSync(STATE, { force: true });
+const startRelay = async () => {
+  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', STATE_FILE: STATE }, stdio: 'inherit' });
+  kids.push(r);
+  for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((x) => setTimeout(x, 100)); }
+  return r;
+};
+let relay = await startRelay();
 
 // the real install path: fetch the script from the relay, like `irm | iex` would
 // PORTABLE=1: hide Node from the agent to test the portable-Node download
@@ -42,7 +48,17 @@ process.on('uncaughtException', (e) => { console.error(e.message, '\n--- agent o
 
 const client = new Client({ name: 'test', version: '0' });
 await client.connect(new StreamableHTTPClientTransport(new URL(BASE + '/mcp'), { requestInit: { headers: { Authorization: 'Bearer ' + KEY } } }));
-const tool = async (name, args = {}) => client.callTool({ name, arguments: args });
+const raw = async (name, args = {}) => client.callTool({ name, arguments: args });
+// like a well-behaved AI: a "still running (job X)" answer is followed by wait_job
+const tool = async (name, args = {}) => {
+  let r = await raw(name, args);
+  for (let i = 0; i < 20; i++) {
+    const j = /Still running .*?\(job (\w+)/.exec(r.content?.[0]?.text || '');
+    if (!j) break;
+    r = await raw('wait_job', { job: j[1], wait_s: 20 });
+  }
+  return r;
+};
 const txt = (r) => r.content.find((c) => c.type === 'text')?.text ?? '';
 
 let code;
@@ -63,6 +79,10 @@ const f = path.join(tmp, 'f.txt');
 assert.match(txt(await tool('write_file', { session: code, path: f, content: 'привет\nline2' })), /written/);
 assert.equal(txt(await tool('read_file', { session: code, path: f })), 'привет\nline2');
 assert.match(txt(await tool('list_dir', { session: code, path: tmp })), /f\.txt/); console.log('files ok');
+
+// big output: travels gzipped, arrives intact (and is capped with a marker)
+const big = txt(await tool('run', { session: code, command: useps ? "'x' * 200000" : "head -c 200000 /dev/zero | tr '\\0' x" }));
+assert.ok(big.length > 90000 && /truncated/.test(big) && /xxxxxxxx/.test(big), 'len=' + big.length + ' head=' + JSON.stringify(big.slice(0, 80)) + ' tail=' + JSON.stringify(big.slice(-60))); console.log('gzip big output ok');
 
 const slow = txt(await tool('run', { session: code, command: useps ? 'Start-Sleep 20' : 'sleep 20', timeout_s: 1 }));
 assert.match(slow, /timeout/); console.log('timeout ok');
@@ -88,8 +108,32 @@ await c2.close();
 await tool('mcp_stop', { session: code, name: 'echo' });
 
 // an agent busy longer than the idle limit must not be dropped (regression: browser calls > 90 s killed the session)
-const busy = txt(await tool('run', { session: code, command: useps ? 'Start-Sleep 6; echo done' : 'sleep 6; echo done', timeout_s: 30 }));
-assert.match(busy, /done/); console.log('long call survives idle limit ok');
+const busy = txt(await raw('run', { session: code, command: useps ? 'Start-Sleep 8; echo done' : 'sleep 8; echo done', timeout_s: 30 }));
+// longer than JOB_SYNC_MS: the relay answers "still running (job X)" instead of letting the MCP client time out, wait_job delivers the result
+const jobId = /job (\w+)/.exec(busy)?.[1];
+assert.ok(jobId, 'expected a background job, got: ' + busy);
+const waited = txt(await raw('wait_job', { job: jobId, wait_s: 25 }));
+assert.match(waited, /done/); console.log('long call survives idle limit + wait_job ok');
+await assert.rejects(raw('wait_job', { job: jobId }).then((r) => { if (r.isError) throw new Error(txt(r)); }), /Unknown or already delivered/);
+
+// start_process: detached launch, reports crashes right away
+const sp = txt(await tool('start_process', { session: code, command: 'node', args: ['-e', 'setTimeout(() => {}, 4000)'], wait_s: 1 }));
+assert.match(sp, /started pid \d+, still running/);
+const sp2 = txt(await tool('start_process', { session: code, command: 'node', args: ['-e', 'console.log("hi-from-child"); process.exit(3)'], wait_s: 2 }));
+assert.match(sp2, /exited with code 3/); assert.match(sp2, /hi-from-child/);
+assert.ok((await tool('start_process', { session: code, command: 'definitely-not-a-command-xyz' })).isError);
+console.log('start_process ok');
+
+// persistence: the relay restarts in the middle of a session; the agent keeps polling, the session and the viewer link survive
+const vurl0 = txt(await tool('open_viewer', { session: code }));
+await new Promise((x) => setTimeout(x, 500));          // let the debounced state file be written
+relay.kill(); await new Promise((x) => setTimeout(x, 800));
+relay = await startRelay();
+const after = JSON.parse(txt(await tool('list_sessions')));
+assert.ok(after.some((x) => x.code === code), 'session must be restored from the state file');
+assert.match(txt(await tool('run', { session: code, command: 'echo after-restart' })), /after-restart/);
+assert.match(await (await fetch(vurl0)).text(), /Remote screen/);
+console.log('relay restart: session + agent + viewer link survive ok');
 
 // live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)
 const vurl = txt(await tool('open_viewer', { session: code }));
@@ -104,10 +148,24 @@ assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);
 if (process.env.GUI) { const fr = await fetch(vurl + '/frame'); assert.equal(fr.headers.get('content-type'), 'image/jpeg'); assert.ok((await fr.arrayBuffer()).byteLength > 1000); }
 console.log('viewer ok');
 
+// stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)
+const pidFile = path.join(tmp, 'grandchild.pid');
+await tool('mcp_start', { session: code, name: 'tree', command: 'node', args: [echoJs], env: { GRANDCHILD_PIDFILE: pidFile } });
+await new Promise((x) => setTimeout(x, 1000));
+const gpid = Number(fs.readFileSync(pidFile, 'utf8'));
+assert.ok(gpid > 0); process.kill(gpid, 0);                                // alive while the server runs
+await tool('mcp_stop', { session: code, name: 'tree' });
+await new Promise((x) => setTimeout(x, 2000));
+assert.throws(() => process.kill(gpid, 0), /ESRCH|kill/, 'grandchild must be gone after mcp_stop'); console.log('process tree killed ok');
+
 const bad = await tool('run', { session: 'NOPE-NOPE', command: 'x' });
 assert.ok(bad.isError); console.log('bad session ok');
 
 if (process.env.GUI) {
+  const size = (r) => Buffer.from(r.content.find((c) => c.type === 'image').data, 'base64').length;
+  const full = size(await tool('screenshot', { session: code }));
+  const lite = size(await tool('screenshot', { session: code, max_width: 640, quality: 30 }));
+  assert.ok(lite < full / 2, `lite screenshot must be much smaller (${lite} vs ${full})`); console.log(`adaptive screenshot ok (${full} -> ${lite} bytes)`);
   const shot = await tool('screenshot', { session: code });
   assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 1000)); console.log('screenshot ok');
 }

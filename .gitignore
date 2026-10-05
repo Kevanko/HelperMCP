@@ -3,3 +3,4 @@ node_modules/
 *.log
 Caddyfile
 data/
+_h.mjs

@@ -121,7 +121,16 @@ function Do-PressKey($a) {
     @{ text = 'ok' }
 }
 
+# A command mentions uv/uvx/npx/npm/node that is not installed? Fetch the portable one first (as if it had always been there).
+function Ensure-For($text) {
+    foreach ($m in [regex]::Matches([string]$text, '(?:^|[\s;&|(])(uvx|uv|npx|npm|node)(?=[\s;&|)]|$)')) {
+        $w = $m.Groups[1].Value
+        try { Ensure-Node $w; Ensure-Uv $w } catch { Write-Host "[helper] could not prepare ${w}: $($_.Exception.Message)" }
+    }
+}
+
 function Do-Run($a) {
+    Ensure-For $a.command
     $secs = if ($a.timeout_s) { [int]$a.timeout_s } else { 60 }
     $cmd = '[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference="SilentlyContinue"; ' + $a.command
     $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
@@ -130,19 +139,35 @@ function Do-Run($a) {
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
     if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    $psi.EnvironmentVariables['PYTHONUTF8'] = '1'; $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'   # Python tools crash on non-ASCII output otherwise
     if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($secs * 1000)) {
-        $p.Kill()
-        return @{ text = "[timeout after ${secs}s]" }
+    $deadline = [DateTime]::UtcNow.AddSeconds($secs)
+    while (-not $p.WaitForExit(400)) {
+        if ([DateTime]::UtcNow -gt $deadline) { Stop-Tree $p; return @{ text = "[timeout after ${secs}s]" } }
+        Pump-Light
     }
     [void]$p.WaitForExit()
     @{ text = Clip ("[exit $($p.ExitCode)]`n" + $o.Result + $e.Result) }
 }
 
 function Do-ReadFile($a) {
+    if ($a.path -match '\.(png|jpe?g|gif|bmp|webp|tiff?)$') {   # an image: return it as an image, scaled down to max_width (default 1600)
+        $cap = if ($a.max_width) { [int]$a.max_width } else { 1600 }
+        $img = [Drawing.Image]::FromFile((Resolve-Path -LiteralPath $a.path).Path)
+        try {
+            $w = [Math]::Min($cap, $img.Width); $h = [int]($img.Height * $w / $img.Width)
+            $out = New-Object Drawing.Bitmap $w, $h
+            $g = [Drawing.Graphics]::FromImage($out); $g.InterpolationMode = 'HighQualityBicubic'; $g.DrawImage($img, 0, 0, $w, $h); $g.Dispose()
+            $enc = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'
+            $ep = New-Object Drawing.Imaging.EncoderParameters 1
+            $ep.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), $(if ($a.quality) { [long]$a.quality } else { 80L })
+            $ms = New-Object IO.MemoryStream; $out.Save($ms, $enc, $ep); $out.Dispose()
+            return @{ jpeg = $ms.ToArray(); mime = 'image/jpeg'; text = "$($img.Width)x$($img.Height) image" }
+        } finally { $img.Dispose() }
+    }
     $max = if ($a.max_bytes) { [int]$a.max_bytes } else { 200000 }
     $fs = [IO.File]::Open($a.path, 'Open', 'Read', 'ReadWrite')
     try { $buf = New-Object byte[] ([Math]::Min($max, $fs.Length)); [void]$fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
@@ -186,6 +211,7 @@ function Resolve-Exe($cmd) {
     $null
 }
 function Do-StartProcess($a) {
+    Ensure-For ([IO.Path]::GetFileNameWithoutExtension([string]$a.command))
     $exe = Resolve-Exe $a.command
     if (-not $exe) { throw "Command '$($a.command)' not found" }
     $log = Join-Path $env:TEMP ("helpermcp-start-$PID-$($script:Started.Count).log")
@@ -194,6 +220,7 @@ function Do-StartProcess($a) {
     $psi.Arguments = '/d /c ""' + $exe + '" ' + $argl + ' > "' + $log + '" 2>&1"'
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    $psi.EnvironmentVariables['PYTHONUTF8'] = '1'; $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
     if ($a.env) { foreach ($q in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$q.Name] = [string]$q.Value } }
     if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     $proc = [Diagnostics.Process]::Start($psi); $script:Started += $proc
@@ -266,7 +293,9 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
     while ($true) {
         if (-not $c.read) { $c.read = $c.p.StandardOutput.ReadLineAsync() }
         $left = [int]($end - [DateTime]::UtcNow).TotalMilliseconds
-        if ($left -lt 0 -or -not $c.read.Wait($left)) {
+        $got = $false
+        while ($left -gt 0) { if ($c.read.Wait([Math]::Min($left, 400))) { $got = $true; break }; Pump-Light; $left = [int]($end - [DateTime]::UtcNow).TotalMilliseconds }
+        if (-not $got) {
             $why = if ($c.p.HasExited) { "exited with code $($c.p.ExitCode): " + $c.err.Result } else { 'still running, no reply' }
             throw "MCP server timed out on $method ($why)"
         }
@@ -293,6 +322,7 @@ function Do-McpStart($a) {
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
     if ($script:ExtraPath.Count) { $psi.EnvironmentVariables['PATH'] = ($script:ExtraPath -join ';') + ';' + $env:PATH }
+    $psi.EnvironmentVariables['PYTHONUTF8'] = '1'; $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
     if ($a.env) { foreach ($q in $a.env.PSObject.Properties) { $psi.EnvironmentVariables[$q.Name] = [string]$q.Value } }
     if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     if ($env:HELPER_DEBUG) { Write-Host "[debug] start $exe $($psi.Arguments)" }
@@ -413,15 +443,55 @@ function Cleanup-Children {
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
+# Light requests (screenshots, sysinfo, file reads) are answered even while a long command runs: the live viewer and the AI's
+# screenshots never freeze behind a 5-minute install or render. Heavy ones wait their turn.
+$LightTools = 'screenshot', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
+$script:Deferred = New-Object System.Collections.ArrayList
+$script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
+
+function Process-Command($cmd) {
+    $name = $cmd.tool; $a = $cmd.args
+    $short = ($cmd.args | ConvertTo-Json -Compress); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) }
+    Write-Host "[helper] $name $short"
+    $res = @{ id = $cmd.id }
+    try {
+        if ($script:Mode -eq 'ask' -and $AskTools -contains $name) {
+            $yn = Read-Host (T 'Разрешить? [y/N]' 'Allow? [y/N]')
+            if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
+        }
+        $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
+            run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
+            start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+        if (-not $fn) { throw "Unknown tool $name" }
+        $res.ok = $true; $res.data = & $fn $a
+    } catch { $res.ok = $false; $res.error = $_.Exception.Message }
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
+        try { Post-Result $res $script:Token; break }
+        catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
+    }
+}
+
+# Called from the wait loops of long operations: take a look at the relay without blocking, serve light requests right away.
+function Pump-Light {
+    if (-not $script:Token -or ([DateTime]::UtcNow - $script:LastPump).TotalMilliseconds -lt 400) { return }
+    $script:LastPump = [DateTime]::UtcNow
+    try { $r = Api '/a/poll?w=0' $null $script:Token 10 } catch { return }
+    if ($r.StatusCode -ne 200 -or -not $r.Content) { return }
+    $cmd = $r.Content | ConvertFrom-Json
+    if ($cmd.tool -eq 'bye') { [void]$script:Deferred.Add($cmd); return }
+    if ($LightTools -contains $cmd.tool) { Process-Command $cmd } else { [void]$script:Deferred.Add($cmd) }
+}
+
 function Start-Helper {
     $mode = $env:HELPER_MODE
     if ($mode -ne 'ask' -and $mode -ne 'full') {
         $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ' 'Mode: [1] ask before every action (recommended)  [2] full access')
         $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
     }
+    $script:Mode = $mode
     $osn = (Get-CimInstance Win32_OperatingSystem).Caption
     $r = (Api '/a/register' @{ os = $osn; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode }).Content | ConvertFrom-Json
-    $token = $r.token
+    $token = $r.token; $script:Token = $token
     Write-Host ''
     Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $r.code) -ForegroundColor Yellow
     Write-Host ("  " + (T 'Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.' 'Give this code to your helper. Close this window or press Ctrl+C to stop.'))
@@ -429,34 +499,19 @@ function Start-Helper {
     Start-Overlay
     try {
         while ($true) {
-            try { $resp = Api '/a/poll' $null $token 40 }
-            catch {
-                $code = [int]$_.Exception.Response.StatusCode
-                if ($code -eq 401 -or $code -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её или сервер помощи перезапущен): запусти команду заново' 'session closed (ended by the helper, or the helper server was reset: run the command again)'); return }
-                Start-Sleep 3; continue
-            }
-            if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
-            $cmd = $resp.Content | ConvertFrom-Json
-            $name = $cmd.tool; $a = $cmd.args
-            if ($name -eq 'bye') { Write-Host 'session closed'; return }
-            $short = ($cmd.args | ConvertTo-Json -Compress); if ($short.Length -gt 200) { $short = $short.Substring(0, 200) }
-            Write-Host "[helper] $name $short"
-            $res = @{ id = $cmd.id }
-            try {
-                if ($mode -eq 'ask' -and $AskTools -contains $name) {
-                    $yn = Read-Host (T 'Разрешить? [y/N]' 'Allow? [y/N]')
-                    if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
+            if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
+            else {
+                try { $resp = Api '/a/poll' $null $token 40 }
+                catch {
+                    $code = [int]$_.Exception.Response.StatusCode
+                    if ($code -eq 401 -or $code -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её или сервер помощи перезапущен): запусти команду заново' 'session closed (ended by the helper, or the helper server was reset: run the command again)'); return }
+                    Start-Sleep 3; continue
                 }
-                $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
-                    run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-                    start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
-                if (-not $fn) { throw "Unknown tool $name" }
-                $res.ok = $true; $res.data = & $fn $a
-            } catch { $res.ok = $false; $res.error = $_.Exception.Message }
-            for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
-                try { Post-Result $res $token; break }
-                catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
+                if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
+                $cmd = $resp.Content | ConvertFrom-Json
             }
+            if ($cmd.tool -eq 'bye') { Write-Host 'session closed'; return }
+            Process-Command $cmd
         }
     } finally {
         Cleanup-Children

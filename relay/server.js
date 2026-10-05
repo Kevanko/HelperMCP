@@ -14,6 +14,7 @@ globalThis.crypto ??= crypto.webcrypto; // Node 18 has no global crypto, the MCP
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8444);
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+const RECIPES_DIR = process.env.RECIPES_DIR || path.join(here, '..', 'recipes');
 const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
 const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 90_000);
 const POLL_MS = 25_000;
@@ -49,6 +50,8 @@ const newSession = (o) => ({ ...o, queue: [], pending: new Map(), waiting: null,
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
+const authFails = new Map();             // ip -> { n, until }: wrong operator keys
+const AUTH_MAX_FAILS = 20, AUTH_WINDOW_MS = 10 * 60_000;
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
 const newCode = () => {
   const b = crypto.randomBytes(8);
@@ -103,6 +106,7 @@ function drop(code, why) {
 
 setInterval(() => {
   for (const [t, v] of viewers) if (v.exp < Date.now()) viewers.delete(t);
+  for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
@@ -168,8 +172,8 @@ const tools = [
     ms: (a) => ((a.timeout_s || 60) + 10) * 1000 },
   { name: 'start_process', agent: true, description: 'Start a program detached and return immediately; it keeps running (use this for GUI apps such as Blender, Unity, Substance, or servers). Returns pid, whether it is still running, and the first output.',
     props: { command: str('Executable name or full path'), args: { type: 'array', items: { type: 'string' } }, cwd: str('working directory'), env: { type: 'object', additionalProperties: { type: 'string' } }, wait_s: { type: 'number', description: 'seconds to watch for an immediate crash, default 2' } }, required: ['command'] },
-  { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000).',
-    props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 } }, required: ['path'] },
+  { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000). Image files (png, jpg, gif, bmp, webp) come back as images, scaled down to max_width: use it to look at renders and saved screenshots.',
+    props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 }, max_width: { type: 'integer', minimum: 64, maximum: 4096, description: 'images only, default 1600' } }, required: ['path'] },
   { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it.',
     props: { path: str('File path'), content: str('New content') }, required: ['path', 'content'] },
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
@@ -186,6 +190,15 @@ const tools = [
   { name: 'mcp_tools', agent: true, description: 'List tools of the MCP servers started on the remote PC.', props: {} },
   { name: 'mcp_call', agent: true, ms: (a) => ((a.timeout_s || 110) + 15) * 1000, description: 'Call a tool of an MCP server started with mcp_start.',
     props: { server: str('Name given to mcp_start'), tool: str('Tool name'), arguments: { type: 'object' }, timeout_s: { type: 'integer', minimum: 5, maximum: 3600, description: 'default 110; raise it for renders, imports, long generations' } }, required: ['server', 'tool'] },
+  { name: 'recipe', always: true, local: true,
+    description: 'Verified step-by-step instructions for setting up and driving an application on the remote PC (check/install the app, its MCP add-on, start it, start its MCP server). Call without a name to list them: e.g. "blender"; "any-app" is the generic pattern for any app that has an MCP server (Unity, Substance, ...).',
+    props: { name: str('recipe name; omit to list') },
+    run: async (a) => {
+      const files = fs.existsSync(RECIPES_DIR) ? fs.readdirSync(RECIPES_DIR).filter((f) => f.endsWith('.md')).map((f) => f.slice(0, -3)) : [];
+      if (!a.name) return { text: 'Recipes: ' + files.join(', ') };
+      if (!/^[a-z0-9_-]+$/.test(a.name) || !files.includes(a.name)) throw new Error(`No recipe "${a.name}". Available: ${files.join(', ')}`);
+      return { text: fs.readFileSync(path.join(RECIPES_DIR, a.name + '.md'), 'utf8') };
+    } },
   { name: 'wait_job', always: true, local: true,
     description: 'Long operations return "still running (job X)" after about 45 s so the call does not time out. Call this with that job id to wait for the result; the work keeps going on the remote PC meanwhile.',
     props: { job: str('Job id from the "still running" message'), wait_s: { type: 'integer', minimum: 1, maximum: 55, description: 'default 40' } }, required: ['job'],
@@ -218,7 +231,7 @@ const fmt = (d) => {
 const INSTRUCTIONS = `You are connected to a REMOTE computer (a friend's PC or server) through HelperMCP. Work on it as if it were your own machine.
 Workflow for any task:
 1. Look first: sysinfo, then screenshot (what the user sees). Use open_viewer so the operator can watch live.
-2. Need an application or MCP server (Blender, Unity, Substance, a browser, ...)? Check whether it is installed (run: Get-Command / where / which / winget list / registry / apt), install it if missing (winget install -e --id ..., apt/flatpak; an installer that needs administrator rights shows a UAC prompt the user must accept: tell them), then continue.
+2. Need an application or MCP server (Blender, Unity, Substance, a browser, ...)? First call recipe (no name = list; "blender" and the generic "any-app" exist). Check whether it is installed (run: Get-Command / where / which / winget list / registry / apt), install it if missing (winget install -e --id ..., apt/flatpak; an installer that needs administrator rights shows a UAC prompt the user must accept: tell them), then continue.
 3. GUI apps and anything long-lived: start_process (detached, keeps running). Do not use run for them.
 4. MCP servers: mcp_start (command npx / uvx / python / an exe). Portable Node and uv are fetched automatically when missing. command="playwright" opens a real visible browser with sound. Then mcp_call (or <server>__<tool> on /s/<code>/mcp). Prefer a dedicated MCP server over clicking the GUI.
 5. Operations that take longer than ~45 s return "Still running (job X)": call wait_job with that id. Raise timeout_s on mcp_start / mcp_call / run for installs and renders.
@@ -306,7 +319,7 @@ const clientIp = (req) => req.socket.remoteAddress;
 function script(req, res, file) {
   let f;
   try { f = fs.readFileSync(path.join(AGENT_DIR, file), 'utf8'); } catch { return text(res, 404, 'not found'); }
-  text(res, 200, f.replaceAll('__RELAY__', baseUrl(req)));
+  text(res, 200, f.replace(/\r\n/g, '\n').replaceAll('__RELAY__', baseUrl(req)));   // LF whatever the checkout's line endings
 }
 
 function landing(req, res) {
@@ -394,7 +407,14 @@ async function handler(req, res) {
 
     const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
     if (mcp) {
-      if (!safeEq(bearer(req), OPERATOR_KEY)) return json(res, 401, { error: 'bad operator key' });
+      const ip = clientIp(req), f = authFails.get(ip);
+      if (f && f.n >= AUTH_MAX_FAILS && Date.now() < f.until) return json(res, 429, { error: 'too many wrong keys, try again later' });   // brute-force guard
+      if (!safeEq(bearer(req), OPERATOR_KEY)) {
+        const n = (f && Date.now() < f.until ? f.n : 0) + 1;
+        authFails.set(ip, { n, until: Date.now() + AUTH_WINDOW_MS });
+        return json(res, 401, { error: 'bad operator key' });
+      }
+      authFails.delete(ip);
       if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
       lastBase = baseUrl(req);
       const fixed = mcp[1] ? mcp[1].toUpperCase() : null;
@@ -428,6 +448,7 @@ async function handler(req, res) {
       if (!s) return json(res, 401, { error: 'unknown token' });
       s.lastSeen = Date.now();
       if (p === '/a/poll' && req.method === 'GET') {
+        if (url.searchParams.get('w') === '0' && !s.queue.length) { res.writeHead(204); return res.end(); }   // agent busy with a long call: just peek
         if (s.waiting) json(s.waiting, 204, {}); // superseded poll
         s.waiting = res;
         s.waitTimer = setTimeout(() => { s.waiting = null; res.writeHead(204); res.end(); }, POLL_MS);

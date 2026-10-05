@@ -4,6 +4,7 @@ COPY relay/package*.json relay/
 RUN cd relay && npm ci --omit=dev
 COPY relay/server.js relay/
 COPY agent agent
+COPY recipes recipes
 ENV PORT=8444
 EXPOSE 8444
 USER node

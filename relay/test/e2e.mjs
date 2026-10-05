@@ -92,6 +92,7 @@ const echoJs = path.join(root, 'relay/test/echo-mcp.mjs');
 const started = txt(await tool('mcp_start', { session: code, name: 'echo', command: 'node', args: [echoJs] }));
 assert.match(started, /echo: 1 tools: say/); console.log('mcp_start ok');
 if (process.env.PORTABLE) { assert.match(agentOut, /downloading portable Node/); console.log('portable node ok'); }
+if (process.env.PORTABLE) { assert.match(txt(await tool('run', { session: code, command: 'npx --version', timeout_s: 300 })), /\d+\.\d+\.\d+/); console.log('run sees portable npx ok'); }
 assert.equal(txt(await tool('mcp_call', { session: code, server: 'echo', tool: 'say', arguments: { msg: 'привет' } })), 'echo:привет');
 console.log('mcp_call ok (via /mcp)');
 
@@ -115,6 +116,20 @@ assert.ok(jobId, 'expected a background job, got: ' + busy);
 const waited = txt(await raw('wait_job', { job: jobId, wait_s: 25 }));
 assert.match(waited, /done/); console.log('long call survives idle limit + wait_job ok');
 await assert.rejects(raw('wait_job', { job: jobId }).then((r) => { if (r.isError) throw new Error(txt(r)); }), /Unknown or already delivered/);
+
+// images come back as images (renders, saved screenshots)
+const png = path.join(tmp, 'pixel.png');
+fs.writeFileSync(png, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
+const imgRes = await tool('read_file', { session: code, path: png });
+assert.ok(imgRes.content.some((c) => c.type === 'image' && c.data.length > 100), 'read_file must return an image for .png'); console.log('read_file image ok');
+
+// responsiveness: a light request is answered while a long command is still running (viewer frames never freeze behind installs/renders)
+const long1 = raw('run', { session: code, command: useps ? 'Start-Sleep 12; echo long-done' : 'sleep 12; echo long-done', timeout_s: 40 });
+await new Promise((x) => setTimeout(x, 1500));
+const tq = Date.now(); const siq = txt(await tool('sysinfo', { session: code })); const dq = Date.now() - tq;
+assert.match(siq, /user/i); assert.ok(dq < 8000, `sysinfo must not wait behind a long run (${dq} ms)`);
+let lr = await long1; for (let i = 0; i < 10 && /Still running .*?\(job (\w+)/.test(lr.content[0].text); i++) lr = await raw('wait_job', { job: /job (\w+)/.exec(lr.content[0].text)[1], wait_s: 20 });
+assert.match(lr.content[0].text, /long-done/); console.log(`concurrency ok (sysinfo answered in ${dq} ms during a 12 s command)`);
 
 // start_process: detached launch, reports crashes right away
 const sp = txt(await tool('start_process', { session: code, command: 'node', args: ['-e', 'setTimeout(() => {}, 4000)'], wait_s: 1 }));
@@ -158,6 +173,11 @@ await tool('mcp_stop', { session: code, name: 'tree' });
 await new Promise((x) => setTimeout(x, 2000));
 assert.throws(() => process.kill(gpid, 0), /ESRCH|kill/, 'grandchild must be gone after mcp_stop'); console.log('process tree killed ok');
 
+// recipes: verified how-tos for apps (no session needed)
+assert.match(txt(await tool('recipe')), /blender.*any-app|any-app.*blender/);
+assert.match(txt(await tool('recipe', { name: 'blender' })), /uvx mcp-for-blender install-addon/);
+assert.ok((await tool('recipe', { name: '../server' })).isError); console.log('recipes ok');
+
 const bad = await tool('run', { session: 'NOPE-NOPE', command: 'x' });
 assert.ok(bad.isError); console.log('bad session ok');
 
@@ -173,6 +193,10 @@ if (process.env.GUI) {
 await tool('end_session', { session: code });
 await new Promise((r) => setTimeout(r, 500));
 assert.equal(JSON.parse(txt(await tool('list_sessions'))).length, 0); console.log('end ok');
+// brute-force guard: many wrong operator keys get locked out (run last: it blocks this IP for a while)
+let last = 0;
+for (let i = 0; i < 22; i++) last = (await fetch(BASE + '/mcp', { method: 'POST', headers: { Authorization: 'Bearer wrong-' + i } })).status;
+assert.equal(last, 429); console.log('operator key brute-force guard ok');
 console.log('ALL PASSED');
 stop();
 process.exit(0);

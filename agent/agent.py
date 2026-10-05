@@ -4,6 +4,7 @@ Run: python3 <(curl -fsSL RELAY/p)"""
 import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, locale, os, platform, queue, shutil, signal, socket
 import subprocess, sys, tarfile, tempfile, threading, time
 import urllib.parse, urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor
 
 RELAY = os.environ.get("HELPER_RELAY") or "__RELAY__"
 RU = (locale.getlocale()[0] or os.environ.get("LANG", "")).lower().startswith("ru")
@@ -232,12 +233,22 @@ def clip(s):
 
 
 def with_path(env=None):
-    e = dict(os.environ, **(env or {}))
+    e = dict(os.environ, PYTHONUTF8="1", **(env or {}))
     if EXTRA_PATH: e["PATH"] = os.pathsep.join(EXTRA_PATH + [e.get("PATH", "")])
     return e
 
 
+def ensure_for(text, args=None):
+    """A command mentions uv/uvx/npx/npm/node that is not installed? Fetch the portable one first (as if it had always been there)."""
+    import re
+    words = set(re.findall(r"(?:^|[\s;&|(])(uvx|uv|npx|npm|node)(?=[\s;&|)]|$)", text or ""))
+    for w in sorted(words):
+        try: ensure_node(w); ensure_uv(w)
+        except Exception as e: print(f"[helper] could not prepare {w}: {e}", flush=True)
+
+
 def run(a):
+    ensure_for(a["command"])
     try:
         p = subprocess.run(["bash", "-c", a["command"]], capture_output=True, text=True, timeout=a.get("timeout_s", 60), errors="replace", env=with_path(), cwd=a.get("cwd"))
         code, out = p.returncode, p.stdout + p.stderr
@@ -248,6 +259,7 @@ def run(a):
 
 def start_process(a):
     """Launch a program detached (GUI apps like Blender/Unity, servers) and return at once; it keeps running after this call."""
+    ensure_for(os.path.basename(a["command"]))
     cmd = shutil.which(a["command"], path=with_path()["PATH"]) or a["command"]
     log = os.path.join(tempfile.gettempdir(), f"helpermcp-start-{os.getpid()}-{len(STARTED)}.log")
     with open(log, "wb") as lf:
@@ -263,7 +275,18 @@ def start_process(a):
 
 
 def read_file(a):
-    with open(os.path.expanduser(a["path"]), "rb") as f:
+    path = os.path.expanduser(a["path"])
+    if path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff")):   # an image: return it as an image, scaled down
+        cap = int(a.get("max_width") or 1600)
+        try:
+            import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
+            pb = GdkPixbuf.Pixbuf.new_from_file(path); w0, h0 = pb.get_width(), pb.get_height()
+            if w0 > cap: pb = pb.scale_simple(cap, int(h0 * cap / w0), GdkPixbuf.InterpType.BILINEAR)
+            _, buf = pb.save_to_bufferv("jpeg", ["quality"], [str(int(a.get("quality") or 80))])
+            return {"jpeg": bytes(buf), "mime": "image/jpeg", "text": f"{w0}x{h0} image"}
+        except Exception:
+            with open(path, "rb") as f: return {"jpeg": f.read(), "mime": "image/png" if path.lower().endswith(".png") else "image/jpeg"}
+    with open(path, "rb") as f:
         return {"text": f.read(a.get("max_bytes", 200_000)).decode("utf-8", "replace")}
 
 
@@ -360,7 +383,7 @@ class Child:
         command = shutil.which(command, path=e["PATH"]) or command
         self.p = subprocess.Popen([command] + list(args or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, env=e, text=True, encoding="utf-8", bufsize=1, cwd=cwd, start_new_session=True)
-        self.q, self.n, self.tools, self.err = queue.Queue(), 0, [], []
+        self.q, self.n, self.tools, self.err, self.lock = queue.Queue(), 0, [], [], threading.Lock()
         threading.Thread(target=self._read, daemon=True).start()
         threading.Thread(target=lambda: [self.err.append(l) for l in self.p.stderr], daemon=True).start()
 
@@ -378,6 +401,9 @@ class Child:
         self.q.put(None)
 
     def rpc(self, method, params=None, timeout=60, notify=False):
+        with self.lock: return self._rpc(method, params, timeout, notify)   # one request at a time per server
+
+    def _rpc(self, method, params, timeout, notify):
         msg = {"jsonrpc": "2.0", "method": method}
         if params is not None: msg["params"] = params
         if not notify:
@@ -536,6 +562,33 @@ TOOLS = dict(screenshot=screenshot, press_key=press_key, click=click, scroll=scr
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
+GUI_TOOLS = {"click", "scroll", "type_text", "press_key"}   # one X11 connection: never two at once
+GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
+
+
+def handle(cmd, mode, token):
+    """One tool call, in its own thread: a slow install or render never blocks screenshots, the live viewer or other calls."""
+    name, args = cmd["tool"], cmd["args"]
+    print(f"[helper] {name} {json.dumps(args, ensure_ascii=False)[:200]}", flush=True)
+    res = {"id": cmd["id"]}
+    try:
+        if mode == "ask" and name in ASK_TOOLS:
+            with ASK_LOCK:
+                if input(t("allow")).strip().lower() not in ("y", "yes", "д", "да"): raise RuntimeError("User denied this action.")
+        if name in GUI_TOOLS:
+            with GUI_LOCK: res.update(ok=True, data=TOOLS[name](args))
+        else:
+            res.update(ok=True, data=TOOLS[name](args))
+    except Exception as e:  # report every failure to the operator
+        res.update(ok=False, error=f"{type(e).__name__}: {e}")
+    for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
+        try: post_result(res, token); break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 410): break
+            time.sleep(1 + attempt)
+        except Exception: time.sleep(1 + attempt)
+
+
 def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))  # run cleanup()
     find_gui()
@@ -546,6 +599,7 @@ def main():
     token = reg["token"]
     print(f"\n  {t('banner')}  {reg['code']}\n  {t('tell')}\n", flush=True)
     overlay_start()
+    pool = ThreadPoolExecutor(max_workers=8)
     try:
         while True:
             try:
@@ -556,25 +610,12 @@ def main():
             except (urllib.error.URLError, OSError, TimeoutError):
                 time.sleep(3); continue
             if status != 200 or not cmd: continue
-            name, args = cmd["tool"], cmd["args"]
-            if name == "bye": print("session closed"); return
-            print(f"[helper] {name} {json.dumps(args, ensure_ascii=False)[:200]}", flush=True)
-            res = {"id": cmd["id"]}
-            try:
-                if mode == "ask" and name in ASK_TOOLS and input(t("allow")).strip().lower() not in ("y", "yes", "д", "да"):
-                    raise RuntimeError("User denied this action.")
-                res.update(ok=True, data=TOOLS[name](args))
-            except Exception as e:  # report every failure to the operator
-                res.update(ok=False, error=f"{type(e).__name__}: {e}")
-            for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
-                try: post_result(res, token); break
-                except urllib.error.HTTPError as e:
-                    if e.code in (401, 410): break
-                    time.sleep(1 + attempt)
-                except Exception: time.sleep(1 + attempt)
+            if cmd["tool"] == "bye": print("session closed"); return
+            pool.submit(handle, cmd, mode, token)
     except KeyboardInterrupt:
         pass
     finally:
+        pool.shutdown(wait=False, cancel_futures=True)
         cleanup()
         try: api("/a/bye", {}, token, timeout=5)
         except Exception: pass

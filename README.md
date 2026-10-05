@@ -68,11 +68,28 @@ Two ways to connect:
 
 | Tool | What |
 |------|------|
-| `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs |
+| `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs. `read_file` returns images (renders, saved screenshots) as images |
+| `start_process` | start a program **detached** (GUI apps like Blender or Unity, servers) and keep it running |
 | `click`, `scroll`, `type_text`, `press_key` | mouse and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
 | `mcp_start`, `mcp_tools`, `mcp_call`, `mcp_stop` | run and use **other MCP servers on the friend's PC** |
+| `recipe` | verified how-tos for apps (`blender`, the generic `any-app`) |
+| `wait_job` | collect the result of a long operation (see below) |
 | `open_viewer` | link to a live view of the remote screen + action log |
 | `list_sessions`, `end_session` | session management |
+
+## Work on their PC like on your own
+
+The relay hands every connecting AI a short manual (MCP `instructions`): look first, check whether the app is installed, install it if not, start it, start its MCP server, work, clean up. The pieces that make this smooth:
+
+* **Missing runtimes appear on their own.** If a command mentions `node`/`npx`/`npm`/`uv`/`uvx` and it is not installed (or Node is older than 20 for `npx`), a portable copy is downloaded into a temp folder, put on `PATH` for everything you start, and deleted on exit. Python tools get `PYTHONUTF8=1`.
+* **Long operations never time out.** Installs, first-time package downloads and renders take minutes; MCP clients give up after about a minute. After ~45 s a call answers `Still running (job X)`; the work continues on the remote PC and `wait_job` collects the result. `timeout_s` on `run`, `mcp_start` and `mcp_call` raises the limits (up to an hour).
+* **Never blocked.** Screenshots, `sysinfo` and file reads are answered while a long command runs (the live viewer does not freeze behind an install).
+* **Stopping cleans up.** `mcp_stop` and closing the agent kill the whole process tree (`uvx`/`npx` start the real server as a grandchild).
+* **Installing apps.** `run` a package manager (`winget install -e --id ...`, `apt`/`flatpak`/`snap`, `brew`); an installer that needs administrator rights shows a UAC prompt the friend has to accept.
+
+### Example: "make a model in Blender"
+
+The AI calls `recipe blender` and does: look for Blender (`winget install` if missing, a background job) → `uvx mcp-for-blender install-addon` and enable the add-on without clicking → `start_process` Blender → `mcp_start uvx blender-mcp` → `execute_blender_code` to build the model → `look` / render + `read_file` to check it. On a PC without a usable GPU there is a no-window mode. Verified on a clean Windows 10 (no Blender, no uv, no Node) and on a PC where Blender was already open. The same pattern works for any app that has an MCP server: `recipe any-app`. Recipes are plain Markdown in [`recipes/`](recipes): add your own.
 
 ### Using other MCP servers (e.g. their browser)
 
@@ -81,11 +98,17 @@ mcp_start  name="browser" command="playwright"
 mcp_call   server="browser" tool="browser_navigate" arguments={"url": "https://example.com"}
 ```
 
-`command="playwright"` opens a **real, visible Chrome/Edge window** on the friend's screen (their installed browser, sound on, no automation warnings), like a Playwright MCP on your own desktop.
+`command="playwright"` opens a **real, visible Chrome/Edge window** on the friend's screen (their installed browser, sound on, no automation warnings), like a Playwright MCP on your own desktop. Any other stdio MCP server works the same way, several side by side, e.g. `command="npx" args=["-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Friend\\Documents"]`. Servers that talk to a local app (Blender, Unity, ...) need that app and its add-on running on the friend's PC (see the recipes).
 
-Any other stdio MCP server works the same way and several can run side by side, e.g. `command="npx" args=["-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Friend\\Documents"]` or `command="uvx" args=["blender-mcp"]`. Servers that talk to a local app (Blender, Unity, ...) need that app and its MCP add-on running on the friend's PC.
+## Weak connections
 
-If Node.js >= 20 is missing or too old, the agent downloads a portable copy into a temp folder (ask mode: after the friend approves) and deletes it on exit. Other runtimes (`uvx`, `python`, ...) must already be installed. Tested end to end with the real Playwright and filesystem MCP servers on Windows and Ubuntu.
+* Screenshots travel as raw JPEG (no base64 inflation), big JSON output is gzipped.
+* The live viewer steps its quality up and down to keep about one frame per second, and sends nothing while the screen does not change.
+* On a slow link the AI's screenshots shrink on their own; `screenshot` takes `max_width` and `quality`, `monitor=N` crops to one screen.
+
+## Sessions survive restarts
+
+The relay stores sessions (agent tokens hashed) and viewer links in `data/state.json`. Restart or update the server and the agents on the friends' PCs just keep working. Without that file (fresh server) an agent tells the friend to run the command again.
 
 ## Develop and test
 
@@ -93,11 +116,11 @@ If Node.js >= 20 is missing or too old, the agent downloads a portable copy into
 cd relay && npm ci && npm test      # relay + real agent + MCP client, end to end
 ```
 
-`AGENT=ps|py` picks the agent, `PORTABLE=1` hides Node to test the portable-Node download. CI runs on Windows and Ubuntu with Node 18 and 22.
+`AGENT=ps|py` picks the agent, `GUI=1` also tests screenshots on a real desktop, `PORTABLE=1` hides Node to test the portable-Node download. The suite covers jobs, concurrency, restarts, process trees, recipes, viewer and the bandwidth path. CI runs on Windows and Ubuntu with Node 18 and 22.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Short version: whoever holds `OPERATOR_KEY` has the same power as the friend on their PC while the window is open. Only run it for people who asked for help, and only send the link to them.
+See [SECURITY.md](SECURITY.md). Wrong operator keys are rate-limited per IP. Short version: whoever holds `OPERATOR_KEY` has the same power as the friend on their PC while the window is open. Only run it for people who asked for help, and only send the link to them.
 
 ## License
 
@@ -128,3 +151,14 @@ curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh
 **Ubuntu:** агент сам находит сессию рабочего стола (даже если запущен по SSH). Для управления мышью нужен X11 («Ubuntu on Xorg»), на Wayland работают команды, файлы и браузер.
 
 Безопасность: см. [SECURITY.md](SECURITY.md). Ключ держи в секрете, ссылку давай только тем, кто сам попросил о помощи.
+
+
+## Как работать на ПК друга «как на своём» (кратко)
+
+* ИИ при подключении получает инструкцию: посмотреть экран, проверить, стоит ли приложение, поставить, запустить, запустить его MCP, работать, убрать за собой.
+* Недостающие `node`/`npx`/`uv`/`uvx` подтягиваются сами (портативные, во временную папку, удаляются при выходе).
+* Долгие операции (установка, первый запуск MCP, рендер) не обрываются по таймауту клиента: через ~45 с приходит `Still running (job X)`, результат забирается через `wait_job`.
+* Скриншоты и просмотр не «замирают» во время долгой команды. `mcp_stop` и закрытие агента убивают всё дерево процессов.
+* `start_process` запускает программы отдельно (Blender, Unity и т.п.), `recipe blender` / `recipe any-app` описывают проверенные сценарии.
+* Слабый интернет: картинки без раздувания base64, JSON сжимается, качество кадров просмотра подстраивается, неизменный экран не передаётся, у скриншота есть `max_width` и `quality`.
+* Сессии и ссылки просмотра хранятся в `data/state.json` и переживают перезапуск сервера.

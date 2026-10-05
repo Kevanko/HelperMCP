@@ -8,7 +8,7 @@ HelperMCP is a remote-control tool. Treat it like one.
 * **Operator** authenticates to `/mcp` with `OPERATOR_KEY` (constant-time compared; after 20 wrong keys an IP is locked out for 10 minutes). Anyone with the key can act on every connected agent: keep it secret and rotate it by changing the env var.
 * **Agents** authenticate with a random 256-bit token issued at registration; the relay stores only its SHA-256 (`data/state.json`, mode 0600). The short session code is only a label for the operator and grants nothing by itself.
 * **Links** (live viewer `/v/<token>`, file downloads `/f/<id>/<name>`) are unguessable (144 / 96 bits), tied to one session or one file, and expire (viewer 12 h, files 24 h). They do not reveal the operator key. Anyone who has such a link can use it, so share it only with people who may see that screen or file.
-* Agent sessions are dropped after 90 s without a poll (not while a call is running). At most 10 sessions per IP and 200 in total.
+* Agent sessions are dropped after 5 minutes without a poll (not while a call is running); the agent then registers again. At most 10 sessions per IP and 200 in total.
 * After the server lost its state the agent re-registers and asks for its old session code; the server hands it out if it is free. Codes are labels and never grant access (that takes the operator key), but anyone who knows a code and registers first could receive the commands meant for that PC: treat codes as private until the session ends.
 * The agent only makes outbound requests; the relay never connects into the friend's network.
 

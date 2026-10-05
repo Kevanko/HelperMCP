@@ -20,8 +20,8 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const RECIPES_DIR = process.env.RECIPES_DIR || path.join(here, '..', 'recipes');
 const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
 const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 300_000);
-const ONLINE_MS = 40_000;   // an agent that has not polled for this long is shown as offline (it polls every <= 25 s)
-const POLL_MS = 25_000;
+const ONLINE_MS = 30_000;   // an agent that has not polled for this long is shown as offline (it polls every <= 15 s)
+const POLL_MS = 15_000;   // agents time out a poll after ~22 s, so a silently dead connection (VPN switch, firewall) is noticed quickly
 const MAX_SESSIONS = 200;
 const MAX_PER_IP = 10;
 

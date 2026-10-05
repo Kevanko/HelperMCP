@@ -696,7 +696,11 @@ function Start-Helper {
         $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
     }
     $script:Mode = $mode
-    $r = Register-Agent $mode $null
+    $wait = 1.0
+    while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
+        try { $r = Register-Agent $mode $null; break }
+        catch { Write-Host "[helper] cannot reach the server, retrying ..."; Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
+    }
     $token = $r.token; $script:Token = $token; $code = $r.code
     Write-Host ''
     Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $code) -ForegroundColor Yellow
@@ -709,7 +713,7 @@ function Start-Helper {
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
             else {
                 $failed = $false; $resp = $null
-                try { $resp = Api '/a/poll' $null $script:Token 40 }
+                try { $resp = Api '/a/poll' $null $script:Token 22 }   # the relay answers within 15 s; anything longer is a dead connection
                 catch {
                     $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); return }

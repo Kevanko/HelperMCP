@@ -814,6 +814,8 @@ def handle(cmd, mode, token):
 
 
 NET = {"s": "ok"}
+LAST_OK = [time.time()]   # last time the relay answered a poll (the watchdog flips to 'lost' when it is too old)
+POLL_TIMEOUT = 22         # the relay answers within 15 s; anything longer is a dead connection
 
 
 def net_state(st):
@@ -837,16 +839,26 @@ def main():
     mode = os.environ.get("HELPER_MODE")
     if mode not in ("ask", "full"):
         mode = "full" if input(t("mode")).strip() == "2" else "ask"
-    reg = register(mode); token = TOKEN = reg["token"]; code = reg["code"]
+    wait = 1.0
+    while True:   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
+        try: reg = register(mode); break
+        except Exception as e:
+            print(f"[helper] cannot reach the server ({type(e).__name__}), retrying ...", flush=True); time.sleep(min(wait, 10.0)); wait *= 1.7
+    token = TOKEN = reg["token"]; code = reg["code"]; LAST_OK[0] = time.time()
     print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
     overlay_start()
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0
+    def watchdog():   # a connection can die silently (the poll just hangs): do not stay blue for long
+        while True:
+            time.sleep(2)
+            if time.time() - LAST_OK[0] > POLL_TIMEOUT + 4: net_state("lost")
+    threading.Thread(target=watchdog, daemon=True).start()
     try:
         while True:
             failed = False
             try:
-                status, cmd = api("/a/poll", token=token, timeout=40)
+                status, cmd = api("/a/poll", token=token, timeout=POLL_TIMEOUT)
             except urllib.error.HTTPError as e:
                 status = cmd = None
                 if e.code == 410: print("session closed (ended by the helper)"); return
@@ -854,7 +866,7 @@ def main():
                     try:
                         reg = register(mode, code); token = TOKEN = reg["token"]
                         print(f"[helper] registered again, session code: {reg['code']}", flush=True)
-                        code = reg["code"]; fails, delay = 0, 1.0; net_state("ok"); continue
+                        code = reg["code"]; fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok"); continue
                     except Exception: pass
                 failed = True
             except Exception:   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying
@@ -864,7 +876,7 @@ def main():
                 if fails >= 2: net_state("lost")
                 time.sleep(min(delay, 10.0) * (0.8 + 0.4 * random.random())); delay *= 1.7
                 continue
-            fails, delay = 0, 1.0; net_state("ok")
+            fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
             if status != 200 or not cmd: continue
             if cmd["tool"] == "bye": print("session closed"); return
             pool.submit(handle, cmd, mode, token)

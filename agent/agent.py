@@ -569,26 +569,17 @@ def make_monitor(mon):
     W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
     w = new_window(W, H, g.x, g.y)
     cache = {}
+    # GNOME Shell draws its panel / dock above every normal window, so a glow at the very screen edge would vanish under it and look cut off.
+    # The glow therefore hugs the work area (the space left by the panel): the panel sits outside the light, nothing is covered.
+    wa = mon.get_workarea(); ox, oy = max(0, wa.x - g.x), max(0, wa.y - g.y)
+    gw, gh = min(W - ox, wa.width - 1 if wa.width < g.width else W), min(H - oy, wa.height - 1 if wa.height < g.height else H)
     def surf():
-        if state not in cache: cache[state] = build_glow(W, H, col())
+        if state not in cache: cache[state] = build_glow(gw, gh, col())
         return cache[state][0]
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+        cr.set_source_surface(surf(), ox, oy); cr.paint()
     w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
-    # GNOME Shell draws its panel / dock above every normal window, so the glow would vanish under it. Where the panel takes space
-    # (work area smaller than the monitor) a thin override-redirect strip repeats the glow along that screen edge, above the panel.
-    # It sits only on the outermost pixels, so the panel's buttons stay clickable.
-    wa = mon.get_workarea(); STRIP = 12; sides = []
-    if wa.y > g.y: sides.append((0, 0, W, STRIP))
-    if wa.y + wa.height < g.y + g.height - 1: sides.append((0, H - STRIP, W, STRIP))
-    if wa.x > g.x: sides.append((0, 0, STRIP, H))
-    if wa.x + wa.width < g.x + g.width - 1: sides.append((W - STRIP, 0, STRIP, H))
-    for (sx, sy, sw, sh) in sides:
-        sw_ = Gtk.Window(type=Gtk.WindowType.POPUP); sw_.set_app_paintable(True); sw_.set_visual(scr.get_rgba_visual())
-        sw_.set_default_size(sw, sh); sw_.move(g.x + sx, g.y + sy); sw_.set_keep_above(True); sw_.set_accept_focus(False)
-        def sdraw(_, cr, sx=sx, sy=sy):
-            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), -sx, -sy); cr.paint()
-        sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
     # the label is its own small window: it pulses without repainting the full-screen glow
     pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
     def pdraw(_, cr):
@@ -687,7 +678,7 @@ def tick():
     global opacity, rip
     now = time.monotonic(); px, py = pointer()
     if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
-    target = 1.0 if (now - last_active < 3.0 or dragging) else 0.0
+    target = 1.0 if (now - last_active < 8.0 or dragging) else 0.0
     opacity += (target - opacity) * 0.22
     if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
     else:

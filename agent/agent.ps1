@@ -553,7 +553,7 @@ $timer.Add_Tick({
     if ([O.Pump]::Eof) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown(); return }
     $now = $clock.Elapsed.TotalSeconds; $p = [Windows.Forms.Cursor]::Position; $c = Cur
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
-    $active = (($now - $script:lastActive) -lt 3.0) -or $script:dragging
+    $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
     $tgt = if ($active) { 1.0 } else { 0.0 }
     $script:opacity += ($tgt - $script:opacity) * 0.22
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }

@@ -15,6 +15,9 @@ T = {
     "hdr1": ("УДАЛЁННАЯ ПОМОЩЬ", "REMOTE HELP"), "hdr2": ("Код сессии:", "Session code:"), "copied": ("скопирован в буфер обмена", "copied to the clipboard"),
     "hdr3": ("Esc — завершить сеанс в любой момент", "Esc — end the session at any time"), "hdr4": ("Скажи этот код тому, кто помогает.", "Tell this code to the person who helps you."),
     "stopask": ("не спрашивать про", "stop asking about"),
+    "st_conn": ("Подключаюсь к серверу…", "Connecting to the server…"), "st_wait": ("Ожидание помощника… он подключается по коду", "Waiting for the helper to connect with the code…"),
+    "st_ok": ("Помощник подключён", "Helper connected"), "st_lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
+    "overlay_wait": ("Ожидание помощника…", "Waiting for the helper…"),
     "ready": ("Подключено. Жду действий.", "Connected. Waiting for actions."),
     "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ: ",
              "Mode: [1] ask before every action (recommended)  [2] full access: "),
@@ -292,7 +295,9 @@ GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard")
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
 KEYS = queue.Queue(); PUMP = {"on": False, "old": None}
-HDR = 5   # lines of the pinned header
+HDR = 6   # lines of the pinned header
+OP = {"seen": False}   # has the helper sent anything yet
+ORANGE = "38;5;208"
 def c(code, x): return f"\033[{code}m{x}\033[0m"
 
 
@@ -381,12 +386,24 @@ def copy_clip(text):
     overlay_send("clip " + text); return bool(OVERLAY_PROC)   # the overlay (GTK) owns the clipboard while the session lasts
 
 
+def status_line():
+    st = "lost" if NET["s"] == "lost" else ("ok" if OP["seen"] else "wait")
+    return c("33", "  │ ") + (c("1;32", "● " + t("st_ok")) if st == "ok" else c("1;" + ORANGE, "◌ " + t("st_lost" if st == "lost" else "st_wait")))
+
+
+def show_status():
+    """redraw only the status row of the pinned header"""
+    if PUMP.get("hdr") and sys.stdout.isatty():
+        sys.stdout.write("\0337\033[5;1H\033[2K" + status_line() + "\0338"); sys.stdout.flush()
+
+
 def header(code, copied):
     try: rows = shutil.get_terminal_size().lines
     except Exception: rows = 24
     bar = "─" * 54
+    PUMP["hdr"] = True
     sys.stdout.write("\033[2J\033[H" + c("1;33", f"  ┌ {t('hdr1')} {bar}") + "\n" + c("1;33", f"  │ {t('hdr2')}  ") + c("1;30;43", f" {code} ") + c("32", f"   ✔ {t('copied')}" if copied else "") + "\n"
-                     + c("33", f"  │ {t('hdr4')}") + "\n" + c("33", f"  │ {t('hdr3')}") + "\n" + c("1;33", f"  └{bar}{'─' * 18}") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
+                     + c("33", f"  │ {t('hdr4')}") + "\n" + c("33", f"  │ {t('hdr3')}") + "\n" + status_line() + "\n" + c("1;33", f"  └{bar}{'─' * 18}") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
     sys.stdout.flush()
 
 
@@ -442,7 +459,7 @@ def ask_permission(name, a):
     if g in ALLOWED: return
     fw = focus_window() or AI["fw"]; label = GROUP_LABEL[g][0 if RU else 1]; d = describe(name, a)
     play("ask")
-    try: subprocess.Popen(["notify-send", "-u", "critical", "-t", "20000", "HelperMCP", "\n".join(d)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try: subprocess.Popen(["notify-send", "-u", "normal", "-t", "15000", "HelperMCP", "\n".join(d)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception: pass
     print("\n" + c("1;30;43", f"  ▶ {t('allow')}" + (d[0] if len(d) == 1 else "") + "  ") + ("".join("\n" + c("33", f"      {i}. {x}") for i, x in enumerate(d, 1)) if len(d) > 1 else "")
           + "\n" + c("33", f"    [Y] {t('keys')}    [A] {t('always')}    [N] {t('no')}    [Esc] {t('endk')}") + "\n" + c("2;33", f"    A = {t('stopask')} {label} {t('until')}"), flush=True)
@@ -762,15 +779,16 @@ gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib
 
 label, ppid, lost_label = sys.argv[1], int(sys.argv[2]), (sys.argv[3] if len(sys.argv) > 3 else "Connection lost")
+wait_label = sys.argv[4] if len(sys.argv) > 4 else "Waiting for the helper…"
 BLUE, ORANGE, VIOLET = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0)
 disp = Gdk.Display.get_default()
 scr = disp.get_default_screen()
 if not scr.is_composited() or scr.get_rgba_visual() is None:
     sys.exit(0)                      # without compositing transparent windows would be opaque black boxes: show nothing
-state = "ok"                         # ok | lost  (connection to the relay)
+state = "ok"                         # ok | lost (connection to the relay) | wait (nobody has connected with the code yet)
 S_DEPTH = 70                         # glow depth in px
 
-def col(): return ORANGE if state == "lost" else BLUE
+def col(): return ORANGE if state in ("lost", "wait") else BLUE
 
 def new_window(w, h, x, y):
     # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an
@@ -813,7 +831,7 @@ glows, pills, strips = [], [], []
 tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
 tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); tmp.set_font_size(15)
 T0 = time.monotonic()
-PILL_W = int(max(tmp.text_extents(label + "   00:00:00").x_advance, tmp.text_extents(lost_label).x_advance)) + 58
+PILL_W = int(max(tmp.text_extents(label + "   00:00:00").x_advance, tmp.text_extents(lost_label).x_advance, tmp.text_extents(wait_label).x_advance)) + 58
 
 def make_monitor(mon):
     g = mon.get_geometry()
@@ -847,7 +865,7 @@ def make_monitor(mon):
     pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
     def pdraw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
-        r_, g_, b_ = col(); lost = state == "lost"; text = lost_label if lost else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
+        r_, g_, b_ = col(); lost = state in ("lost", "wait"); text = lost_label if state == "lost" else wait_label if state == "wait" else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         ext = cr.text_extents(text); ph, rr, pad = 34, 17, 18
@@ -1182,7 +1200,7 @@ chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)
 chan.set_close_on_unref(False)
 GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
 GLib.timeout_add(16, tick)
-GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state == "lost" else None) or True)   # orange label pulses
+GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state in ("lost", "wait") else None) or True)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
 GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()
@@ -1202,7 +1220,7 @@ def overlay_start():
     global OVERLAY_PROC
     if os.environ.get("HELPER_NO_OVERLAY") or not GUI["type"]: return
     try:
-        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost")],
+        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost"), t("overlay_wait")],
                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, HM_RELAY=RELAY))
     except Exception: pass
 
@@ -1254,6 +1272,7 @@ GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 def handle(cmd, mode, token):
     """One tool call, in its own thread: a slow install or render never blocks screenshots, the live viewer or other calls."""
     name, args = cmd["tool"], cmd["args"]
+    if not OP["seen"]: OP["seen"] = True; overlay_send("state ok"); show_status(); print(c("32", "  ● " + t("st_ok")), flush=True)
     print(line_for(name, args), flush=True)
     res = {"id": cmd["id"]}
     try:
@@ -1283,8 +1302,9 @@ POLL_TIMEOUT = 22         # the relay answers within 15 s; anything longer is a 
 def net_state(st):
     if NET["s"] == st: return
     NET["s"] = st
-    print("[helper] " + ("connection lost, retrying ..." if st == "lost" else "connection restored"), flush=True)
-    overlay_send("state " + st)   # the overlay turns orange while the link is down
+    print(c(ORANGE, "  ◌ " + t("st_lost")) if st == "lost" else c("32", "  ● " + ("Связь восстановлена" if RU else "Connection restored")), flush=True)
+    overlay_send("state " + ("lost" if st == "lost" else ("ok" if OP["seen"] else "wait")))   # the overlay turns orange while the link is down or nobody has connected yet
+    show_status()
 
 
 def register(mode, resume=None):
@@ -1305,7 +1325,7 @@ def main():
     while True:   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
         try: reg = register(mode); break
         except Exception as e:
-            print(f"[helper] cannot reach the server ({type(e).__name__}), retrying ...", flush=True); time.sleep(min(wait, 10.0)); wait *= 1.7
+            print(c(ORANGE, "  ◌ " + t("st_conn") + f" ({type(e).__name__})"), flush=True); time.sleep(min(wait, 10.0)); wait *= 1.7
     token = TOKEN = reg["token"]; code = reg["code"]; LAST_OK[0] = time.time()
     overlay_start()
     copied = copy_clip(code)
@@ -1313,7 +1333,8 @@ def main():
     else: print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
     play("ok")
     if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()
-    print(c("32", "  ✔ " + t("ready")), flush=True)
+    overlay_send("state wait")
+    print(c(ORANGE, "  ◌ " + t("st_wait")), flush=True)
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0
     def watchdog():   # a connection can die silently (the poll just hangs): do not stay blue for long

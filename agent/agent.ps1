@@ -494,13 +494,13 @@ namespace O {
 "@
 [O.Pump]::Start()
 Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadCursorFromFile(string f); [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr h, uint id); [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);'
-$label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $ppid = [int]$env:HM_PPID
+$label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 $script:state = 'ok'
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
 $BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
-function Cur() { if ($script:state -eq 'lost') { $ORANGE } else { $BLUE } }
+function Cur() { if ($script:state -eq 'lost' -or $script:state -eq 'wait') { $ORANGE } else { $BLUE } }
 
 function New-Win($x, $y, $w, $h) {
     $win = New-Object Windows.Window
@@ -536,7 +536,7 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $m = @{ win = $win; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
     $win.Show(); Click-Through $win; $mons += $m
 }
-function Label-Text { if ($script:state -eq 'lost') { $lostLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
+function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 function Apply-State {
     $c = Cur; $key = $script:state
@@ -549,7 +549,7 @@ function Apply-State {
         $m.img.Source = $m.cache[$key]
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
         $m.tb.Text = Label-Text
-        if ($script:state -eq 'lost') {   # the orange dot pulses while the link is down
+        if ($script:state -eq 'lost' -or $script:state -eq 'wait') {   # the orange dot pulses while the link is down or nobody has connected yet
             $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
             $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
             $m.dot.BeginAnimation([Windows.UIElement]::OpacityProperty, $an)
@@ -802,7 +802,7 @@ function Start-Overlay {
         $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $file + '"'
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
         $psi.EnvironmentVariables['HM_RELAY'] = $RELAY; $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
-        $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…')
+        $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'); $psi.EnvironmentVariables['HM_WAIT'] = (T 'Ожидание помощника…' 'Waiting for the helper…')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
         $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
     } catch { }   # a missing overlay must never block the help session
@@ -876,6 +876,21 @@ function Play-Sound($kind) {
     } catch { }
 }
 function Enable-VT { try { $h = [H.U__BUILD__]::GetStdHandle(-11); $m = 0; if ([H.U__BUILD__]::GetConsoleMode($h, [ref]$m) -and [H.U__BUILD__]::SetConsoleMode($h, $m -bor 4)) { $script:VT = $true } } catch { } }
+$script:OperatorSeen = $false; $script:HdrDrawn = $false
+function Orange($text) { if ($script:VT) { "$([char]27)[38;5;208m$text$([char]27)[0m" } else { $text } }
+function Write-Orange($text) { if ($script:VT) { [Console]::WriteLine((Orange $text)) } else { Write-Host $text -ForegroundColor DarkYellow } }
+function Status-Text {
+    $st = if ($script:Net -eq 'lost') { 'lost' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }
+    switch ($st) {
+        'ok' { @('ok', ([char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected'))) }
+        'lost' { @('lost', ([char]0x25CC + ' ' + (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'))) }
+        default { @('wait', ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…'))) }
+    }
+}
+function Show-Status {   # redraw only the status row (row 5) of the pinned header
+    if (-not $script:VT -or -not $script:HdrDrawn) { return }
+    try { $e = [char]27; $x = Status-Text; $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::Write("${e}7$e[5;1H$e[2K  $e[33m$([char]0x2502) $col$($x[1])$e[0m${e}8") } catch { }
+}
 function Draw-Header($code, $copied) {
     $e = [char]27; $bar = [string]([char]0x2500) * 56
     try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
@@ -885,8 +900,11 @@ function Draw-Header($code, $copied) {
     if ($copied) { Write-Host ('   ' + [char]0x221A + ' ' + (T 'скопирован в буфер обмена' 'copied to the clipboard')) -ForegroundColor Green } else { Write-Host '' }
     Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Скажи этот код тому, кто помогает.' 'Tell this code to the person who helps you.')) -ForegroundColor DarkYellow
     Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Esc - завершить сеанс в любой момент' 'Esc - end the session at any time')) -ForegroundColor DarkYellow
+    $x = Status-Text; Write-Host ('  ' + [char]0x2502 + ' ') -ForegroundColor Yellow -NoNewline
+    if ($script:VT) { $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::WriteLine("$col$($x[1])$e[0m") } else { Write-Host $x[1] -ForegroundColor $(if ($x[0] -eq 'ok') { 'Green' } else { 'DarkYellow' }) }
     Write-Host ('  ' + [char]0x2514 + $bar + [string]([char]0x2500) * 18) -ForegroundColor Yellow
-    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[6;${h}r$e[6;1H") } catch { } }   # the header stays on top, the log scrolls below it
+    $script:HdrDrawn = $true
+    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[7;${h}r$e[7;1H") } catch { } }   # the header stays on top, the log scrolls below it
 }
 function Flash-Console {
     try { $f = New-Object 'H.U__BUILD__+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U__BUILD__]::GetAncestor([H.U__BUILD__]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U__BUILD__]::FlashWindowEx([ref]$f) } catch { }
@@ -961,6 +979,7 @@ function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
 }
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
+    if (-not $script:OperatorSeen) { $script:OperatorSeen = $true; Overlay-Send 'state ok'; Show-Status; Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
     Say-Step $name $a
     $res = @{ id = $cmd.id }
     try {
@@ -1000,8 +1019,9 @@ $script:Net = 'ok'
 function Net-State($st) {
     if ($script:Net -eq $st) { return }
     $script:Net = $st
-    Write-Host ("[helper] " + $(if ($st -eq 'lost') { 'connection lost, retrying ...' } else { 'connection restored' }))
-    Overlay-Send "state $st"   # the overlay turns orange while the link is down
+    if ($st -eq 'lost') { Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…')) } else { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Связь восстановлена' 'Connection restored')) -ForegroundColor Green }
+    Overlay-Send ("state " + $(if ($st -eq 'lost') { 'lost' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }))   # the overlay turns orange while the link is down or nobody has connected yet
+    Show-Status
 }
 
 function Register-Agent($mode, $resume) {
@@ -1020,15 +1040,16 @@ function Start-Helper {
     $wait = 1.0
     while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
         try { $r = Register-Agent $mode $null; break }
-        catch { Write-Host "[helper] cannot reach the server, retrying ..."; Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
+        catch { Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…')); Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
     }
     $token = $r.token; $script:Token = $token; $code = $r.code
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     Play-Sound 'ok'
-    Write-Host ('  ' + [char]0x221A + ' ' + (T 'Подключено. Жду действий.' 'Connected. Waiting for actions.')) -ForegroundColor Green
+    Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Ожидание помощника… назови ему код' 'Waiting for the helper… give them the code'))
     Start-Overlay
+    Overlay-Send 'state wait'
     $fails = 0; $delay = 1.0
     try {
         while ($true) {

@@ -182,7 +182,8 @@ function Ensure-Node($cmd) {
     $zip = Join-Path $script:NodeDir 'n.zip'
     $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # PS 5.1 progress bar makes downloads ~10x slower
     try { Invoke-WebRequest "https://nodejs.org/dist/$NodeVersion/node-$NodeVersion-win-$arch.zip" -OutFile $zip -UseBasicParsing } finally { $ProgressPreference = $pp }
-    Expand-Archive $zip $script:NodeDir -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem   # Expand-Archive is painfully slow on PS 5.1 (progress bar + per-file overhead)
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $script:NodeDir)
     Remove-Item $zip
     $script:NodeBin = (Get-ChildItem $script:NodeDir -Directory | Select-Object -First 1).FullName
 }

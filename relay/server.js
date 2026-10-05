@@ -256,15 +256,16 @@ function viewerPage(s) {
 <script>
 const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён'}:{live:'Live',wait:'Waiting for a frame…',end:'Session ended'};
 const dot=document.getElementById('dot'),st=document.getElementById('st'),img=document.getElementById('img'),log=document.getElementById('log');
+const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 let ended=false;
-async function frames(){while(!ended){try{const r=await fetch('frame?'+Date.now());
+async function frames(){while(!ended){try{const r=await fetch(base+'/frame?'+Date.now());
  if(r.status===410){ended=true;break}
  if(r.ok){const u=URL.createObjectURL(await r.blob());const o=img.src;img.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o);dot.className='on';st.textContent=L.live}
  else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
  catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,2000))}
  await new Promise(x=>setTimeout(x,150))}
  dot.className='';st.textContent=L.end}
-async function logs(){while(!ended){try{const r=await fetch('log');if(r.ok){const a=await r.json();
+async function logs(){while(!ended){try{const r=await fetch(base+'/log');if(r.ok){const a=await r.json();
  log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+e.tool+'</b> '+(e.args||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
 frames();logs();

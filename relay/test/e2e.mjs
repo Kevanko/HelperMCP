@@ -94,7 +94,10 @@ assert.match(busy, /done/); console.log('long call survives idle limit ok');
 // live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)
 const vurl = txt(await tool('open_viewer', { session: code }));
 assert.match(vurl, new RegExp(`^${BASE}/v/[0-9a-f]{36}$`));
-assert.match(await (await fetch(vurl)).text(), /Remote screen/);
+const page = await (await fetch(vurl)).text();
+assert.match(page, /Remote screen/);
+// regression: /v/<token> has no trailing slash, so a relative fetch('frame') resolved to /v/frame (404) and the viewer stayed empty
+assert.ok(!/fetch\('(frame|log)/.test(page) && page.includes("location.pathname.split('/').slice(0,3)"), 'viewer must build absolute frame/log URLs');
 const vlog = await (await fetch(vurl + '/log')).json();
 assert.ok(vlog.some((e) => e.tool === 'run') && !vlog.some((e) => e.args.includes('view')), 'log shows actions, not viewer frames');
 assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);

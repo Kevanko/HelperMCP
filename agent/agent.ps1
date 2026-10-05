@@ -275,6 +275,16 @@ $OverlayScript = @'
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
 Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
 [void][O.W]::SetProcessDPIAware()
+Add-Type -Namespace O -Name Glow -MemberDefinition @"
+public static byte[] Make(int w, int h, int s, int r, int g, int b) {
+    var px = new byte[w * h * 4]; var prof = new double[s];
+    for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; prof[d] = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); }
+    for (int y = 0; y < h; y++) { int dy = Math.Min(y, h - 1 - y);
+        for (int x = 0; x < w; x++) { int d = Math.Min(dy, Math.Min(x, w - 1 - x)); if (d >= s) continue;
+            double a = prof[d]; int i = (y * w + x) * 4; px[i] = (byte)(b * a); px[i + 1] = (byte)(g * a); px[i + 2] = (byte)(r * a); px[i + 3] = (byte)(255 * a); } }
+    return px;
+}
+"@
 $label = $env:HM_LABEL; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 function Col($a) { [Windows.Media.Color]::FromArgb($a, 76, 141, 255) }
@@ -286,24 +296,14 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $w.Topmost = $true; $w.ShowInTaskbar = $false; $w.ShowActivated = $false; $w.WindowStartupLocation = 'Manual'
     $w.Left = $b.X / $dpi; $w.Top = $b.Y / $dpi; $w.Width = $b.Width / $dpi; $w.Height = $b.Height / $dpi
     $g = New-Object Windows.Controls.Grid
-    # 4 trapezoids meeting on the corner diagonals (like a picture frame): each pixel belongs to exactly one strip,
-    # so nothing overlaps and the corners stay square
-    $S = 70; $Wd = $w.Width; $Ht = $w.Height
-    function Strip($pts, $x0, $y0, $x1, $y1) {
-        $gs = New-Object Windows.Media.GradientStopCollection
-        foreach ($x in @(@(150, 0.0), @(45, 0.35), @(0, 1.0))) { [void]$gs.Add((New-Object Windows.Media.GradientStop (Col $x[0]), $x[1])) }
-        $lb = New-Object Windows.Media.LinearGradientBrush; $lb.GradientStops = $gs
-        $lb.StartPoint = New-Object Windows.Point $x0, $y0; $lb.EndPoint = New-Object Windows.Point $x1, $y1
-        $poly = New-Object Windows.Shapes.Polygon
-        $poly.Points = New-Object Windows.Media.PointCollection (, [Windows.Point[]]($pts | ForEach-Object { New-Object Windows.Point $_[0], $_[1] }))
-        $poly.Fill = $lb; $poly.HorizontalAlignment = 'Left'; $poly.VerticalAlignment = 'Top'
-        [Windows.Media.RenderOptions]::SetEdgeMode($poly, 'Aliased')   # no anti-aliased seam on the diagonals
-        [void]$g.Children.Add($poly)
-    }
-    Strip @(@(0, 0), @($S, $S), @($S, ($Ht - $S)), @(0, $Ht)) 0 0.5 1 0.5                                   # left
-    Strip @(@($Wd, 0), @($Wd, $Ht), @(($Wd - $S), ($Ht - $S)), @(($Wd - $S), $S)) 1 0.5 0 0.5               # right
-    Strip @(@(0, 0), @($Wd, 0), @(($Wd - $S), $S), @($S, $S)) 0.5 0 0.5 1                                   # top
-    Strip @(@(0, $Ht), @($S, ($Ht - $S)), @(($Wd - $S), ($Ht - $S)), @($Wd, $Ht)) 0.5 1 0.5 0               # bottom
+    # Glow bitmap: alpha of every pixel is a fade of its distance to the NEAREST screen edge. No strips, so nothing can overlap or leave a gap.
+    $pw = $b.Width; $ph = $b.Height
+    $pix = [O.Glow]::Make($pw, $ph, [int](70 * $dpi), 76, 141, 255)
+    $bmp = [Windows.Media.Imaging.BitmapSource]::Create($pw, $ph, 96 * $dpi, 96 * $dpi, [Windows.Media.PixelFormats]::Pbgra32, $null, $pix, $pw * 4)
+    $bmp.Freeze()
+    $img = New-Object Windows.Controls.Image
+    $img.Source = $bmp; $img.Stretch = 'None'; $img.HorizontalAlignment = 'Left'; $img.VerticalAlignment = 'Top'
+    [void]$g.Children.Add($img)
     $pill = New-Object Windows.Controls.Border
     $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 14, 6, 18, 6
     $pill.Margin = New-Object Windows.Thickness 0, 12, 0, 0; $pill.HorizontalAlignment = 'Center'; $pill.VerticalAlignment = 'Top'

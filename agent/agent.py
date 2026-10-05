@@ -377,6 +377,7 @@ def mcp_stop(a):
 # ---- "remote control" overlay: glowing screen edges + a label on top (like Codex) ----------------------
 OVERLAY = r'''
 import os, sys, math
+from array import array
 import gi, cairo
 gi.require_version("Gtk", "3.0"); gi.require_version("Gdk", "3.0")
 from gi.repository import Gtk, Gdk, GLib
@@ -390,16 +391,26 @@ def make(mon):                       # one overlay window per monitor: every scr
     vis = w.get_screen().get_rgba_visual()
     if vis: w.set_visual(vis)
     w.set_default_size(W, H); w.move(g.x, g.y); w.set_keep_above(True); w.set_accept_focus(False)
+    # Glow bitmap: alpha of every pixel is a fade of its distance to the NEAREST screen edge. No strips, so nothing can overlap or leave a gap.
+    S = 70
+    def fade(d):                                     # 0.59 at the edge, 0.18 at 35% of the depth, 0 at the depth
+        t = (d + 0.5) / S
+        return 0.59 + (0.18 - 0.59) * t / 0.35 if t <= 0.35 else 0.18 * (1 - (t - 0.35) / 0.65)
+    prof = [(int(255 * fade(d)) << 24) | (int(R * 255 * fade(d)) << 16) | (int(G * 255 * fade(d)) << 8) | int(B * 255 * fade(d)) for d in range(S)]
+    px = array("I", bytes(4 * W * H))                # premultiplied ARGB32
+    for y in range(H):
+        dy = min(y, H - 1 - y)
+        if dy < S:
+            left = [prof[min(dy, x)] for x in range(S)]
+            px[y * W: y * W + S] = array("I", left)
+            px[y * W + S: (y + 1) * W - S] = array("I", [prof[dy]]) * (W - 2 * S)
+            px[(y + 1) * W - S: (y + 1) * W] = array("I", left[::-1])
+        else:
+            px[y * W: y * W + S] = array("I", prof)
+            px[(y + 1) * W - S: (y + 1) * W] = array("I", prof[::-1])
+    glow = cairo.ImageSurface.create_for_data(px, cairo.FORMAT_ARGB32, W, H, W * 4)
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
-        cr.set_operator(cairo.OPERATOR_LIGHTEN)        # where two strips meet in a corner the brighter one wins instead of adding up
-        S = 70
-        for (x0, y0, x1, y1, rx, ry, rw, rh) in ((0, 0, S, 0, 0, 0, S, H), (W, 0, W - S, 0, W - S, 0, S, H),
-                                                (0, 0, 0, S, 0, 0, W, S), (0, H, 0, H - S, 0, H - S, W, S)):
-            gr = cairo.LinearGradient(x0, y0, x1, y1)
-            gr.add_color_stop_rgba(0, R, G, B, 0.59); gr.add_color_stop_rgba(0.35, R, G, B, 0.18); gr.add_color_stop_rgba(1, R, G, B, 0)
-            cr.set_source(gr); cr.rectangle(rx, ry, rw, rh); cr.fill()
-        cr.set_operator(cairo.OPERATOR_OVER)
+        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(glow, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         tw = cr.text_extents(label).x_advance; pw, ph = tw + 54, 34; px, py, r = (W - pw) / 2, 12, 17
         cr.new_sub_path(); cr.arc(px + pw - r, py + r, r, -math.pi / 2, math.pi / 2); cr.arc(px + r, py + r, r, math.pi / 2, 3 * math.pi / 2); cr.close_path()

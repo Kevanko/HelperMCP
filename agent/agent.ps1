@@ -136,10 +136,17 @@ function Do-Scroll($a) {
 
 function Do-TypeText($a) {
     Overlay-Send 'typing'
-    # SendKeys treats + ^ % ~ ( ) { } [ ] specially: wrap each in braces
-    $esc = [regex]::Replace($a.text, '[+^%~(){}\[\]]', '{$0}')
-    $esc = $esc -replace "`r?`n", '{ENTER}'
-    [Windows.Forms.SendKeys]::SendWait($esc)
+    $t = $a.text -replace "`r`n", "`n"
+    $lines = @($t.Split("`n") | Select-Object -First 30 | ForEach-Object { $_.Length })
+    Overlay-Send ('type ' + ([Math]::Min($t.Length, 300) * 0.026).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) + ' ' + ($lines -join ','))
+    $step = [Math]::Max(1, [int][Math]::Ceiling($t.Length / 300.0))   # about 26 ms per step: the arrow can follow
+    for ($i = 0; $i -lt $t.Length; $i += $step) {
+        $chunk = $t.Substring($i, [Math]::Min($step, $t.Length - $i))
+        # SendKeys treats + ^ % ~ ( ) { } [ ] specially: wrap each in braces
+        $esc = [regex]::Replace($chunk, '[+^%~(){}\[\]]', '{$0}') -replace "`n", '{ENTER}'
+        [Windows.Forms.SendKeys]::SendWait($esc)
+        if ($t.Length -gt 1) { Start-Sleep -Milliseconds 18 }
+    }
     @{ text = 'ok' }
 }
 
@@ -523,6 +530,7 @@ $arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrowRot = New-Obje
 $tg = New-Object Windows.Media.TransformGroup; [void]$tg.Children.Add($arrowScale); [void]$tg.Children.Add($arrowRot); $arrow.RenderTransform = $tg; $arrow.RenderTransformOrigin = New-Object Windows.Point 0, 0
 $aglow = New-Object Windows.Media.Effects.DropShadowEffect; $aglow.ShadowDepth = 2; $aglow.Direction = 270; $aglow.BlurRadius = 9; $aglow.Opacity = 0.45; $arrow.Effect = $aglow
 [Windows.Controls.Canvas]::SetLeft($arrow, $HX); [Windows.Controls.Canvas]::SetTop($arrow, $HY); [void]$cv.Children.Add($arrow)
+$arrowImg = New-Object Windows.Controls.Image; $arrowImg.Stretch = 'Fill'; $arrowImg.Visibility = 'Collapsed'; $arrowImg.RenderTransform = $tg; [void]$cv.Children.Add($arrowImg)
 $typeDots = @(); 0..2 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 6.4; $e.Height = 6.4; $e.Visibility = 'Collapsed'
     [Windows.Controls.Canvas]::SetLeft($e, $HX + 27 + $_ * 9); [Windows.Controls.Canvas]::SetTop($e, $HY + 37); [void]$cv.Children.Add($e); $typeDots += $e }
 $chev = @(); 0..2 | ForEach-Object { $l = New-Object Windows.Shapes.Polyline; $l.StrokeThickness = 3; $l.StrokeStartLineCap = 'Round'; $l.StrokeEndLineCap = 'Round'; $l.StrokeLineJoin = 'Round'
@@ -557,6 +565,32 @@ function Make-SoftCur($file) {
     $w.Write((New-Object byte[] $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
 }
 $CurIds = @{ pointer = 32512; beam = 32513; busy = 32514; precision = 32515; alternate = 32516; dgn1 = 32642; dgn2 = 32643; horz = 32644; vert = 32645; move = 32646; unavailable = 32648; link = 32649; working = 32650; help = 32651 }
+function Read-Cur32($file) {   # 32-bit .cur -> @{ w; h; hx; hy; raw = BGRA top-down }, else $null
+    try {
+        $b = [IO.File]::ReadAllBytes($file); $n = [BitConverter]::ToUInt16($b, 4); $best = $null
+        for ($i = 0; $i -lt $n; $i++) { $o = 6 + 16 * $i; $w = [int]$b[$o]; if ($w -eq 0) { $w = 256 }; if (-not $best -or ($w -le 48 -and $w -gt $best.w)) { $best = @{ w = $w; h = [int]$b[$o + 1]; hx = [BitConverter]::ToUInt16($b, $o + 4); hy = [BitConverter]::ToUInt16($b, $o + 6); off = [BitConverter]::ToUInt32($b, $o + 12) } } }
+        $o = $best.off; if ($b[$o] -eq 0x89 -or [BitConverter]::ToUInt16($b, $o + 14) -ne 32) { return $null }
+        $w = $best.w; $h = $best.h; $hs = [BitConverter]::ToUInt32($b, $o); $raw = New-Object byte[] ($w * $h * 4)
+        for ($y = 0; $y -lt $h; $y++) { [Array]::Copy($b, $o + $hs + ($h - 1 - $y) * $w * 4, $raw, $y * $w * 4, $w * 4) }
+        @{ w = $w; h = $h; hx = $best.hx; hy = $best.hy; raw = $raw }
+    } catch { $null }
+}
+function Write-CurFile($file, $raw, $W, $H, $hx, $hy) {
+    $ms = New-Object IO.MemoryStream; $bw = New-Object IO.BinaryWriter $ms; $mask = (($W + 31) -shr 5) * 4 * $H; $size = 40 + $W * $H * 4 + $mask
+    $bw.Write([uint16]0); $bw.Write([uint16]2); $bw.Write([uint16]1); $bw.Write([byte]$W); $bw.Write([byte]$H); $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([uint16]$hx); $bw.Write([uint16]$hy); $bw.Write([uint32]$size); $bw.Write([uint32]22)
+    $bw.Write([uint32]40); $bw.Write([int32]$W); $bw.Write([int32](2 * $H)); $bw.Write([uint16]1); $bw.Write([uint16]32); $bw.Write([uint32]0); $bw.Write([uint32]($W * $H * 4)); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([uint32]0); $bw.Write([uint32]0)
+    for ($y = $H - 1; $y -ge 0; $y--) { $bw.Write($raw, $y * $W * 4, $W * 4) }
+    $bw.Write((New-Object byte[] $mask)); $bw.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
+}
+function Scale-Cur($info, $k, $file) {   # a little bigger than the pack's 32 px, smooth
+    $W = [int][Math]::Round($info.w * $k); $H = [int][Math]::Round($info.h * $k)
+    $src = New-Object Drawing.Bitmap $info.w, $info.h, ([Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $bd = $src.LockBits((New-Object Drawing.Rectangle 0, 0, $info.w, $info.h), 'WriteOnly', 'Format32bppArgb'); [Runtime.InteropServices.Marshal]::Copy($info.raw, 0, $bd.Scan0, $info.raw.Length); $src.UnlockBits($bd)
+    $dst = New-Object Drawing.Bitmap $W, $H, ([Drawing.Imaging.PixelFormat]::Format32bppArgb); $g = [Drawing.Graphics]::FromImage($dst); $g.InterpolationMode = 'HighQualityBicubic'; $g.PixelOffsetMode = 'HighQuality'; $g.CompositingMode = 'SourceCopy'
+    $g.DrawImage($src, 0, 0, $W, $H); $g.Dispose()
+    $bd = $dst.LockBits((New-Object Drawing.Rectangle 0, 0, $W, $H), 'ReadOnly', 'Format32bppArgb'); $raw = New-Object byte[] ($W * $H * 4); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $raw, 0, $raw.Length); $dst.UnlockBits($bd)
+    Write-CurFile $file $raw $W $H ([int][Math]::Round($info.hx * $k)) ([int][Math]::Round($info.hy * $k))
+}
 function Make-BlankCur($file) {
     $S = 32; $mask = (($S + 31) -shr 5) * 4 * $S; $size = 40 + $S * $S * 4 + $mask; $ms = New-Object IO.MemoryStream; $w = New-Object IO.BinaryWriter $ms
     $w.Write([uint16]0); $w.Write([uint16]2); $w.Write([uint16]1); $w.Write([byte]$S); $w.Write([byte]$S); $w.Write([byte]0); $w.Write([byte]0); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([uint32]$size); $w.Write([uint32]22)
@@ -583,16 +617,35 @@ function Apply-Cursors {
             }
         }
         if (-not $got.ContainsKey('pointer')) { $f = Join-Path $dir 'pointer.cur'; Make-SoftCur $f; $got['pointer'] = $f }
+        else {
+            $info = Read-Cur32 $got['pointer']
+            if ($info) {
+                $pm = New-Object byte[] $info.raw.Length   # premultiplied copy for WPF
+                for ($i = 0; $i -lt $info.raw.Length; $i += 4) { $al = $info.raw[$i + 3]; $pm[$i] = [byte]($info.raw[$i] * $al / 255); $pm[$i + 1] = [byte]($info.raw[$i + 1] * $al / 255); $pm[$i + 2] = [byte]($info.raw[$i + 2] * $al / 255); $pm[$i + 3] = $al }
+                $bs = [Windows.Media.Imaging.BitmapSource]::Create($info.w, $info.h, 96, 96, [Windows.Media.PixelFormats]::Pbgra32, $null, $pm, $info.w * 4); $bs.Freeze()
+                $K = 1.45; $arrowImg.Source = $bs; $arrowImg.Width = $info.w * $K; $arrowImg.Height = $info.h * $K
+                [Windows.Controls.Canvas]::SetLeft($arrowImg, $HX - $info.hx * $K); [Windows.Controls.Canvas]::SetTop($arrowImg, $HY - $info.hy * $K)
+                $arrowImg.RenderTransformOrigin = New-Object Windows.Point ($info.hx / $info.w), ($info.hy / $info.h); $arrow.Visibility = 'Collapsed'; $arrowImg.Visibility = 'Visible'
+                $f2 = Join-Path $dir 'pointer-big.cur'; Scale-Cur $info 1.35 $f2; $got['pointer'] = $f2
+            }
+        }
         foreach ($k in @($got.Keys)) { $h = [O.C]::LoadCursorFromFile($got[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } }
         $script:CurFiles = $got; $script:BlankFile = Join-Path $dir 'blank.cur'; Make-BlankCur $script:BlankFile; $script:CurDir = $dir
-    } catch { Restore-Cursors }
+    } catch { [Console]::Error.WriteLine('cursors: ' + $_); Restore-Cursors }
 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
 $script:scrollDir = 0; $script:scrollT = -99.0; $script:typingT = -99.0; $script:rip = $null; $script:cursorShown = $false; $script:ripShown = $false
 $trail = New-Object System.Collections.ArrayList
-$script:lastPtr = $null; $script:lean = 0.0
+$script:lastPtr = $null; $script:lean = 0.0; $script:typeAnim = $null
 
+function Type-Offset($now) {   # where the arrow stands while text is typed: it follows the caret (about 7.5 px per character, 20 px per line) just below the text
+    $a = $script:typeAnim; if (-not $a -or -not $a.lines.Count) { return @(0, 0) }
+    $el = $now - $a.t0; if ($el -gt $a.dur + 1.2) { return @(0, 0) }
+    $tot = ($a.lines | Measure-Object -Sum).Sum + $a.lines.Count - 1; $pos = [Math]::Min($el / [Math]::Max($a.dur, 0.05), 1.0) * $tot; $row = 0
+    for ($i = 0; $i -lt $a.lines.Count - 1; $i++) { if ($pos -le $a.lines[$i]) { break }; $pos -= $a.lines[$i] + 1; $row++ }
+    return @(([Math]::Min($pos, 70) * 7.5), (12 + 20 * $row))
+}
 function On-Line($line) {
     $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
     if (-not $f -or -not $f[0]) { return }
@@ -604,6 +657,7 @@ function On-Line($line) {
         'up'    { $script:dragging = $false; if ($f.Count -ge 3) { $script:rip = @{ x = [double]$f[1]; y = [double]$f[2]; t = $now; c = (Cur) } } }
         'scroll' { $script:scrollDir = if ([double]$f[1] -gt 0) { 1 } else { -1 }; $script:scrollT = $now }
         'typing' { $script:typingT = $now }
+        'type' { if ($f.Count -ge 3) { $script:typeAnim = @{ t0 = $now; dur = [double]::Parse($f[1], [Globalization.CultureInfo]::InvariantCulture); lines = @($f[2].Split(',') | Where-Object { $_ } | ForEach-Object { [int]$_ }) } } }
     }
 }
 
@@ -626,7 +680,7 @@ $timer.Add_Tick({
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
     else {
         if (-not $script:cursorShown) { $cwin.Show(); $script:cursorShown = $true }
-        $cwin.Left = $p.X / $dpi - $HX; $cwin.Top = $p.Y / $dpi - $HY; $cwin.Opacity = [Math]::Min(1.0, $script:opacity)
+        $to = Type-Offset $now; $cwin.Left = ($p.X + $to[0]) / $dpi - $HX; $cwin.Top = ($p.Y + $to[1]) / $dpi - $HY; $cwin.Opacity = [Math]::Min(1.0, $script:opacity)
         $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
         $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }

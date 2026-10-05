@@ -247,6 +247,7 @@ def press_key(a):
 def type_text(a):
     """Type any Unicode: park each character's keysym on a spare keycode, press it, restore the keymap (what xdotool does)."""
     X = xlib(); x11, d = X["x"], X["d"]; overlay_send("typing")
+    lines = [len(t_) for t_ in a["text"].split("\n")]; overlay_send("type %.2f %s" % (len(a["text"]) * 0.024, ",".join(map(str, lines[:30]))))
     lo, hi, per = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     x11.XDisplayKeycodes(d, ctypes.byref(lo), ctypes.byref(hi))
     m = x11.XGetKeyboardMapping(d, lo.value, hi.value - lo.value + 1, ctypes.byref(per))
@@ -622,7 +623,7 @@ CW = 140; HX = HY = 44               # cursor window size and where the arrow ti
 cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None
+last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; type_anim = None   # (t0, dur, [line lengths])
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -710,6 +711,15 @@ NAMES = {"pointer": ["left_ptr", "default", "arrow", "top_left_arrow"], "link": 
          "vert": ["sb_v_double_arrow", "ns-resize", "size_ver"], "horz": ["sb_h_double_arrow", "ew-resize", "size_hor"], "move": ["fleur", "move"],
          "dgn1": ["nwse-resize", "size_fdiag"], "dgn2": ["nesw-resize", "size_bdiag"]}
 
+def scale_img(img, k):
+    """premultiplied ARGB image scaled by k (smooth)"""
+    w, h, hx, hy, data = img; nw, nh = int(round(w * k)), int(round(h * k))
+    src = cairo.ImageSurface.create_for_data(bytearray(data), cairo.FORMAT_ARGB32, w, h, w * 4)
+    dst = cairo.ImageSurface(cairo.FORMAT_ARGB32, nw, nh); c = cairo.Context(dst); c.scale(nw / w, nh / h)
+    c.set_source_surface(src, 0, 0); c.get_source().set_filter(cairo.FILTER_BEST); c.paint()
+    return nw, nh, int(round(hx * k)), int(round(hy * k)), bytes(dst.get_data())
+
+PACK = {"arrow": None}   # (surface, hotx, hoty) of the pack's pointer: the AI's arrow looks the same as the cursor theme, only bigger
 def apply_theme():
     """pack from the relay (optional) or the soft arrow, as the cursor theme for the whole session; returns True when it is active"""
     try:
@@ -723,6 +733,10 @@ def apply_theme():
                     with urllib.request.urlopen(relay + "/cursor/%s.cur" % key, timeout=3) as r: got[key] = parse_cur(r.read())
                 except Exception: pass
         if "pointer" not in got: got["pointer"] = soft_arrow()
+        else:
+            w_, h_, hx_, hy_, d_ = got["pointer"]; PACK["arrow"] = (cairo.ImageSurface.create_for_data(bytearray(d_), cairo.FORMAT_ARGB32, w_, h_, w_ * 4), hx_, hy_)
+        for key in ("pointer", "link"):
+            if key in got: got[key] = scale_img(got[key], 1.35)      # a little bigger than the pack's 32 px
         old = gs("get", "org.gnome.desktop.interface", "cursor-theme") or "Adwaita"
         os.makedirs(THEME_DIR + "/cursors", exist_ok=True); os.makedirs(os.path.dirname(RESTORE), exist_ok=True)
         json.dump({"old": old}, open(RESTORE, "w"))
@@ -757,6 +771,17 @@ def real_pointer(hide):
         except Exception: pass
         real_hidden[0] = hide
 
+def type_offset(now):
+    """where the arrow stands while text is typed: it follows the caret (about 7.5 px per character, 20 px per line) just below the text"""
+    if not type_anim: return 0, 0
+    t0, dur, lines = type_anim; el = now - t0
+    if el > dur + 1.2: return 0, 0
+    pos = min(el / max(dur, 0.05), 1.0) * (sum(lines) + len(lines) - 1); row = 0
+    for ln in lines[:-1]:
+        if pos <= ln: break
+        pos -= ln + 1; row += 1
+    return min(pos, 70) * 7.5, 12 + 20 * row
+
 def in_panel(x, y):
     return any(st[1][0] <= x < st[1][0] + st[1][2] and st[1][1] <= y < st[1][1] + st[1][3] for st in strips)
 
@@ -782,22 +807,25 @@ def draw_cursor(_, cr):
     halo = cairo.RadialGradient(HX + 6, HY + 8, 2, HX + 6, HY + 8, 52)   # soft light around the pointer, like Codex
     halo.add_color_stop_rgba(0, r_, g_, b_, 0.78); halo.add_color_stop_rgba(0.45, r_, g_, b_, 0.34); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
     cr.set_source(halo); cr.arc(HX + 6, HY + 8, 52, 0, 2 * math.pi); cr.fill()
-    if True:   # the real pointer is hidden while the AI works: this arrow takes its place
-        cr.save(); cr.translate(HX, HY); cr.rotate(lean); cr.scale(s, s)
-        cr.move_to(*ARROW[0])
-        for p in ARROW[1:]: cr.line_to(*p)
-        cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
-        path = cr.copy_path()
-        cr.save(); cr.translate(1.5, 3)                        # soft drop shadow
-        for lw, a in ((11, 0.05), (8, 0.07), (5, 0.10)):
-            cr.new_path(); cr.append_path(path); cr.set_source_rgba(0.02, 0.05, 0.15, a); cr.set_line_width(lw); cr.stroke()
-        cr.restore()
-        for lw, a in ((10, 0.10), (7, 0.16), (4.5, 0.26)):      # coloured glow
-            cr.new_path(); cr.append_path(path); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.stroke()
-        cr.new_path(); cr.append_path(path); cr.set_line_width(3.2); cr.set_source_rgba(1, 1, 1, 1); cr.stroke_preserve()   # rounded corners
-        grad = cairo.LinearGradient(0, 0, 0, 27); grad.add_color_stop_rgb(0, 1, 1, 1); grad.add_color_stop_rgb(1, 0.82, 0.89, 1)
-        cr.set_source(grad); cr.fill_preserve()
-        cr.set_source_rgba(r_, g_, b_, 0.55); cr.set_line_width(1.1); cr.stroke(); cr.restore()
+    if PACK["arrow"]:   # the pack's pointer, bigger, leaning into the movement
+        sf_, hx_, hy_ = PACK["arrow"]; k = 1.45 * s / 1.4
+        cr.save(); cr.translate(HX, HY); cr.rotate(lean); cr.scale(k, k); cr.set_source_surface(sf_, -hx_, -hy_); cr.get_source().set_filter(cairo.FILTER_BEST); cr.paint(); cr.restore()
+    else:   # the real pointer is hidden while the AI works: this arrow takes its place
+            cr.save(); cr.translate(HX, HY); cr.rotate(lean); cr.scale(s, s)
+            cr.move_to(*ARROW[0])
+            for p in ARROW[1:]: cr.line_to(*p)
+            cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+            path = cr.copy_path()
+            cr.save(); cr.translate(1.5, 3)                        # soft drop shadow
+            for lw, a in ((11, 0.05), (8, 0.07), (5, 0.10)):
+                cr.new_path(); cr.append_path(path); cr.set_source_rgba(0.02, 0.05, 0.15, a); cr.set_line_width(lw); cr.stroke()
+            cr.restore()
+            for lw, a in ((10, 0.10), (7, 0.16), (4.5, 0.26)):      # coloured glow
+                cr.new_path(); cr.append_path(path); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.stroke()
+            cr.new_path(); cr.append_path(path); cr.set_line_width(3.2); cr.set_source_rgba(1, 1, 1, 1); cr.stroke_preserve()   # rounded corners
+            grad = cairo.LinearGradient(0, 0, 0, 27); grad.add_color_stop_rgb(0, 1, 1, 1); grad.add_color_stop_rgb(1, 0.82, 0.89, 1)
+            cr.set_source(grad); cr.fill_preserve()
+            cr.set_source_rgba(r_, g_, b_, 0.55); cr.set_line_width(1.1); cr.stroke(); cr.restore()
     sa = now - scroll_t
     if scroll_dir and 0 <= sa < 0.7:                      # scrolling: chevrons travel in the scroll direction
         for k in range(3):
@@ -845,7 +873,7 @@ def tick():
     opacity += (target - opacity) * 0.22
     if (opacity < 0.03 and target == 0.0) or now < pre_until: hide(cursor, "cursor"); real_pointer(False)   # pre_until: a click on the panel needs the pointer free for a moment
     else:
-        real_pointer(True); show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
+        real_pointer(True); dx, dy = type_offset(now); show(cursor, "cursor"); cursor.move(px + dx - HX, py + dy - HY); cursor.get_window().raise_(); cursor.queue_draw()
     for st in strips:   # over-the-panel glow strips: out of the way while the pointer is on them
         x, y, w_, h_ = st[1]; inside = x <= px < x + w_ and y <= py < y + h_
         if inside and st[2]: st[0].hide(); st[2] = False
@@ -864,7 +892,7 @@ def set_state(s):
     for w in pills: w.queue_draw()
 
 def on_line(line):
-    global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip, pre_until
+    global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip, pre_until, type_anim
     f = line.split(); now = time.monotonic()
     if not f: return
     if f[0] == "state" and len(f) > 1: set_state(f[1]); return
@@ -881,6 +909,9 @@ def on_line(line):
         if len(f) >= 3: rip = (float(f[1]), float(f[2]), now, col())
     elif f[0] == "scroll" and len(f) > 1: scroll_dir = 1 if float(f[1]) > 0 else -1; scroll_t = now
     elif f[0] == "typing": typing_t = now
+    elif f[0] == "type" and len(f) >= 3:
+        try: type_anim = (now, float(f[1]), [int(v) for v in f[2].split(",") if v][:30] or [0])
+        except ValueError: pass
 
 def on_stdin(chan, cond):
     if cond & GLib.IO_HUP and not (cond & GLib.IO_IN): Gtk.main_quit(); return False

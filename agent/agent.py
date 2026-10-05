@@ -562,7 +562,8 @@ def build_glow(W, H, rgb):
 glows, pills, strips = [], [], []
 tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
 tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); tmp.set_font_size(15)
-PILL_W = int(max(tmp.text_extents(label).x_advance, tmp.text_extents(lost_label).x_advance)) + 58
+T0 = time.monotonic()
+PILL_W = int(max(tmp.text_extents(label + "   00:00:00").x_advance, tmp.text_extents(lost_label).x_advance)) + 58
 
 def make_monitor(mon):
     g = mon.get_geometry()
@@ -595,7 +596,7 @@ def make_monitor(mon):
     pw = new_window(PILL_W, 36, g.x + (g.width - PILL_W) // 2, g.y + 12)
     def pdraw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
-        r_, g_, b_ = col(); lost = state == "lost"; text = lost_label if lost else label
+        r_, g_, b_ = col(); lost = state == "lost"; text = lost_label if lost else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
         ph, rr = 34, 17; x0, y0 = (PILL_W - (PILL_W - 4)) / 2, 1
         w_ = PILL_W - 4
@@ -623,6 +624,20 @@ def pointer():
     _, x, y = disp.get_default_seat().get_pointer().get_position()
     return x, y
 
+try:   # hide the real pointer while the big one is shown (a second client's XFixesHideCursor lasts until it shows it again or exits)
+    import ctypes
+    _xl = ctypes.CDLL("libX11.so.6"); _xf = ctypes.CDLL("libXfixes.so.3")
+    _xl.XOpenDisplay.restype = ctypes.c_void_p; _xl.XDefaultRootWindow.restype = ctypes.c_ulong; _xl.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    _xd = _xl.XOpenDisplay(None); _xroot = _xl.XDefaultRootWindow(_xd)
+    _xf.XFixesHideCursor.argtypes = _xf.XFixesShowCursor.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+except Exception: _xd = None
+sys_hidden = [False]
+def sys_cursor(hide):
+    if _xd and hide != sys_hidden[0]:
+        try: (_xf.XFixesHideCursor if hide else _xf.XFixesShowCursor)(_xd, _xroot); _xl.XFlush(ctypes.c_void_p(_xd))
+        except Exception: pass
+        sys_hidden[0] = hide
+
 def ease_out(p): return 1 - (1 - p) ** 3
 
 ARROW = [(0, 0), (0, 23), (5.2, 18.2), (8.8, 26.5), (12.3, 25), (8.7, 16.8), (15.6, 16.8)]
@@ -649,11 +664,18 @@ def draw_cursor(_, cr):
     cr.save(); cr.translate(HX, HY); cr.scale(s, s)
     cr.move_to(*ARROW[0])
     for p in ARROW[1:]: cr.line_to(*p)
-    cr.close_path()
-    for lw, a in ((9, 0.10), (6, 0.16), (3.5, 0.28)):    # glow
-        cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.stroke_preserve()
-    cr.set_source_rgba(1, 1, 1, 1); cr.fill_preserve()
-    cr.set_source_rgba(0.05, 0.1, 0.18, 0.95); cr.set_line_width(1.6); cr.stroke(); cr.restore()
+    cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    path = cr.copy_path()
+    cr.save(); cr.translate(1.5, 3)                        # soft drop shadow
+    for lw, a in ((11, 0.05), (8, 0.07), (5, 0.10)):
+        cr.new_path(); cr.append_path(path); cr.set_source_rgba(0.02, 0.05, 0.15, a); cr.set_line_width(lw); cr.stroke()
+    cr.restore()
+    for lw, a in ((10, 0.10), (7, 0.16), (4.5, 0.26)):      # coloured glow
+        cr.new_path(); cr.append_path(path); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.stroke()
+    cr.new_path(); cr.append_path(path); cr.set_line_width(3.2); cr.set_source_rgba(1, 1, 1, 1); cr.stroke_preserve()   # rounded corners
+    grad = cairo.LinearGradient(0, 0, 0, 27); grad.add_color_stop_rgb(0, 1, 1, 1); grad.add_color_stop_rgb(1, 0.82, 0.89, 1)
+    cr.set_source(grad); cr.fill_preserve()
+    cr.set_source_rgba(r_, g_, b_, 0.55); cr.set_line_width(1.1); cr.stroke(); cr.restore()
     sa = now - scroll_t
     if scroll_dir and 0 <= sa < 0.7:                      # scrolling: chevrons travel in the scroll direction
         for k in range(3):
@@ -696,9 +718,9 @@ def tick():
     if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
     target = 1.0 if (now - last_active < 8.0 or dragging) else 0.0
     opacity += (target - opacity) * 0.22
-    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
+    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor"); sys_cursor(False)
     else:
-        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
+        sys_cursor(opacity > 0.5); show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
     for st in strips:   # over-the-panel glow strips: out of the way while the pointer is on them
         x, y, w_, h_ = st[1]; inside = x <= px < x + w_ and y <= py < y + h_
         if inside and st[2]: st[0].hide(); st[2] = False
@@ -753,6 +775,7 @@ GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdi
 GLib.timeout_add(16, tick)
 GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state == "lost" else None) or True)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
+GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()
 '''
 

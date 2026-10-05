@@ -110,6 +110,14 @@ mcp_call   server="browser" tool="browser_navigate" arguments={"url": "https://e
 * The live viewer steps its quality up and down to keep about one frame per second, and sends nothing while the screen does not change.
 * On a slow link the AI's screenshots shrink on their own; `screenshot` takes `max_width` and `quality`, `monitor=N` crops to one screen.
 
+## Android phone
+
+A separate app (`android/`, Kotlin, no dependencies, Android 11+) instead of the one-liner. The landing page of your relay shows a QR code: scan it, download the APK, allow the install, open the app, switch **HelperMCP** on under *Accessibility* (step 1), press **Start help** (step 2) and tell the code to the helper. Sideloaded apps on Android 13+ need *App info → ⋮ → Allow restricted settings* once; the app says so.
+
+* **What works:** `screenshot`, `click` (a tap; `button=right` = long press), `drag` (a swipe; `hold=true` = drag and drop), `scroll`, `type_text` (into the focused field), `press_key` (home, back, recents, notifications, enter, volume ...), `start_process` (app name, package or link), `actions` and `sysinfo`. No shell, no files and no MCP bridge on a phone.
+* **Same look as on the PC:** edge glow (blue connected, orange waiting for the helper or link lost), a label with the session clock (tap it to end the session), the AI's pointer that glides with a curve, leans into the movement, ripples on taps and shows typing dots, and a question card (Yes / Always / No / Stop) with a soft chime. The code is copied to the clipboard.
+* **Build and publish:** `cd android && ./gradlew assembleRelease -Prelay=https://your.relay` (needs the Android SDK and a full JDK 17+), then put `app/build/outputs/apk/release/app-release.apk` into the relay's `data/apk/helpermcp.apk` (or set `APK_FILE`). The relay then serves it at `/apk`, draws the QR code at `/qr.svg` and adds the Android section to the landing page. The release build is signed with the debug key: use your own key if you want a stable update channel.
+
 ## Reconnecting by itself
 
 The agent never gives up on a bad connection: failed requests are retried with a growing delay (1 s to 10 s), after two failures the overlay turns orange, and when the link is back everything continues. Connections that died with an old route (VPN switched) are dropped and re-opened. A session is kept for 5 minutes after the agent was last seen; `list_sessions` shows `online` and `last_seen_s`, and a call to an offline PC fails at once with a clear message instead of hanging. If the server forgot the session (restart without `data/`, outage longer than 5 minutes) the agent registers again and asks for **the same code**, so the operator keeps using it.

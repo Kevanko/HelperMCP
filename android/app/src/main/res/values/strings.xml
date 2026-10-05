@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HelperMCP</string>
+    <string name="a11y_description">Lets the person who helps you see this screen and tap, swipe and type for you while a help session is running. You see everything it does and can end the session at any time.</string>
+</resources>

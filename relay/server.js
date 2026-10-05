@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import QRCode from 'qrcode';
 import zlib from 'node:zlib';
 import os from 'node:os';
 import { pipeline } from 'node:stream/promises';
@@ -56,6 +57,7 @@ let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used 
 const VIEWER_TTL_MS = 12 * 3600_000;
 // files copied from a remote PC to the operator: unguessable link, kept 24 h
 const CURSOR_DIR = process.env.CURSOR_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'cursor') : path.join(__dirname, 'cursor'));
+const APK_FILE = process.env.APK_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'apk', 'helpermcp.apk') : path.join(here, '..', 'android', 'helpermcp.apk'));   // the Android app, built from android/ (see README)
 const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
 const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
 const FILE_TTL_MS = 24 * 3600_000;
@@ -202,7 +204,7 @@ const tools = [
   { name: 'move', agent: true, description: 'Glide the mouse pointer to (x,y) in screenshot coordinates without clicking (hover, open menus that open on hover).',
     props: { x: num('x'), y: num('y') }, required: ['x', 'y'] },
   { name: 'drag', agent: true, description: 'Drag with the mouse: press at (x,y), glide to (x2,y2) with the button held, release. Coordinates are screenshot pixels.',
-    props: { x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] } }, required: ['x', 'y', 'x2', 'y2'] },
+    props: { x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, hold: { type: 'boolean', description: 'Android: long-press first, then move (drag and drop of icons / list items); without it the drag is a swipe' } }, required: ['x', 'y', 'x2', 'y2'] },
   { name: 'scroll', agent: true, description: 'Scroll the mouse wheel (positive amount = down, negative = up), optionally at (x,y) in screenshot coordinates.',
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
   { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
@@ -211,7 +213,7 @@ const tools = [
     description: 'A short sequence of small GUI steps done as ONE action the friend confirms once (move + click, click + type, drag, scroll, key presses). Prefer this over separate click / move / type_text calls. Coordinates are screenshot pixels. Stops at the first failing step.',
     props: { steps: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: {
       do: { type: 'string', enum: ['move', 'click', 'drag', 'scroll', 'type', 'key', 'wait'], description: 'move | click | drag | scroll | type (text) | key (keys) | wait (ms)' },
-      x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' },
+      x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' }, hold: { type: 'boolean' },
       amount: { type: 'integer' }, text: str('text to type'), keys: str('key combo'), ms: { type: 'integer', description: 'wait milliseconds, up to 5000' } }, required: ['do'] } } },
     required: ['steps'] },
   { name: 'mcp_start', agent: true, ms: (a) => ((a.timeout_s || 240) + 30) * 1000,
@@ -269,7 +271,8 @@ Workflow for any task:
 6. The network may be slow: take screenshots only when needed (monitor=N crops to one screen), avoid huge command output.
 7. The user watches the screen: make your work visible. Do windowing with the mouse (drag a title bar to move a window, drag an edge or corner to resize, click the minimise / maximise / close buttons, click taskbar icons to open or hide an app) instead of keyboard shortcuts or commands when a mouse action exists. When you read or check something, use move to glide the pointer to the text you are reading first (like a person following a line with the cursor). Skip this for background work (files, commands, MCP calls).
 8. Talk to the user while you work. At the start say whether the connection worked (list_sessions, sysinfo) and that the friend can end the session at any time with Esc. Before a group of actions say in one short line what you are going to do, afterwards whether it worked. Bundle small GUI steps (move + click, click + type, drag, scroll) into ONE actions call so the friend confirms once instead of per step. If any call comes back "ended", "denied", "Agent left" or "No such session": stop, do not retry, tell the operator.
-9. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
+9. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
+10. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -369,7 +372,8 @@ function landing(req, res) {
 <p>Someone is going to help you with your computer. Run <b>one</b> line, then tell them the code it shows. Close the window to stop at any time.</p>
 <h3>Windows 10 / 11</h3><p>Open PowerShell (Start, type "powershell") and paste:</p><pre>${esc(ps)}</pre>
 <h3>Ubuntu / Linux</h3><pre>${esc(sh)}</pre>
-<p><small>Nothing is installed. The script is <a href="${esc(b)}/h">readable here</a>.</small></p>`, 'text/html; charset=utf-8');
+${fs.existsSync(APK_FILE) ? `<h3>Android phone</h3><p>Scan with the camera, download the app, allow the install, open it, press <b>1. Allow control</b> (switch HelperMCP on), then <b>2. Start help</b> and tell the code to your helper.</p><p><img alt="QR" width=240 height=240 src="${esc(b)}/qr.svg?u=${encodeURIComponent(b + '/apk')}"><br><a href="${esc(b)}/apk">${esc(b)}/apk</a></p>` : ''}
+<p><small>On Windows and Linux nothing is installed. The script is <a href="${esc(b)}/h">readable here</a>.</small></p>`, 'text/html; charset=utf-8');
 }
 
 function viewerPage(s) {
@@ -419,6 +423,17 @@ async function handler(req, res) {
   const p = url.pathname;
   try {
     if (p === '/health') return text(res, 200, 'ok');
+    if (p === '/apk') {   // the Android app (people scan the QR code on the landing page)
+      if (!fs.existsSync(APK_FILE)) return text(res, 404, 'The Android app is not installed on this server');
+      res.writeHead(200, { 'content-type': 'application/vnd.android.package-archive', 'content-disposition': 'attachment; filename="HelperMCP.apk"', 'cache-control': 'no-cache' });
+      return res.end(fs.readFileSync(APK_FILE));
+    }
+    if (p === '/qr.svg') {   // QR code of one of our own links
+      const u = url.searchParams.get('u') || '';
+      if (!u.startsWith(baseUrl(req) + '/') || u.length > 300) return text(res, 400, 'bad link');
+      res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'max-age=3600' });
+      return res.end(await QRCode.toString(u, { type: 'svg', margin: 1, width: 240 }));
+    }
     if (p === '/h') return script(req, res, 'agent.ps1');
     if (p.startsWith('/cursor/')) {   // optional cursor pack (pointer.cur, link.cur, ...): drop the files into CURSOR_DIR, agents put them on the PC for the session
       const name = p.slice(8), f = path.join(CURSOR_DIR, name);

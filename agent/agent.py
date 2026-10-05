@@ -480,7 +480,10 @@ wins = []
 def make(mon):                       # one overlay window per monitor: every screen the helper can see is marked
     g = mon.get_geometry()
     W, H = g.width - 1, g.height - 1   # NOT exactly screen-sized: mutter would treat a full-screen window as opaque, stop compositing it and show black
-    w = Gtk.Window(type=Gtk.WindowType.POPUP)
+    # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an override-redirect
+    # overlay to its own panel / tray (clock, tray icons, ...), whatever the X input shape says; it does for this window type.
+    w = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    w.set_decorated(False); w.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION); w.set_skip_taskbar_hint(True); w.set_skip_pager_hint(True); w.stick()
     w.set_app_paintable(True)
     vis = w.get_screen().get_rgba_visual()
     if vis: w.set_visual(vis)

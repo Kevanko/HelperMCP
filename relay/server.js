@@ -55,6 +55,7 @@ const viewers = new Map();  // unguessable token -> { code, exp }: lets the oper
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
 // files copied from a remote PC to the operator: unguessable link, kept 24 h
+const CURSOR_DIR = process.env.CURSOR_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'cursor') : path.join(__dirname, 'cursor'));
 const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
 const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
 const FILE_TTL_MS = 24 * 3600_000;
@@ -407,6 +408,11 @@ async function handler(req, res) {
   try {
     if (p === '/health') return text(res, 200, 'ok');
     if (p === '/h') return script(req, res, 'agent.ps1');
+    if (p.startsWith('/cursor/')) {   // optional cursor pack (pointer.cur, link.cur, ...): drop the files into CURSOR_DIR, agents put them on the PC for the session
+      const name = p.slice(8), f = path.join(CURSOR_DIR, name);
+      if (!/^[a-z0-9_-]{1,30}\.(cur|ani)$/.test(name) || !fs.existsSync(f)) { res.writeHead(404); return res.end(); }
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'max-age=3600' }); return res.end(fs.readFileSync(f));
+    }
     if (p === '/p') return script(req, res, 'agent.py');
     if (p === '/') return landing(req, res);
 

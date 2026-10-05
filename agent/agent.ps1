@@ -17,6 +17,7 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 Add-Type -Namespace H -Name U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);
 [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
 '@
@@ -435,6 +436,7 @@ namespace O {
 }
 "@
 [O.Pump]::Start()
+Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadCursorFromFile(string f); [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr h, uint id); [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);'
 $label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 $script:state = 'ok'
@@ -465,7 +467,7 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $img = New-Object Windows.Controls.Image; $img.Stretch = 'None'; $img.HorizontalAlignment = 'Left'; $img.VerticalAlignment = 'Top'
     [void]$g.Children.Add($img)
     $pill = New-Object Windows.Controls.Border
-    $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 14, 6, 18, 6
+    $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 18, 6, 18, 6
     $pill.Margin = New-Object Windows.Thickness 0, 12, 0, 0; $pill.HorizontalAlignment = 'Center'; $pill.VerticalAlignment = 'Top'
     $pill.Background = New-Object Windows.Media.SolidColorBrush (C 15 23 36 224); $pill.BorderThickness = New-Object Windows.Thickness 1.5
     $sp = New-Object Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
@@ -477,6 +479,8 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $m = @{ win = $win; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
     $win.Show(); Click-Through $win; $mons += $m
 }
+function Label-Text { if ($script:state -eq 'lost') { $lostLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
+$script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 function Apply-State {
     $c = Cur; $key = $script:state
     foreach ($m in $mons) {
@@ -487,7 +491,7 @@ function Apply-State {
         }
         $m.img.Source = $m.cache[$key]
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
-        $m.tb.Text = if ($script:state -eq 'lost') { $lostLabel } else { $label }
+        $m.tb.Text = Label-Text
         if ($script:state -eq 'lost') {   # the orange dot pulses while the link is down
             $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
             $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
@@ -504,13 +508,12 @@ $cv = New-Object Windows.Controls.Canvas; $cwin.Content = $cv
 $trailDots = @(); 1..9 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 8; $e.Height = 8; $e.Visibility = 'Collapsed'; [void]$cv.Children.Add($e); $trailDots += $e }
 $ring = New-Object Windows.Shapes.Ellipse; $ring.Width = 46; $ring.Height = 46; $ring.StrokeThickness = 2.4; $ring.Visibility = 'Collapsed'
 [Windows.Controls.Canvas]::SetLeft($ring, $HX - 23); [Windows.Controls.Canvas]::SetTop($ring, $HY - 23); [void]$cv.Children.Add($ring)
-$arrow = New-Object Windows.Shapes.Polygon
-$pts = New-Object Windows.Media.PointCollection
-foreach ($q in @(@(0, 0), @(0, 23), @(5.2, 18.2), @(8.8, 26.5), @(12.3, 25), @(8.7, 16.8), @(15.6, 16.8))) { $pts.Add((New-Object Windows.Point ($q[0] * 1.4), ($q[1] * 1.4))) }
-$arrow.Points = $pts; $arrow.Fill = [Windows.Media.Brushes]::White; $arrow.Stroke = Brush (C 13 26 46 242); $arrow.StrokeThickness = 1.7; $arrow.StrokeLineJoin = 'Round'
-$arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrow.RenderTransform = $arrowScale; $arrow.RenderTransformOrigin = New-Object Windows.Point 0, 0
-$glow = New-Object Windows.Media.Effects.DropShadowEffect; $glow.ShadowDepth = 0; $glow.BlurRadius = 16; $glow.Opacity = 0.9; $arrow.Effect = $glow
-[Windows.Controls.Canvas]::SetLeft($arrow, $HX); [Windows.Controls.Canvas]::SetTop($arrow, $HY); [void]$cv.Children.Add($arrow)
+# soft light around the (real, replaced) pointer, like Codex; it squeezes a little on a click
+$arrow = New-Object Windows.Shapes.Ellipse; $arrow.Width = 92; $arrow.Height = 92; $arrow.IsHitTestVisible = $false
+$haloBrush = New-Object Windows.Media.RadialGradientBrush; $haloStops = @(); foreach ($o in @(0.0, 0.5, 1.0)) { $gs = New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(0, 76, 141, 255)), $o; [void]$haloBrush.GradientStops.Add($gs); $haloStops += $gs }
+$arrow.Fill = $haloBrush
+$arrowScale = New-Object Windows.Media.ScaleTransform 1, 1; $arrow.RenderTransform = $arrowScale; $arrow.RenderTransformOrigin = New-Object Windows.Point 0.5, 0.5
+[Windows.Controls.Canvas]::SetLeft($arrow, $HX - 40); [Windows.Controls.Canvas]::SetTop($arrow, $HY - 38); [void]$cv.Children.Add($arrow)
 $typeDots = @(); 0..2 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e.Width = 6.4; $e.Height = 6.4; $e.Visibility = 'Collapsed'
     [Windows.Controls.Canvas]::SetLeft($e, $HX + 27 + $_ * 9); [Windows.Controls.Canvas]::SetTop($e, $HY + 37); [void]$cv.Children.Add($e); $typeDots += $e }
 $chev = @(); 0..2 | ForEach-Object { $l = New-Object Windows.Shapes.Polyline; $l.StrokeThickness = 3; $l.StrokeStartLineCap = 'Round'; $l.StrokeEndLineCap = 'Round'; $l.StrokeLineJoin = 'Round'
@@ -525,6 +528,43 @@ $rings = @(); 0..1 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e
 $rdot = New-Object Windows.Shapes.Ellipse; $rdot.Fill = [Windows.Media.Brushes]::White; $rdot.Visibility = 'Collapsed'; [void]$rc.Children.Add($rdot)
 function Place($e, $cx, $cy, $r) { $e.Width = 2 * $r; $e.Height = 2 * $r; [Windows.Controls.Canvas]::SetLeft($e, $cx - $r); [Windows.Controls.Canvas]::SetTop($e, $cy - $r) }
 
+# The REAL pointer is replaced for the whole session: the operator's cursor pack (CURSOR_DIR on the relay) or a soft rounded arrow. Restored when the overlay ends
+# (the agent restores it too, and Windows restores it at the next sign-in whatever happens).
+function Make-SoftCur($file) {
+    $S = 44; $bmp = New-Object Drawing.Bitmap $S, $S, ([Drawing.Imaging.PixelFormat]::Format32bppArgb); $g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'
+    $pts = foreach ($q in @(@(0, 0), @(0, 23), @(5.2, 18.2), @(8.8, 26.5), @(12.3, 25), @(8.7, 16.8), @(15.6, 16.8))) { New-Object Drawing.PointF ((5 + 1.2 * $q[0]) * 1.1), ((4 + 1.2 * $q[1]) * 1.1) }
+    $path = New-Object Drawing.Drawing2D.GraphicsPath; $path.AddPolygon([Drawing.PointF[]]$pts)
+    $g.TranslateTransform(1.1, 2.2)
+    foreach ($sh in @(@(6.6, 15), @(4.4, 23), @(2.6, 36))) { $pen = New-Object Drawing.Pen ([Drawing.Color]::FromArgb($sh[1], 5, 13, 38)), $sh[0]; $pen.LineJoin = 'Round'; $g.DrawPath($pen, $path) }
+    $g.ResetTransform()
+    $pw = New-Object Drawing.Pen ([Drawing.Color]::White), 2.8; $pw.LineJoin = 'Round'; $g.DrawPath($pw, $path)
+    $br = New-Object Drawing.Drawing2D.LinearGradientBrush -ArgumentList @((New-Object Drawing.PointF 0, 4), (New-Object Drawing.PointF 0, 38), [Drawing.Color]::White, [Drawing.Color]::FromArgb(209, 227, 255)); $g.FillPath($br, $path)
+    $po = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(166, 76, 141, 255)), 1.1; $po.LineJoin = 'Round'; $g.DrawPath($po, $path); $g.Dispose()
+    $bd = $bmp.LockBits((New-Object Drawing.Rectangle 0, 0, $S, $S), 'ReadOnly', 'Format32bppArgb'); $raw = New-Object byte[] ($S * $S * 4); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $raw, 0, $raw.Length); $bmp.UnlockBits($bd)
+    $ms = New-Object IO.MemoryStream; $w = New-Object IO.BinaryWriter $ms; $mask = (($S + 31) -shr 5) * 4 * $S; $size = 40 + $S * $S * 4 + $mask
+    $w.Write([uint16]0); $w.Write([uint16]2); $w.Write([uint16]1); $w.Write([byte]$S); $w.Write([byte]$S); $w.Write([byte]0); $w.Write([byte]0); $w.Write([uint16]5); $w.Write([uint16]4); $w.Write([uint32]$size); $w.Write([uint32]22)
+    $w.Write([uint32]40); $w.Write([int32]$S); $w.Write([int32](2 * $S)); $w.Write([uint16]1); $w.Write([uint16]32); $w.Write([uint32]0); $w.Write([uint32]($S * $S * 4)); $w.Write([int32]0); $w.Write([int32]0); $w.Write([uint32]0); $w.Write([uint32]0)
+    for ($y = $S - 1; $y -ge 0; $y--) { $w.Write($raw, $y * $S * 4, $S * 4) }
+    $w.Write((New-Object byte[] $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
+}
+$CurIds = @{ pointer = 32512; beam = 32513; busy = 32514; precision = 32515; alternate = 32516; dgn1 = 32642; dgn2 = 32643; horz = 32644; vert = 32645; move = 32646; unavailable = 32648; link = 32649; working = 32650; help = 32651 }
+function Restore-Cursors { [void][O.C]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) }
+function Apply-Cursors {
+    try {
+        $dir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item $dir -ItemType Directory -Force)
+        $t0 = [Diagnostics.Stopwatch]::StartNew(); $got = @{}
+        if ($env:HM_RELAY) {
+            foreach ($k in @($CurIds.Keys)) {
+                if ($t0.Elapsed.TotalSeconds -gt 8) { break }
+                $ext = if ($k -eq 'busy' -or $k -eq 'working') { 'ani' } else { 'cur' }
+                try { $rq = [Net.WebRequest]::Create("$($env:HM_RELAY)/cursor/$k.$ext"); $rq.Timeout = 3000; $rs = $rq.GetResponse(); $f = Join-Path $dir "$k.$ext"; $fs = [IO.File]::Create($f); $rs.GetResponseStream().CopyTo($fs); $fs.Close(); $rs.Close(); $got[$k] = $f } catch { }
+            }
+        }
+        if (-not $got.ContainsKey('pointer')) { $f = Join-Path $dir 'pointer.cur'; Make-SoftCur $f; $got['pointer'] = $f }
+        foreach ($k in @($got.Keys)) { $h = [O.C]::LoadCursorFromFile($got[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } }
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    } catch { Restore-Cursors }
+}
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
 $script:scrollDir = 0; $script:scrollT = -99.0; $script:typingT = -99.0; $script:rip = $null; $script:cursorShown = $false; $script:ripShown = $false
@@ -551,6 +591,8 @@ $timer.Add_Tick({
     $line = $null
     while ([O.Pump]::Q.TryDequeue([ref]$line)) { On-Line $line }
     if ([O.Pump]::Eof) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown(); return }
+    $sec = [int]$script:clockT.Elapsed.TotalSeconds
+    if ($sec -ne $script:lastSec) { $script:lastSec = $sec; $t = Label-Text; foreach ($m in $mons) { $m.tb.Text = $t } }   # the session clock in the label
     $now = $clock.Elapsed.TotalSeconds; $p = [Windows.Forms.Cursor]::Position; $c = Cur
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
     $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
@@ -560,7 +602,7 @@ $timer.Add_Tick({
     else {
         if (-not $script:cursorShown) { $cwin.Show(); $script:cursorShown = $true }
         $cwin.Left = $p.X / $dpi - $HX; $cwin.Top = $p.Y / $dpi - $HY; $cwin.Opacity = [Math]::Min(1.0, $script:opacity)
-        $glow.Color = $c; $br = Brush $c
+        $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
         $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
         $arrowScale.ScaleX = $s; $arrowScale.ScaleY = $s
@@ -602,6 +644,9 @@ $timer.Add_Tick({
     } elseif ($script:ripShown) { $rwin.Hide(); $script:ripShown = $false }
 })
 $timer.Start()
+$once = New-Object Windows.Threading.DispatcherTimer; $once.Interval = [TimeSpan]::FromMilliseconds(400)
+$once.Add_Tick({ $once.Stop(); Apply-Cursors })   # after the glow is on screen (downloading the pack can take a moment)
+$once.Start()
 $wd = New-Object Windows.Threading.DispatcherTimer
 $wd.Interval = [TimeSpan]::FromSeconds(1.5)
 $wd.Add_Tick({
@@ -610,6 +655,7 @@ $wd.Add_Tick({
 })
 $wd.Start()
 [Windows.Threading.Dispatcher]::Run()
+Restore-Cursors
 '@
 function Start-Overlay {
     if ($env:HELPER_NO_OVERLAY) { return }
@@ -620,7 +666,7 @@ function Start-Overlay {
         [IO.File]::WriteAllText($file, $OverlayScript, (New-Object Text.UTF8Encoding $true)); $script:TmpDirs += $file
         $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $file + '"'
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
-        $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
+        $psi.EnvironmentVariables['HM_RELAY'] = $RELAY; $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
         $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
         $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
@@ -629,7 +675,8 @@ function Start-Overlay {
 
 function Cleanup-Children {
     foreach ($c in $Children.Values) { Stop-Tree $c.p }
-    if ($script:OverlayProc) { try { $script:OverlayProc.Kill() } catch { } }
+    if ($script:OverlayProc) { try { $script:OverlayIn.Close(); if (-not $script:OverlayProc.WaitForExit(3000)) { $script:OverlayProc.Kill() } } catch { try { $script:OverlayProc.Kill() } catch { } } }
+    try { [void][H.U]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 

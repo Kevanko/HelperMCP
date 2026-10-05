@@ -580,16 +580,19 @@ def make_monitor(mon):
     # (work area smaller than the monitor) an override-redirect strip repeats the same glow right over the panel, so the light runs
     # along the whole monitor. Shell does not let clicks through such a window, so the strip hides while the pointer is on it
     # (see tick): the panel stays clickable, the glow only blinks out where the mouse actually is.
-    wa = mon.get_workarea(); sides = []
-    if wa.y > g.y: sides.append((0, 0, W, min(S_DEPTH, wa.y - g.y + 6)))
-    if wa.y + wa.height < g.y + g.height - 1: d = g.y + g.height - (wa.y + wa.height) + 6; d = min(S_DEPTH, d); sides.append((0, H - d, W, d))
-    if wa.x > g.x: sides.append((0, 0, min(S_DEPTH, wa.x - g.x + 6), H))
-    if wa.x + wa.width < g.x + g.width - 1: d = min(S_DEPTH, g.x + g.width - (wa.x + wa.width) + 6); sides.append((W - d, 0, d, H))
-    for (sx, sy, sw, sh) in sides:
+    wa = mon.get_workarea(); sides = []; D = 26      # only the brightest outer part of the glow goes over the panel; its inner edge fades out
+    if wa.y > g.y: sides.append((0, 0, W, D, (0, D, 0, 0)))
+    if wa.y + wa.height < g.y + g.height - 1: sides.append((0, H - D, W, D, (0, 0, 0, D)))
+    if wa.x > g.x: sides.append((0, 0, D, H, (D, 0, 0, 0)))
+    if wa.x + wa.width < g.x + g.width - 1: sides.append((W - D, 0, D, H, (0, 0, D, 0)))
+    for (sx, sy, sw, sh, gr) in sides:
         sw_ = Gtk.Window(type=Gtk.WindowType.POPUP); sw_.set_app_paintable(True); sw_.set_visual(scr.get_rgba_visual())
         sw_.set_default_size(sw, sh); sw_.move(g.x + sx, g.y + sy); sw_.set_keep_above(True); sw_.set_accept_focus(False)
-        def sdraw(_, cr, sx=sx, sy=sy):
-            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), -sx, -sy); cr.paint()
+        def sdraw(_, cr, sx=sx, sy=sy, gr=gr):
+            cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER); cr.set_source_surface(surf(), -sx, -sy)
+            fade = cairo.LinearGradient(*gr); fade.add_color_stop_rgba(0, 0, 0, 0, 0); fade.add_color_stop_rgba(0.3, 0, 0, 0, 1); fade.add_color_stop_rgba(1, 0, 0, 0, 1)
+            cr.mask(fade)
         sw_.connect("draw", sdraw); sw_.show_all(); click_through(sw_); glows.append(sw_)
         strips.append([sw_, (g.x + sx - 6, g.y + sy - 6, sw + 12, sh + 12), True])
     # the label is its own small window: it pulses without repainting the full-screen glow
@@ -598,13 +601,14 @@ def make_monitor(mon):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
         r_, g_, b_ = col(); lost = state == "lost"; text = lost_label if lost else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
-        ph, rr = 34, 17; x0, y0 = (PILL_W - (PILL_W - 4)) / 2, 1
-        w_ = PILL_W - 4
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
+        ext = cr.text_extents(text); ph, rr, pad = 34, 17, 18
+        w_ = pad + 10 + 9 + ext.x_advance + pad; x0, y0 = (PILL_W - w_) / 2, 1          # the pill hugs its content and sits in the middle of the window
         cr.new_sub_path(); cr.arc(x0 + w_ - rr, y0 + rr, rr, -math.pi / 2, math.pi / 2); cr.arc(x0 + rr, y0 + rr, rr, math.pi / 2, 3 * math.pi / 2); cr.close_path()
         cr.set_source_rgba(0.06, 0.09, 0.14, 0.9); cr.fill_preserve(); cr.set_source_rgba(r_, g_, b_, 0.95); cr.set_line_width(1.5); cr.stroke()
-        cr.arc(x0 + 20, y0 + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, pulse); cr.fill()
-        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
-        cr.set_source_rgba(1, 1, 1, 1); cr.move_to(x0 + 34, y0 + ph / 2 + 5); cr.show_text(text)
+        cr.arc(x0 + pad + 5, y0 + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, pulse); cr.fill()
+        fe = cr.font_extents()
+        cr.set_source_rgba(1, 1, 1, 1); cr.move_to(x0 + pad + 19, y0 + ph / 2 + (fe[0] - fe[1]) / 2 - 0.5); cr.show_text(text)
     pw.connect("draw", pdraw); pw.show_all(); click_through(pw); pills.append(pw)
 
 for i in range(disp.get_n_monitors()): make_monitor(disp.get_monitor(i))
@@ -624,23 +628,119 @@ def pointer():
     _, x, y = disp.get_default_seat().get_pointer().get_position()
     return x, y
 
-try:   # hide the real pointer while the big one is shown (a second client's XFixesHideCursor lasts until it shows it again or exits)
-    import ctypes
-    _xl = ctypes.CDLL("libX11.so.6"); _xf = ctypes.CDLL("libXfixes.so.3")
-    _xl.XOpenDisplay.restype = ctypes.c_void_p; _xl.XDefaultRootWindow.restype = ctypes.c_ulong; _xl.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
-    _xd = _xl.XOpenDisplay(None); _xroot = _xl.XDefaultRootWindow(_xd)
-    _xf.XFixesHideCursor.argtypes = _xf.XFixesShowCursor.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
-except Exception: _xd = None
-sys_hidden = [False]
-def sys_cursor(hide):
-    if _xd and hide != sys_hidden[0]:
-        try: (_xf.XFixesHideCursor if hide else _xf.XFixesShowCursor)(_xd, _xroot); _xl.XFlush(ctypes.c_void_p(_xd))
-        except Exception: pass
-        sys_hidden[0] = hide
+# ---- the REAL pointer is replaced for the whole session (every app, the panel too): the operator's cursor pack (CURSOR_DIR on the relay) or a soft rounded arrow
+ARROW = [(0, 0), (0, 23), (5.2, 18.2), (8.8, 26.5), (12.3, 25), (8.7, 16.8), (15.6, 16.8)]
+SYS = False
+def soft_arrow(size=44):
+    """(w, h, hotx, hoty, premultiplied ARGB bytes) of a soft rounded arrow with a light shadow"""
+    sf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size); c = cairo.Context(sf); k = size / 40.0
+    c.scale(k, k); c.translate(5, 4); c.scale(1.2, 1.2)
+    c.move_to(*ARROW[0])
+    for q in ARROW[1:]: c.line_to(*q)
+    c.close_path(); c.set_line_join(cairo.LINE_JOIN_ROUND); path = c.copy_path()
+    c.save(); c.translate(1, 2)
+    for lw, a in ((6, 0.06), (4, 0.09), (2.4, 0.14)): c.new_path(); c.append_path(path); c.set_source_rgba(0.02, 0.05, 0.15, a); c.set_line_width(lw); c.stroke()
+    c.restore()
+    c.new_path(); c.append_path(path); c.set_source_rgb(1, 1, 1); c.set_line_width(2.4); c.stroke_preserve()
+    g = cairo.LinearGradient(0, 0, 0, 27); g.add_color_stop_rgb(0, 1, 1, 1); g.add_color_stop_rgb(1, 0.82, 0.89, 1)
+    c.set_source(g); c.fill_preserve(); c.set_source_rgba(0.3, 0.55, 1, 0.65); c.set_line_width(0.9); c.stroke()
+    return size, size, int(5 * k), int(4 * k), bytes(sf.get_data())
+
+def parse_cur(data):
+    """largest image of a Windows .cur (32-bit BMP or PNG) -> (w, h, hotx, hoty, premultiplied ARGB bytes)"""
+    import struct
+    n = struct.unpack_from("<H", data, 4)[0]; best = None
+    for i in range(n):
+        w, h, _, _, hx, hy, sz, off = struct.unpack_from("<BBBBHHII", data, 6 + 16 * i)
+        w, h = w or 256, h or 256
+        if not best or (w <= 48 < best[0]) or (best[0] <= 48 and best[0] < w <= 48): best = (w, h, hx, hy, sz, off)
+    w, h, hx, hy, sz, off = best; img = data[off:off + sz]; out = bytearray(w * h * 4)
+    if img[:4] == b"\x89PNG":
+        from gi.repository import GdkPixbuf
+        ld = GdkPixbuf.PixbufLoader(); ld.write(img); ld.close(); pb = ld.get_pixbuf().add_alpha(False, 0, 0, 0)
+        w, h, rs = pb.get_width(), pb.get_height(), pb.get_rowstride(); px = pb.get_pixels(); out = bytearray(w * h * 4)
+        for y in range(h):
+            for x in range(w):
+                r, g, b, a = px[y * rs + x * 4: y * rs + x * 4 + 4]; o = (y * w + x) * 4
+                out[o:o + 4] = bytes((b * a // 255, g * a // 255, r * a // 255, a))
+        return w, h, hx, hy, bytes(out)
+    hs, bw, bh, _, bpp, _c, _s, _x1, _y1, ncol = struct.unpack_from("<IiiHHIIiiI", img, 0)
+    w, h = bw, abs(bh) // 2
+    if bpp <= 8: ncol = ncol or (1 << bpp); pal = [img[hs + 4 * i: hs + 4 * i + 3] for i in range(ncol)]; hs += 4 * ncol
+    rowb = ((w * bpp + 31) // 32) * 4; maskrow = ((w + 31) // 32) * 4; mask0 = hs + rowb * h; out = bytearray(w * h * 4)
+    for y in range(h):
+        row = hs + (h - 1 - y) * rowb
+        for x in range(w):
+            if bpp == 32: b, g, r, a = img[row + 4 * x: row + 4 * x + 4]
+            else:
+                if bpp == 24: b, g, r = img[row + 3 * x: row + 3 * x + 3]
+                else:
+                    bit = x * bpp; idx = (img[row + bit // 8] >> (8 - bpp - bit % 8)) & ((1 << bpp) - 1); b, g, r = pal[idx]
+                a = 0 if (img[mask0 + (h - 1 - y) * maskrow + x // 8] >> (7 - x % 8)) & 1 else 255
+            o = (y * w + x) * 4; out[o:o + 4] = bytes((b * a // 255, g * a // 255, r * a // 255, a))
+    return w, h, hx, hy, bytes(out)
+
+# The session theme: an Xcursor theme is written to ~/.icons and selected through gsettings, so every app (and the panel) shows
+# it, and it is put back when the overlay ends (or at the next start if the PC was killed in between). XFixesChangeCursorByName was tried first:
+# it replaces server-side cursors for good and cannot be undone.
+import json, subprocess as sp, shutil, signal
+THEME = "helpermcp-remote"; THEME_DIR = os.path.expanduser("~/.icons/" + THEME); RESTORE = os.path.expanduser("~/.cache/helpermcp-cursor.json")
+GS = ["gsettings", "get", "org.gnome.desktop.interface", "cursor-theme"]
+def gs(*a):
+    r = sp.run(["gsettings"] + list(a), capture_output=True, text=True, timeout=8); return r.stdout.strip().strip("'")
+def restore_theme():
+    try:
+        old = json.load(open(RESTORE))["old"]
+        gs("set", "org.gnome.desktop.interface", "cursor-theme", old); os.remove(RESTORE)
+    except Exception: pass
+    shutil.rmtree(THEME_DIR, ignore_errors=True)
+
+def xcursor_bytes(img):
+    import struct
+    w, h, hx, hy, data = img
+    chunk = struct.pack("<IIIIIIIII", 36, 0xfffd0002, w, 1, w, h, hx, hy, 0) + data
+    return b"Xcur" + struct.pack("<III", 16, 0x10000, 1) + struct.pack("<III", 0xfffd0002, w, 28) + chunk
+
+NAMES = {"pointer": ["left_ptr", "default", "arrow", "top_left_arrow"], "link": ["hand2", "hand1", "pointer", "pointing_hand"], "beam": ["xterm", "text", "ibeam"],
+         "help": ["question_arrow", "help"], "precision": ["crosshair", "cross"], "unavailable": ["not-allowed", "crossed_circle", "forbidden"],
+         "vert": ["sb_v_double_arrow", "ns-resize", "size_ver"], "horz": ["sb_h_double_arrow", "ew-resize", "size_hor"], "move": ["fleur", "move"],
+         "dgn1": ["nwse-resize", "size_fdiag"], "dgn2": ["nesw-resize", "size_bdiag"]}
+
+def apply_theme():
+    """pack from the relay (optional) or the soft arrow, as the cursor theme for the whole session; returns True when it is active"""
+    try:
+        restore_theme()                                   # leftovers of a killed run
+        got = {}; relay = os.environ.get("HM_RELAY", ""); t0 = time.monotonic()
+        if relay:
+            import urllib.request
+            for key in NAMES:
+                if time.monotonic() - t0 > 6: break
+                try:
+                    with urllib.request.urlopen(relay + "/cursor/%s.cur" % key, timeout=3) as r: got[key] = parse_cur(r.read())
+                except Exception: pass
+        if "pointer" not in got: got["pointer"] = soft_arrow()
+        old = gs("get", "org.gnome.desktop.interface", "cursor-theme") or "Adwaita"
+        os.makedirs(THEME_DIR + "/cursors", exist_ok=True); os.makedirs(os.path.dirname(RESTORE), exist_ok=True)
+        json.dump({"old": old}, open(RESTORE, "w"))
+        open(THEME_DIR + "/index.theme", "w").write("[Icon Theme]\nName=HelperMCP remote\nInherits=%s\n" % old)
+        for key, img in got.items():
+            for nm in NAMES[key]: open(THEME_DIR + "/cursors/" + nm, "wb").write(xcursor_bytes(img))
+        gs("set", "org.gnome.desktop.interface", "cursor-theme", THEME); return True
+    except Exception as e:
+        print("[overlay] cursor theme:", repr(e), file=sys.stderr); restore_theme(); return False
+
+def theme_done():
+    global SYS
+    SYS = THEME_RESULT[0]; return False
+THEME_RESULT = [False]
+def theme_worker():
+    THEME_RESULT[0] = apply_theme(); GLib.idle_add(theme_done)
+import threading
+threading.Thread(target=theme_worker, daemon=True).start()
+GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, lambda: (Gtk.main_quit(), False)[1])
 
 def ease_out(p): return 1 - (1 - p) ** 3
 
-ARROW = [(0, 0), (0, 23), (5.2, 18.2), (8.8, 26.5), (12.3, 25), (8.7, 16.8), (15.6, 16.8)]
 
 def draw_cursor(_, cr):
     cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER)
@@ -659,23 +759,24 @@ def draw_cursor(_, cr):
         cr.arc(HX, HY, rr, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, 0.18); cr.fill_preserve()
         cr.set_source_rgba(r_, g_, b_, 0.85); cr.set_line_width(2.4); cr.stroke()
     halo = cairo.RadialGradient(HX + 6, HY + 8, 2, HX + 6, HY + 8, 46)   # soft light around the pointer, like Codex
-    halo.add_color_stop_rgba(0, r_, g_, b_, 0.42); halo.add_color_stop_rgba(0.5, r_, g_, b_, 0.16); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
+    halo.add_color_stop_rgba(0, r_, g_, b_, 0.5); halo.add_color_stop_rgba(0.5, r_, g_, b_, 0.16); halo.add_color_stop_rgba(1, r_, g_, b_, 0)
     cr.set_source(halo); cr.arc(HX + 6, HY + 8, 46, 0, 2 * math.pi); cr.fill()
-    cr.save(); cr.translate(HX, HY); cr.scale(s, s)
-    cr.move_to(*ARROW[0])
-    for p in ARROW[1:]: cr.line_to(*p)
-    cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
-    path = cr.copy_path()
-    cr.save(); cr.translate(1.5, 3)                        # soft drop shadow
-    for lw, a in ((11, 0.05), (8, 0.07), (5, 0.10)):
-        cr.new_path(); cr.append_path(path); cr.set_source_rgba(0.02, 0.05, 0.15, a); cr.set_line_width(lw); cr.stroke()
-    cr.restore()
-    for lw, a in ((10, 0.10), (7, 0.16), (4.5, 0.26)):      # coloured glow
-        cr.new_path(); cr.append_path(path); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.stroke()
-    cr.new_path(); cr.append_path(path); cr.set_line_width(3.2); cr.set_source_rgba(1, 1, 1, 1); cr.stroke_preserve()   # rounded corners
-    grad = cairo.LinearGradient(0, 0, 0, 27); grad.add_color_stop_rgb(0, 1, 1, 1); grad.add_color_stop_rgb(1, 0.82, 0.89, 1)
-    cr.set_source(grad); cr.fill_preserve()
-    cr.set_source_rgba(r_, g_, b_, 0.55); cr.set_line_width(1.1); cr.stroke(); cr.restore()
+    if not SYS:   # the real pointer is already replaced: no second arrow
+        cr.save(); cr.translate(HX, HY); cr.scale(s, s)
+        cr.move_to(*ARROW[0])
+        for p in ARROW[1:]: cr.line_to(*p)
+        cr.close_path(); cr.set_line_join(cairo.LINE_JOIN_ROUND); cr.set_line_cap(cairo.LINE_CAP_ROUND)
+        path = cr.copy_path()
+        cr.save(); cr.translate(1.5, 3)                        # soft drop shadow
+        for lw, a in ((11, 0.05), (8, 0.07), (5, 0.10)):
+            cr.new_path(); cr.append_path(path); cr.set_source_rgba(0.02, 0.05, 0.15, a); cr.set_line_width(lw); cr.stroke()
+        cr.restore()
+        for lw, a in ((10, 0.10), (7, 0.16), (4.5, 0.26)):      # coloured glow
+            cr.new_path(); cr.append_path(path); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(lw); cr.stroke()
+        cr.new_path(); cr.append_path(path); cr.set_line_width(3.2); cr.set_source_rgba(1, 1, 1, 1); cr.stroke_preserve()   # rounded corners
+        grad = cairo.LinearGradient(0, 0, 0, 27); grad.add_color_stop_rgb(0, 1, 1, 1); grad.add_color_stop_rgb(1, 0.82, 0.89, 1)
+        cr.set_source(grad); cr.fill_preserve()
+        cr.set_source_rgba(r_, g_, b_, 0.55); cr.set_line_width(1.1); cr.stroke(); cr.restore()
     sa = now - scroll_t
     if scroll_dir and 0 <= sa < 0.7:                      # scrolling: chevrons travel in the scroll direction
         for k in range(3):
@@ -718,9 +819,9 @@ def tick():
     if not trail or (trail[-1][1], trail[-1][2]) != (px, py): trail.append((now, px, py))
     target = 1.0 if (now - last_active < 8.0 or dragging) else 0.0
     opacity += (target - opacity) * 0.22
-    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor"); sys_cursor(False)
+    if opacity < 0.03 and target == 0.0: hide(cursor, "cursor")
     else:
-        sys_cursor(opacity > 0.5); show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
+        show(cursor, "cursor"); cursor.move(px - HX, py - HY); cursor.get_window().raise_(); cursor.queue_draw()
     for st in strips:   # over-the-panel glow strips: out of the way while the pointer is on them
         x, y, w_, h_ = st[1]; inside = x <= px < x + w_ and y <= py < y + h_
         if inside and st[2]: st[0].hide(); st[2] = False
@@ -777,6 +878,7 @@ GLib.timeout_add(120, lambda: ([w.queue_draw() for w in pills] if state == "lost
 GLib.timeout_add(1500, watchdog)
 GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()
+restore_theme()
 '''
 
 
@@ -793,15 +895,17 @@ def overlay_start():
     if os.environ.get("HELPER_NO_OVERLAY") or not GUI["type"]: return
     try:
         OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost")],
-                                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, HM_RELAY=RELAY))
     except Exception: pass
 
 
 def cleanup():
     for c in CHILDREN.values(): c.kill()
     if OVERLAY_PROC:
-        try: OVERLAY_PROC.kill()
-        except Exception: pass
+        try: OVERLAY_PROC.terminate(); OVERLAY_PROC.wait(3)   # lets it put the cursor theme back
+        except Exception:
+            try: OVERLAY_PROC.kill()
+            except Exception: pass
     for p in TMP: shutil.rmtree(p, ignore_errors=True)
 
 

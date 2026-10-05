@@ -47,7 +47,9 @@ class HelperService : AccessibilityService() {
     private var askMode = true
     private var wake: PowerManager.WakeLock? = null
 
-    override fun onServiceConnected() { inst = this; fx = Fx(this); phase = if (running) phase else "ready" }
+    override fun onServiceConnected() {
+        Crash.install(this)
+        inst = this; fx = Fx(this); phase = if (running) phase else "ready" }
     override fun onAccessibilityEvent(e: AccessibilityEvent?) { }
     override fun onInterrupt() { }
     override fun onDestroy() { endSession(); inst = null; phase = "off"; super.onDestroy() }

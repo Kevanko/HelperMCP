@@ -63,6 +63,7 @@ class MainActivity : Activity() {
         askSwitch = Switch(this).apply { text = t("Спрашивать подтверждение каждого действия", "Ask before every action"); setTextColor(Color.WHITE); isChecked = prefs.getBoolean("ask", true); setPadding(0, dp(18), 0, 0) }; col.addView(askSwitch)
         col.addView(TextView(this).apply { text = t("Сервер", "Server"); setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(16), 0, 0) })
         relay = EditText(this).apply { setText(prefs.getString("relay", BuildConfig.RELAY)); setTextColor(Color.WHITE); inputType = InputType.TYPE_TEXT_VARIATION_URI; textSize = 14f }; col.addView(relay)
+        Crash.install(this)
         versionLine = TextView(this).apply { setTextColor(0xFF6B7A94.toInt()); textSize = 12f; setPadding(0, dp(18), 0, 0) }; col.addView(versionLine)
         setContentView(ScrollView(this).apply { setBackgroundColor(0xFF0F1724.toInt()); addView(col) })
     }
@@ -94,12 +95,13 @@ class MainActivity : Activity() {
         val code = HelperService.code
         codeView.visibility = if (code != null && HelperService.running) View.VISIBLE else View.GONE
         codeView.text = code ?: ""
-        hint.text = if (code != null && HelperService.running) t("Код скопирован в буфер. Чтобы закончить, нажмите на плашку «✕» сверху экрана или кнопку ниже.", "The code is copied. To stop, tap the “✕” label at the top of the screen or the button below.") else ""
+        hint.text = if (code != null && HelperService.running) t("Код скопирован в буфер. Чтобы закончить, удерживайте плашку «✕» сверху экрана или нажмите кнопку ниже.", "The code is copied. To stop, hold the “✕” label at the top of the screen or tap the button below.") else ""
         allow.visibility = if (on) View.GONE else View.VISIBLE
         allowViews.forEach { it.visibility = if (on) View.GONE else View.VISIBLE }
         start.text = if (HelperService.running) t("Завершить помощь", "End help") else t("2. Начать помощь", "2. Start help")
         if (System.currentTimeMillis() % 20000 < 600) Update.check(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY })
         versionLine.text = "v" + BuildConfig.VERSION_NAME + (if (up != null) "  →  " + up.optString("versionName") else if (Update.checked == "ok") t("  (последняя версия)", "  (up to date)") else if (Update.checked.isNotEmpty()) "  (" + Update.checked + ")" else "")
+        Crash.last(this)?.let { versionLine.text = versionLine.text.toString() + "\n\n" + t("Последний сбой:", "Last crash:") + "\n" + it }
         h.postDelayed({ tick() }, 500)
     }
 }

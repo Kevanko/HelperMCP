@@ -149,7 +149,7 @@ class Fx(private val svc: AccessibilityService) {
             .apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES })
         val p = TextView(svc).apply {
             setTextColor(Color.WHITE); textSize = 14f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
-            setPadding(dp(18 + 22), dp(8 + 22), dp(18 + 22), dp(8 + 22)); setOnClickListener { onEnd?.invoke() }
+            setPadding(dp(18 + 22), dp(8 + 22), dp(18 + 22), dp(8 + 22)); setOnLongClickListener { onEnd?.invoke(); true }   // long press only: an injected tap that lands here must not end the session
         }
         pill = p
         wm.addView(p, WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -290,11 +290,19 @@ class Fx(private val svc: AccessibilityService) {
 class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
     var col = BLUE; var busy = false; var pulse = 0f; var r = 40f; var stroke = 4f
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var halo: android.graphics.Bitmap? = null; private var haloKey = ""
     override fun draw(c: Canvas) {
         val m = margin.toFloat(); val rect = android.graphics.RectF(bounds.left + m, bounds.top + m, bounds.right - m, bounds.bottom - m)
-        if (busy) for ((blur, a) in listOf(m to 0.45f + 0.45f * pulse, m * 0.5f to 0.65f + 0.35f * pulse)) {
-            p.reset(); p.isAntiAlias = true; p.style = Paint.Style.FILL; p.color = (col and 0x00FFFFFF) or ((a.coerceIn(0f, 1f) * 255).toInt() shl 24)
-            p.maskFilter = android.graphics.BlurMaskFilter(blur, android.graphics.BlurMaskFilter.Blur.NORMAL); c.drawRoundRect(rect, r, r, p)
+        if (busy && bounds.width() > 0) {
+            val key = "$col ${bounds.width()} ${bounds.height()} $r"
+            if (halo == null || haloKey != key) {   // the blur is made once; only its opacity breathes (cheap enough for a busy phone)
+                val bmp = android.graphics.Bitmap.createBitmap(bounds.width(), bounds.height(), android.graphics.Bitmap.Config.ARGB_8888); val bc = Canvas(bmp)
+                val rr = android.graphics.RectF(m, m, bounds.width() - m, bounds.height() - m); val q = Paint(Paint.ANTI_ALIAS_FLAG); q.color = col
+                q.maskFilter = android.graphics.BlurMaskFilter(m, android.graphics.BlurMaskFilter.Blur.NORMAL); bc.drawRoundRect(rr, r, r, q)
+                q.maskFilter = android.graphics.BlurMaskFilter(m * 0.5f, android.graphics.BlurMaskFilter.Blur.NORMAL); bc.drawRoundRect(rr, r, r, q)
+                halo?.recycle(); halo = bmp; haloKey = key
+            }
+            p.reset(); p.alpha = ((0.45f + 0.55f * pulse) * 255).toInt(); c.drawBitmap(halo!!, bounds.left.toFloat(), bounds.top.toFloat(), p)
         }
         p.reset(); p.isAntiAlias = true; p.color = 0xF20F1724.toInt(); c.drawRoundRect(rect, r, r, p)
         p.style = Paint.Style.STROKE; p.strokeWidth = stroke; p.color = col; c.drawRoundRect(rect, r, r, p)

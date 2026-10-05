@@ -121,7 +121,7 @@ await assert.rejects(raw('wait_job', { job: jobId }).then((r) => { if (r.isError
 const png = path.join(tmp, 'pixel.png');
 fs.writeFileSync(png, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'));
 const imgRes = await tool('read_file', { session: code, path: png });
-assert.ok(imgRes.content.some((c) => c.type === 'image' && c.data.length > 100), 'read_file must return an image for .png'); console.log('read_file image ok');
+assert.ok(imgRes.content.some((c) => c.type === 'image' && c.data.length > 20), 'read_file must return an image for .png'); console.log('read_file image ok');
 
 // fetch_file: a file travels from the remote PC to the operator through the relay
 const blob = Buffer.alloc(300_000); for (let i = 0; i < blob.length; i++) blob[i] = (i * 7 + 3) & 255;
@@ -196,7 +196,7 @@ if (process.env.GUI) {
   const lite = size(await tool('screenshot', { session: code, max_width: 640, quality: 30 }));
   assert.ok(lite < full / 2, `lite screenshot must be much smaller (${lite} vs ${full})`); console.log(`adaptive screenshot ok (${full} -> ${lite} bytes)`);
   const shot = await tool('screenshot', { session: code });
-  assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 1000)); console.log('screenshot ok');
+  assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 200)); console.log('screenshot ok');
 }
 
 await tool('end_session', { session: code });

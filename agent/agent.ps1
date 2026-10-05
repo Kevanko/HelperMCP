@@ -1,12 +1,13 @@
 # HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
 #   [Net.ServicePointManager]::SecurityProtocol=3072; irm RELAY/h | iex
-$prevEAP = $ErrorActionPreference; $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session  # restored at the end: iex runs in the user's session
+$prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'write_file', 'click', 'type_text', 'press_key', 'mcp_start', 'mcp_call'
-$NodeVersion = 'v22.11.0'
+$AskTools = 'run', 'write_file', 'click', 'type_text', 'press_key', 'scroll', 'mcp_start', 'mcp_call'
+$NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
+$script:TmpDirs = @(); $script:OverlayProc = $null
 $Children = @{}   # name -> other MCP servers running on this PC
 $MaxOut = 100000
 
@@ -40,7 +41,7 @@ function Do-Screenshot($a) {
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
-    $w = [Math]::Min(1280, $s.Width)
+    $w = [Math]::Min(1920, $s.Width)
     $script:Scale = $s.Width / $w
     $out = New-Object Drawing.Bitmap $w, ([int]($s.Height / $script:Scale))
     $g = [Drawing.Graphics]::FromImage($out)
@@ -138,9 +139,33 @@ function Do-SysInfo($a) {
     } | ConvertTo-Json) }
 }
 
-# npx/node/npm missing? Download a portable Node into a temp dir (removed on exit).
+function Do-Scroll($a) {
+    if ($null -ne $a.x -and $null -ne $a.y) { [void][H.U]::SetCursorPos([int]($a.x * $Scale) + $Screen.Left, [int]($a.y * $Scale) + $Screen.Top) }
+    $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
+    $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * $n)), 0)
+    [H.U]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
+    @{ text = 'ok' }
+}
+
+function Node-Major { try { [int](((& node -v 2>$null) -as [string]).TrimStart('v').Split('.')[0]) } catch { 0 } }
+
+# command="playwright": a real, visible browser with sound, like a normal Playwright MCP on a desktop.
+function Playwright-Preset($a) {
+    $exe = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    $opts = [ordered]@{ headless = $false; chromiumSandbox = $true; ignoreDefaultArgs = @('--mute-audio', '--disable-blink-features=AutomationControlled'); args = @('--autoplay-policy=no-user-gesture-required') }
+    if ($exe) { $opts.executablePath = $exe }
+    $dir = Join-Path $env:TEMP ('helpermcp-pw-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    [void](New-Item -ItemType Directory $dir); $script:TmpDirs += $dir
+    $cfg = Join-Path $dir 'config.json'
+    [IO.File]::WriteAllText($cfg, (@{ browser = @{ browserName = 'chromium'; launchOptions = $opts } } | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding $false))
+    @{ command = 'npx'; args = @('-y', '@playwright/mcp@latest', '--config', $cfg) + @($a.args | Where-Object { $null -ne $_ }) }
+}
+
+# npx/node/npm missing or older than 20? Download a portable Node into a temp dir (removed on exit).
 function Ensure-Node($cmd) {
-    if ($cmd -notmatch '^(npx|npm|node)(\.cmd|\.exe)?$' -or $script:NodeBin -or (Get-Command $cmd -ErrorAction SilentlyContinue)) { return }
+    if ($cmd -notmatch '^(npx|npm|node)(\.cmd|\.exe)?$' -or $script:NodeBin -or (Node-Major) -ge $NodeMin) { return }
     if (-not [Environment]::Is64BitOperatingSystem) { throw 'Node.js is missing and there is no 32-bit portable build' }
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
     $script:NodeDir = Join-Path $env:TEMP ('helpermcp-node-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -185,6 +210,7 @@ function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
 
 function Do-McpStart($a) {
     if ($Children.ContainsKey($a.name)) { throw "'$($a.name)' is already running" }
+    if ($a.command -eq 'playwright') { $pre = Playwright-Preset $a; $a = @{ name = $a.name; command = $pre.command; args = $pre.args; env = $a.env } }
     Ensure-Node $a.command
     $exe = $a.command
     if ($script:NodeBin -and (Test-Path (Join-Path $script:NodeBin "$exe.cmd"))) { $exe = Join-Path $script:NodeBin "$exe.cmd" }
@@ -237,9 +263,74 @@ function Do-McpStop($a) {
     if ($c) { try { $c.p.Kill() } catch { }; $Children.Remove($a.name) }
     @{ text = if ($c) { 'stopped' } else { 'not running' } }
 }
+# "Remote control" overlay: glowing screen edges that fade out + a label on top, on every monitor. Runs as its own
+# process (needs a message loop), ignores the mouse, and quits when the agent's PowerShell is gone.
+$OverlayScript = @'
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Drawing
+Add-Type -Namespace O -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int i, int v); [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[void][O.W]::SetProcessDPIAware()
+$label = $env:HM_LABEL; $ppid = [int]$env:HM_PPID
+$dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
+function Col($a) { [Windows.Media.Color]::FromArgb($a, 76, 141, 255) }
+function Edge($angle, $ha, $va, $w, $h) {
+    $gs = New-Object Windows.Media.GradientStopCollection
+    foreach ($s in @(@(150, 0.0), @(45, 0.35), @(0, 1.0))) { [void]$gs.Add((New-Object Windows.Media.GradientStop (Col $s[0]), $s[1])) }
+    $r = New-Object Windows.Shapes.Rectangle
+    $r.Width = $w; $r.Height = $h; $r.HorizontalAlignment = $ha; $r.VerticalAlignment = $va
+    $r.Fill = New-Object Windows.Media.LinearGradientBrush $gs, $angle
+    $r
+}
+$wins = @()
+foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
+    $b = $scr.Bounds
+    $w = New-Object Windows.Window
+    $w.WindowStyle = 'None'; $w.ResizeMode = 'NoResize'; $w.AllowsTransparency = $true; $w.Background = [Windows.Media.Brushes]::Transparent
+    $w.Topmost = $true; $w.ShowInTaskbar = $false; $w.ShowActivated = $false; $w.WindowStartupLocation = 'Manual'
+    $w.Left = $b.X / $dpi; $w.Top = $b.Y / $dpi; $w.Width = $b.Width / $dpi; $w.Height = $b.Height / $dpi
+    $g = New-Object Windows.Controls.Grid
+    $nan = [double]::NaN; $S = 70
+    [void]$g.Children.Add((Edge 0 'Left' 'Stretch' $S $nan)); [void]$g.Children.Add((Edge 180 'Right' 'Stretch' $S $nan))
+    [void]$g.Children.Add((Edge 90 'Stretch' 'Top' $nan $S)); [void]$g.Children.Add((Edge 270 'Stretch' 'Bottom' $nan $S))
+    $pill = New-Object Windows.Controls.Border
+    $pill.CornerRadius = New-Object Windows.CornerRadius 17; $pill.Padding = New-Object Windows.Thickness 14, 6, 18, 6
+    $pill.Margin = New-Object Windows.Thickness 0, 12, 0, 0; $pill.HorizontalAlignment = 'Center'; $pill.VerticalAlignment = 'Top'
+    $pill.Background = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromArgb(224, 15, 23, 36))
+    $pill.BorderBrush = New-Object Windows.Media.SolidColorBrush (Col 230); $pill.BorderThickness = New-Object Windows.Thickness 1.5
+    $sp = New-Object Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
+    $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 9; $dot.Height = 9; $dot.VerticalAlignment = 'Center'; $dot.Fill = New-Object Windows.Media.SolidColorBrush (Col 255)
+    $tb = New-Object Windows.Controls.TextBlock; $tb.Text = $label; $tb.Foreground = [Windows.Media.Brushes]::White; $tb.FontSize = 14
+    $tb.FontWeight = 'SemiBold'; $tb.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'; $tb.Margin = New-Object Windows.Thickness 9, 0, 0, 0
+    [void]$sp.Children.Add($dot); [void]$sp.Children.Add($tb); $pill.Child = $sp; [void]$g.Children.Add($pill)
+    $w.Content = $g
+    $w.Show()
+    $h = (New-Object Windows.Interop.WindowInteropHelper $w).Handle   # click-through, no focus, hidden from Alt+Tab
+    [void][O.W]::SetWindowLong($h, -20, ([O.W]::GetWindowLong($h, -20) -bor 0x20 -bor 0x80 -bor 0x08000000))
+    $wins += $w
+}
+$timer = New-Object Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromSeconds(1)
+$timer.Add_Tick({
+    if (-not (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() }
+    else { foreach ($x in $wins) { $x.Topmost = $false; $x.Topmost = $true } }   # stay above other topmost windows
+})
+$timer.Start()
+[Windows.Threading.Dispatcher]::Run()
+'@
+function Start-Overlay {
+    if ($env:HELPER_NO_OVERLAY) { return }
+    try {
+        $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
+        $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($OverlayScript))
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
+        $script:OverlayProc = [Diagnostics.Process]::Start($psi)
+    } catch { }   # a missing overlay must never block the help session
+}
+
 function Cleanup-Children {
     foreach ($c in $Children.Values) { try { $c.p.Kill() } catch { } }
-    if ($script:NodeDir) { Remove-Item $script:NodeDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($script:OverlayProc) { try { $script:OverlayProc.Kill() } catch { } }
+    foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
 function Start-Helper {
@@ -255,6 +346,7 @@ function Start-Helper {
     Write-Host ("  " + (T 'УДАЛЁННАЯ ПОМОЩЬ. Код сессии:' 'REMOTE HELP. Session code:') + "  " + $r.code) -ForegroundColor Yellow
     Write-Host ("  " + (T 'Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.' 'Give this code to your helper. Close this window or press Ctrl+C to stop.'))
     Write-Host ''
+    Start-Overlay
     try {
         while ($true) {
             try { $resp = Api '/a/poll' $null $token 40 }
@@ -275,7 +367,7 @@ function Start-Helper {
                     $yn = Read-Host (T 'Разрешить? [y/N]' 'Allow? [y/N]')
                     if ($yn -notmatch '^(y|yes|д|да)$') { throw 'User denied this action.' }
                 }
-                $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
+                $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
                     run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
                     mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
                 if (-not $fn) { throw "Unknown tool $name" }

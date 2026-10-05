@@ -21,7 +21,7 @@ for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) bre
 
 // the real install path: fetch the script from the relay, like `irm | iex` would
 // PORTABLE=1: hide Node from the agent to test the portable-Node download
-const agentEnv = { ...process.env, HELPER_MODE: 'full', HELPER_DEBUG: '1', HELPER_INIT_TIMEOUT: '25' };
+const agentEnv = { ...process.env, HELPER_MODE: 'full', HELPER_DEBUG: '1', HELPER_INIT_TIMEOUT: '25', HELPER_NO_OVERLAY: '1' };
 if (process.env.PORTABLE) {
   for (const k of Object.keys(agentEnv)) if (k.toUpperCase() === 'PATH') agentEnv[k] = agentEnv[k].split(path.delimiter).filter((p) => !/node/i.test(p)).join(path.delimiter);
 }

@@ -41,8 +41,9 @@ The script runs in memory (Windows) or from a pipe (Linux), asks for a mode and 
 * **Ask mode (default):** the friend types `y` for every command, file write, click, keystroke and MCP-server start/call. Screenshots, file reads and directory listings need no confirmation.
 * **Full mode:** no prompts.
 * Everything the AI does is printed in the friend's console.
+* While a helper is connected, **every screen gets a soft glowing edge and a "Remote control" label on top** (like Codex). It ignores the mouse, stays on top, and disappears when the window is closed, even if the agent is killed.
 
-Linux GUI control needs X11 and `sudo apt install xdotool scrot`; on Wayland only commands, files and child MCP servers work.
+**Linux:** the agent finds the user's desktop session by itself (also when started over SSH) and drives the mouse/keyboard through X11 directly, so nothing has to be installed (`scrot`/`python3-gi`, present on most desktops, are used for screenshots and the overlay). On **Wayland** screenshots (needs `grim`/`gnome-screenshot`), commands, files and browsers work, but mouse/keyboard control does not: log in with "Ubuntu on Xorg" for that.
 
 ## 3. Connect your AI (once)
 
@@ -64,18 +65,22 @@ Two ways to connect:
 | Tool | What |
 |------|------|
 | `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs |
-| `click`, `type_text`, `press_key` | mouse and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`); click coordinates are screenshot pixels |
+| `click`, `scroll`, `type_text`, `press_key` | mouse and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
 | `mcp_start`, `mcp_tools`, `mcp_call`, `mcp_stop` | run and use **other MCP servers on the friend's PC** |
 | `list_sessions`, `end_session` | session management |
 
 ### Using other MCP servers (e.g. their browser)
 
 ```
-mcp_start  name="browser" command="npx" args=["-y", "@playwright/mcp@latest"]
+mcp_start  name="browser" command="playwright"
 mcp_call   server="browser" tool="browser_navigate" arguments={"url": "https://example.com"}
 ```
 
-Any stdio MCP server works the same way. If Node.js (`npx`) is missing, the agent downloads a portable copy into a temp folder (ask mode: after the friend approves) and deletes it on exit. This is tested end to end with the real Playwright MCP.
+`command="playwright"` opens a **real, visible Chrome/Edge window** on the friend's screen (their installed browser, sound on, no automation warnings), like a Playwright MCP on your own desktop.
+
+Any other stdio MCP server works the same way and several can run side by side, e.g. `command="npx" args=["-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Friend\\Documents"]` or `command="uvx" args=["blender-mcp"]`. Servers that talk to a local app (Blender, Unity, ...) need that app and its MCP add-on running on the friend's PC.
+
+If Node.js >= 20 is missing or too old, the agent downloads a portable copy into a temp folder (ask mode: after the friend approves) and deletes it on exit. Other runtimes (`uvx`, `python`, ...) must already be installed. Tested end to end with the real Playwright and filesystem MCP servers on Windows and Ubuntu.
 
 ## Develop and test
 
@@ -111,6 +116,10 @@ curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh
 
 **Ты:** один раз подключаешь MCP (`claude mcp add ...`, команду печатает установщик) и пишешь ИИ: «подключись к K7M2-QX9P и выясни, почему вылетает игра». Для прозрачного режима используй `/s/КОД/mcp`: инструменты друга выглядят как твои собственные.
 
-**Браузер друга:** `mcp_start name="browser" command="npx" args=["-y","@playwright/mcp@latest"]`. Если Node нет, агент скачает портативную копию во временную папку и удалит при выходе.
+**Во время сессии** на каждом экране друга появляется плашка «Удалённое управление» и мягкое свечение по краям, как в Codex. Мышь и клавиатура работают сквозь неё.
+
+**Браузер друга:** `mcp_start name="browser" command="playwright"` откроет настоящий видимый Chrome/Edge со звуком. Так же можно запускать любые другие MCP-серверы (файлы, Blender и т.д.), несколько одновременно. Если Node 20+ нет, агент скачает портативную копию во временную папку и удалит при выходе.
+
+**Ubuntu:** агент сам находит сессию рабочего стола (даже если запущен по SSH). Для управления мышью нужен X11 («Ubuntu on Xorg»), на Wayland работают команды, файлы и браузер.
 
 Безопасность: см. [SECURITY.md](SECURITY.md). Ключ держи в секрете, ссылку давай только тем, кто сам попросил о помощи.

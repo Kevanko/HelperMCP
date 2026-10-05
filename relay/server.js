@@ -14,7 +14,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8444);
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
-const SESSION_IDLE_MS = 90_000;
+const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 90_000);
 const POLL_MS = 25_000;
 const MAX_SESSIONS = 200;
 const MAX_PER_IP = 10;
@@ -73,7 +73,8 @@ function drop(code, why) {
 }
 
 setInterval(() => {
-  for (const [code, s] of sessions) if (Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
+  // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
+  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
 
 // ---- MCP tool table -------------------------------------------------------

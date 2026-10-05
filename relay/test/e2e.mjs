@@ -15,7 +15,7 @@ const kids = [];
 const stop = () => kids.forEach((k) => k.kill());
 process.on('exit', stop);
 
-const relay = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY }, stdio: 'inherit' });
+const relay = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000' }, stdio: 'inherit' });
 kids.push(relay);
 for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((r) => setTimeout(r, 100)); }
 
@@ -86,6 +86,10 @@ assert.match((await c2.callTool({ name: 'run', arguments: { command: 'echo direc
 console.log('transparent /s/<code>/mcp ok');
 await c2.close();
 await tool('mcp_stop', { session: code, name: 'echo' });
+
+// an agent busy longer than the idle limit must not be dropped (regression: browser calls > 90 s killed the session)
+const busy = txt(await tool('run', { session: code, command: useps ? 'Start-Sleep 6; echo done' : 'sleep 6; echo done', timeout_s: 30 }));
+assert.match(busy, /done/); console.log('long call survives idle limit ok');
 
 const bad = await tool('run', { session: 'NOPE-NOPE', command: 'x' });
 assert.ok(bad.isError); console.log('bad session ok');

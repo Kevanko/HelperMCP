@@ -12,6 +12,7 @@ services:
     ports: ["${RELAY_BIND:-0.0.0.0}:${RELAY_PORT:-8444}:8444"]
     environment:
       OPERATOR_KEY: ${OPERATOR_KEY:?set OPERATOR_KEY in .env}
+      RELAY_PORT: ${RELAY_PORT:-8444}   # only to show it in the console panel
       PUBLIC_URL: ${PUBLIC_URL:-}   # e.g. https://help.example.com
       TLS_CERT: ${TLS_CERT:-}       # optional: serve TLS from your own certbot files, e.g. /certs/live/<domain>/fullchain.pem
       TLS_KEY: ${TLS_KEY:-}

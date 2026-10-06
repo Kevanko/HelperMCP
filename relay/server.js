@@ -364,6 +364,7 @@ function bodyBuf(req, limit) {
 const body = async (req, limit) => (await bodyBuf(req, limit)).toString('utf8');
 const baseUrl = (req) => PUBLIC_URL || `${req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')}://${req.headers.host}`;
 const clientIp = (req) => req.socket.remoteAddress;
+const PKG_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')).version; } catch { return '?'; } })();
 
 function script(req, res, file) {
   let f;
@@ -387,9 +388,9 @@ function landing(req, res) {
     APK_TAB: apk ? '<button class="tab" role="tab" data-p="and">android</button>' : '',
     APK_PANE: apk ? `<section class="win" id="and" role="tabpanel"><div class="bar"><i></i><i></i><i></i><span>~/android</span></div><div class="body">
 <div class="qr"><img alt="QR code with the link to the app" src="${esc(b)}/qr.svg?u=${encodeURIComponent(b + '/apk')}"><div>
-<ol><li>Scan the code with the phone camera, or open the link, and download the app.</li><li>Allow the install and open <b>HelperMCP</b>.</li><li>Tap <b>Allow control</b>, switch HelperMCP on, then tap <b>Start help</b>.</li></ol>
-<div class="cmd"><small>Link</small><pre>${esc(b)}/apk</pre><button class="cp" data-t="${esc(b)}/apk">Copy</button></div>
-<a class="btn" href="${esc(b)}/apk">Download APK</a></div></div></div></section>` : '',
+<ol><li data-i="a1">Scan the code with the phone camera, or open the link, and download the app.</li><li data-i="a2">Allow the install and open <b>HelperMCP</b>.</li><li data-i="a3">Tap <b>Allow control</b>, switch HelperMCP on, then tap <b>Start help</b>.</li></ol>
+<div class="cmd"><small data-i="aLink">Link</small><pre>${esc(b)}/apk</pre><button class="cp" data-t="${esc(b)}/apk">Copy</button></div>
+<a class="btn" href="${esc(b)}/apk" data-i="aBtn">Download APK</a></div></div></div></section>` : '',
   };
   let html = LANDING;
   for (const [k, v] of Object.entries(vars)) html = html.split(`{{${k}}}`).join(v);
@@ -506,6 +507,20 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       } catch (e) { return json(res, 503, { error: e.message }); } finally { v.busy = false; }
     }
 
+    if (p === '/admin/status') {   // for the `helpermcp` console panel (needs the operator key)
+      const ip = clientIp(req), f = authFails.get(ip);
+      if (f && f.n >= AUTH_MAX_FAILS && Date.now() < f.until) return json(res, 429, { error: 'too many wrong keys, try again later' });
+      if (!safeEq(bearer(req), OPERATOR_KEY)) { const n = (f && Date.now() < f.until ? f.n : 0) + 1; authFails.set(ip, { n, until: Date.now() + AUTH_WINDOW_MS }); return json(res, 401, { error: 'bad operator key' }); }
+      authFails.delete(ip);
+      const now = Date.now();
+      return json(res, 200, {
+        version: PKG_VERSION, uptime_s: Math.round(process.uptime()), public_url: PUBLIC_URL || lastBase || '', tls: !!(process.env.TLS_CERT && process.env.TLS_KEY), port: Number(process.env.PORT || 8444),
+        state_encrypted: !!STATE_FILE, apk: fs.existsSync(APK_FILE), cursor_pack: fs.existsSync(CURSOR_DIR),
+        counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => now - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size, auth_lockouts: authFails.size },
+        limits: { max_sessions: MAX_SESSIONS, per_ip: MAX_PER_IP, idle_s: Math.round(SESSION_IDLE_MS / 1000) },
+        sessions: [...sessions].map(([code, x]) => ({ code, os: x.info?.os || '', host: x.info?.host || '', user: x.info?.user || '', mode: x.mode, online: now - x.lastSeen < ONLINE_MS, last_seen_s: Math.round((now - x.lastSeen) / 1000), running: x.pending.size, queued: x.queue.length, age_s: Math.round((now - x.created) / 1000) })),
+      });
+    }
     const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
     if (mcp) {
       const ip = clientIp(req), f = authFails.get(ip);

@@ -1,6 +1,6 @@
 {
   "name": "helpermcp-relay",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "description": "Relay + MCP server: lets Claude help on a remote PC through a one-line agent",
   "type": "module",
   "main": "server.js",

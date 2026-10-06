@@ -13,6 +13,7 @@ body{margin:0;min-height:100vh;color:var(--fg);font:15px/1.6 ui-monospace,"Casca
 body:before{content:"";position:fixed;inset:0;z-index:1;pointer-events:none;background:radial-gradient(ellipse at 50% 30%,rgba(2,10,6,.15),rgba(2,10,6,.88) 75%),repeating-linear-gradient(0deg,rgba(56,255,122,.035) 0 1px,transparent 1px 3px)}
 main{position:relative;z-index:2;max-width:48rem;margin:0 auto;padding:clamp(1.2rem,5vw,3.5rem) 1rem 4rem}
 a{color:var(--g)}
+.lang{position:fixed;top:.8rem;right:.8rem;z-index:5;font:600 12px inherit;color:var(--g);background:rgba(7,20,12,.85);border:1px solid var(--line2);border-radius:6px;padding:.35rem .7rem;cursor:pointer;transition:box-shadow .2s}.lang:hover{box-shadow:0 0 16px rgba(56,255,122,.35)}.lang:focus-visible{outline:2px solid var(--g);outline-offset:2px}
 .hero{margin-bottom:1.6rem}
 .prompt{color:var(--mut);font-size:13px;min-height:1.5em}
 .prompt b{color:var(--g);font-weight:600}
@@ -65,12 +66,13 @@ footer b{color:var(--g);font-weight:600}
 @media(prefers-reduced-motion:reduce){#rain{display:none}.caret,.qr img{animation:none}.win.on{animation:none}.btn,.cp{transition:none}}
 </style>
 <canvas id="rain" aria-hidden="true"></canvas>
+<button id="lang" class="lang" aria-label="Language">RU</button>
 <main>
 <section class="hero">
   <div class="prompt"><b>friend@pc</b>:~$ <span id="typed"></span><span class="caret"></span></div>
   <h1>Remote help</h1>
-  <p class="sub">Someone is going to help you with your device. Start the helper, then <b>read them the code</b> it shows. You see everything they do, and you can stop at any time.</p>
-  <div class="code-demo" aria-label="Example of a session code"><span>your code looks like</span><code id="democode">K7M2-QX9P</code></div>
+  <p class="sub" data-i="sub">Someone is going to help you with your device. Start the helper, then <b>read them the code</b> it shows. You see everything they do, and you can stop at any time.</p>
+  <div class="code-demo" aria-label="Example of a session code"><span data-i="codeLabel">your code looks like</span><code id="democode">K7M2-QX9P</code></div>
 </section>
 
 <div class="tabs" role="tablist">
@@ -82,12 +84,12 @@ footer b{color:var(--g);font-weight:600}
 <section class="win" id="win" role="tabpanel">
   <div class="bar"><i></i><i></i><i></i><span>~/windows</span></div>
   <div class="body">
-    <p>Download the launcher and double-click it. It opens a window, starts the helper and shows your code.</p>
-    <a class="btn" href="{{BASE}}/h.cmd" download>Download launcher</a><span class="note">remote-help.cmd, three lines of text (<a href="{{BASE}}/h.cmd">read it</a>)</span>
-    <div class="or">or paste a command</div>
+    <p data-i="winIntro">Download the launcher and double-click it. It opens a window, starts the helper and shows your code.</p>
+    <a class="btn" href="{{BASE}}/h.cmd" download><span data-i="dl">Download launcher</span></a><span class="note" data-i="dlNote">remote-help.cmd, three lines of text (<a href="{{BASE}}/h.cmd">read it</a>)</span>
+    <div class="or" data-i="orPaste">or paste a command</div>
     <ol>
-      <li>Press <kbd>Win</kbd> + <kbd>R</kbd>, type <kbd>powershell</kbd> or <kbd>cmd</kbd>, press <kbd>Enter</kbd>.</li>
-      <li>Paste the command (right-click or <kbd>Ctrl</kbd> + <kbd>V</kbd>) and press <kbd>Enter</kbd>.</li>
+      <li data-i="w1">Press <kbd>Win</kbd> + <kbd>R</kbd>, type <kbd>powershell</kbd> or <kbd>cmd</kbd>, press <kbd>Enter</kbd>.</li>
+      <li data-i="w2">Paste the command (right-click or <kbd>Ctrl</kbd> + <kbd>V</kbd>) and press <kbd>Enter</kbd>.</li>
     </ol>
     <div class="cmd"><small>PowerShell</small><pre>{{PS}}</pre><button class="cp" data-t="{{PS_ATTR}}">Copy</button></div>
     <div class="cmd"><small>Command Prompt</small><pre>{{CMD}}</pre><button class="cp" data-t="{{CMD_ATTR}}">Copy</button></div>
@@ -98,26 +100,54 @@ footer b{color:var(--g);font-weight:600}
   <div class="bar"><i></i><i></i><i></i><span>~/ubuntu</span></div>
   <div class="body">
     <ol>
-      <li>Open a terminal with <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd>.</li>
-      <li>Paste the command and press <kbd>Enter</kbd>.</li>
+      <li data-i="l1">Open a terminal with <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd>.</li>
+      <li data-i="l2">Paste the command and press <kbd>Enter</kbd>.</li>
     </ol>
     <div class="cmd"><small>Terminal</small><pre>{{SH}}</pre><button class="cp" data-t="{{SH_ATTR}}">Copy</button></div>
-    <div class="or">or download it</div>
-    <a class="btn alt" href="{{BASE}}/p.sh" download>remote-help.sh</a><span class="note">then run <kbd>bash remote-help.sh</kbd></span>
+    <div class="or" data-i="orDl">or download it</div>
+    <a class="btn alt" href="{{BASE}}/p.sh" download>remote-help.sh</a><span class="note" data-i="lThen">then run <kbd>bash remote-help.sh</kbd></span>
   </div>
 </section>
 
 {{APK_PANE}}
 
 <footer>
-  <span><b>Nothing is installed.</b> On Windows and Linux the helper runs from memory and disappears when you close the window.</span>
-  <span><b>Private.</b> Encrypted on the way, and everything is deleted when the session ends. Press <kbd>Esc</kbd> in the window to stop at any time.</span>
-  <span>Read the scripts first: <a href="{{BASE}}/h">windows</a>, <a href="{{BASE}}/p">linux</a>.</span>
+  <span data-i="f1"><b>Nothing is installed.</b> On Windows and Linux the helper runs from memory and disappears when you close the window.</span>
+  <span data-i="f2"><b>Private.</b> Encrypted on the way, and everything is deleted when the session ends. Press <kbd>Esc</kbd> in the window to stop at any time.</span>
+  <span data-i="f3">Read the scripts first: <a href="{{BASE}}/h">windows</a>, <a href="{{BASE}}/p">linux</a>.</span>
 </footer>
 </main>
 <script>
 (function(){
 var reduce=matchMedia('(prefers-reduced-motion:reduce)').matches;
+// language
+var RU={
+ sub:'Кто-то собирается помочь вам с устройством. Запустите помощника и <b>назовите ему код</b>, который он покажет. Вы видите всё, что делает помощник, и можете остановить в любой момент.',
+ codeLabel:'ваш код выглядит так',
+ winIntro:'Скачайте запускатор и дважды щёлкните по нему. Он откроет окно, запустит помощника и покажет код.',
+ dl:'Скачать запускатор',
+ dlNote:'remote-help.cmd, три строки текста (<a href="{{BASE}}/h.cmd">прочитать</a>)',
+ orPaste:'или вставьте команду',
+ w1:'Нажмите <kbd>Win</kbd> + <kbd>R</kbd>, введите <kbd>powershell</kbd> или <kbd>cmd</kbd> и нажмите <kbd>Enter</kbd>.',
+ w2:'Вставьте команду (правой кнопкой или <kbd>Ctrl</kbd> + <kbd>V</kbd>) и нажмите <kbd>Enter</kbd>.',
+ l1:'Откройте терминал: <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd>.',
+ l2:'Вставьте команду и нажмите <kbd>Enter</kbd>.',
+ orDl:'или скачайте файл',
+ lThen:'затем выполните <kbd>bash remote-help.sh</kbd>',
+ f1:'<b>Ничего не устанавливается.</b> На Windows и Linux помощник работает из памяти и исчезает, когда вы закрываете окно.',
+ f2:'<b>Приватно.</b> Данные шифруются в пути, а после конца сеанса всё удаляется. <kbd>Esc</kbd> в окне остановит помощь в любой момент.',
+ f3:'Сначала можно прочитать скрипты: <a href="{{BASE}}/h">windows</a>, <a href="{{BASE}}/p">linux</a>.',
+ a1:'Наведите камеру телефона на код (или откройте ссылку) и скачайте приложение.',
+ a2:'Разрешите установку и откройте <b>HelperMCP</b>.',
+ a3:'Нажмите <b>Allow control / Разрешить управление</b>, включите HelperMCP, затем <b>Start help / Начать помощь</b>.',
+ aLink:'Ссылка', aBtn:'Скачать APK', copy:'Копировать', copied:'Скопировано'};
+var lang=localStorage.getItem('hm-lang')||((navigator.language||'en').slice(0,2)==='ru'?'ru':'en');
+function applyLang(){
+ document.documentElement.lang=lang;
+ document.querySelectorAll('[data-i]').forEach(function(e){if(!e.dataset.en)e.dataset.en=e.innerHTML;e.innerHTML=lang==='ru'&&RU[e.dataset.i]?RU[e.dataset.i]:e.dataset.en});
+ document.querySelectorAll('.cp').forEach(function(b){b.textContent=lang==='ru'?RU.copy:'Copy'});
+ document.getElementById('lang').textContent=lang==='ru'?'EN':'RU'}
+document.getElementById('lang').onclick=function(){lang=lang==='ru'?'en':'ru';try{localStorage.setItem('hm-lang',lang)}catch(e){}applyLang()};
 // tabs
 var ua=navigator.userAgent,start=/Android/i.test(ua)?'and':(/Linux|X11/i.test(ua)&&!/Android/i.test(ua)?'lin':'win');
 function show(id){if(!document.getElementById(id))id='win';
@@ -127,7 +157,8 @@ document.querySelectorAll('.tab').forEach(function(e){e.onclick=function(){show(
 // copy
 document.querySelectorAll('.cp').forEach(function(b){b.onclick=async function(){var t=b.dataset.t;
  try{await navigator.clipboard.writeText(t)}catch(e){var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}
- var o=b.textContent;b.textContent='Copied';b.classList.add('ok');setTimeout(function(){b.textContent=o;b.classList.remove('ok')},1400)}});
+ b.textContent=lang==='ru'?RU.copied:'Copied';b.classList.add('ok');setTimeout(function(){b.textContent=lang==='ru'?RU.copy:'Copy';b.classList.remove('ok')},1400)}});
+applyLang();
 // typed prompt
 var line='help --me',el=document.getElementById('typed'),i=0;
 if(reduce){el.textContent=line}else{(function t(){el.textContent=line.slice(0,++i);if(i<line.length)setTimeout(t,70+Math.random()*90)})()}

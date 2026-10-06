@@ -313,6 +313,7 @@ fun captureMode(on: Boolean) {
             p.text = when (state) {
                 "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
                 "done" -> "✓  " + t("Работа выполнена", "Work finished")
+                "hold" -> "||  " + t("Помощник на паузе, вернётся", "The helper is on hold, back soon")
                 "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")
                 "paused" -> "||  " + t("Пауза: помощник ждёт", "Paused: the helper is waiting")
                 else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…")
@@ -402,8 +403,12 @@ fun captureMode(on: Boolean) {
                 if (id != 0) { val v = android.content.res.Resources.getSystem().getDimensionPixelSize(id).toFloat(); r = floatArrayOf(v, v, v, v) }
             }
         } catch (_: Throwable) { }
+        val user = try { svc.getSharedPreferences("cfg", Context.MODE_PRIVATE).getInt("corner", 0) } catch (_: Throwable) { 0 }
+        if (user > 0) { val v = user * d; return Shape(v, v, v, v) }   // set with the slider in the app (0 = automatic)
+        if (r.all { it == 0f }) { val v = 0.05f * min(width, height); return Shape(v, v, v, v) }   // the phone does not tell: a typical radius
         return Shape(r[0], r[1], r[2], r[3])
     }
+    fun rebuild() = main.post { if (view != null) applyState() }
 
     /** the hole filled on a small bitmap and a distance map around it (two chamfer passes): the glow hugs the true outline */
     private fun maskOf(path: Path, depth: Int, w: Int, h: Int): HoleMask? {
@@ -456,6 +461,17 @@ fun captureMode(on: Boolean) {
             val r = if (fy < hh) (if (fx < hw) sh.rTL else sh.rTR) else (if (fx < hw) sh.rBL else sh.rBR)
             var dist = -sdRound(fx, fy, hw, hh, hw, hh, r)   // depth below the surface of the screen shape
             if (dist < 0f) continue                          // outside a rounded corner: not part of the screen
+            val shapeDist = dist
+            // how much this pixel sits on the slanted part of a corner arc (0 on the straight edges, 1 at 45 degrees)
+            var tilt = 0f
+            run {
+                val rr = if (fy < hh) (if (fx < hw) sh.rTL else sh.rTR) else (if (fx < hw) sh.rBL else sh.rBR)
+                val ccx = if (fx < hw) rr else w - rr; val ccy = if (fy < hh) rr else h - rr
+                if (rr > 0f && (if (fx < hw) fx < rr else fx > w - rr) && (if (fy < hh) fy < rr else fy > h - rr)) {
+                    val vx = fx - ccx; val vy = fy - ccy; val len = kotlin.math.sqrt(vx * vx + vy * vy)
+                    if (len > 0f) tilt = min(kotlin.math.abs(vx), kotlin.math.abs(vy)) / len
+                }
+            }
             for (m in sh.masks) {
                 if (x < m.x0 || x >= m.x0 + m.w || y < m.y0 || y >= m.y0 + m.h) continue
                 val v = m.d[(y - m.y0) * m.w + (x - m.x0)]
@@ -463,7 +479,14 @@ fun captureMode(on: Boolean) {
                 dist = min(dist, v)
             }
             if (dist < 0f) continue
-            val di = dist.toInt(); if (di < depth) px[y * w + x] = prof[di]
+            val di = dist.toInt(); if (di >= depth) continue
+            var p = prof[di]
+            if (tilt > 0f) {   // on a corner arc the outer rim fades in over a few px: no hard line where our curve and the real panel curve differ a little
+                val st = (tilt / 0.3f).coerceIn(0f, 1f); val t = (shapeDist / (4f * d)).coerceIn(0f, 1f); val k = t * t * (3 - 2 * t)
+                val f = 1f - st * (1f - k)
+                p = ((((p ushr 24) * f).toInt()) shl 24) or (p and 0x00FFFFFF)
+            }
+            px[y * w + x] = p
         }
         return px
     }

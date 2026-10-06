@@ -50,6 +50,7 @@ class HelperService : AccessibilityService() {
     @Volatile private var lastOpAt = 0L
     @Volatile private var pauseBy = ""
     private var unlockedSince = 0L
+    private var lastWakeAt = 0L
     private val stateExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val IDLE_MS = 150_000L   // no call from the helper for this long: the label goes back to "waiting for the helper" and the timer restarts
     private var wake: PowerManager.WakeLock? = null
@@ -70,7 +71,9 @@ class HelperService : AccessibilityService() {
         Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
     }
 
-    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); fx.hide() }
+    fun refreshFx() { fx.rebuild() }
+
+    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); if (::fx.isInitialized) fx.hide() }
 
     /** pause / continue: by the button in the app, and automatically when the screen is switched off (and back on after unlock) */
     fun setPaused(on: Boolean, by: String = "user") {
@@ -101,6 +104,7 @@ class HelperService : AccessibilityService() {
         override fun run() {
             if (!running) return
             val now = SystemClock.uptimeMillis()
+            if (now - lastWakeAt > 30 * 60_000L) { lastWakeAt = now; try { wake?.acquire(3 * 3600 * 1000L) } catch (_: Throwable) { } }   // long sessions: the CPU lock is renewed, it never runs out
             val ready = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive && !(getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
             if (paused && pauseBy == "screen") { if (!ready) unlockedSince = 0 else if (unlockedSince == 0L) unlockedSince = now else if (now - unlockedSince >= 4000) setPaused(false) }
             if (!paused && phase == "ok" && lastOpAt > 0 && now - lastOpAt > IDLE_MS) { opSeen = false; phase = "wait"; fx.setState("wait"); fx.resetClock() }
@@ -120,7 +124,7 @@ class HelperService : AccessibilityService() {
 
     private fun loop(relay: String) {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        try { wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "helpermcp:session").also { it.acquire(6 * 3600 * 1000L) } } catch (_: Throwable) { }
+        try { wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "helpermcp:session").also { it.setReferenceCounted(false); it.acquire(3 * 3600 * 1000L) } } catch (_: Throwable) { }
         var token: String; var wait = 1000L
         var reg: JSONObject
         while (true) {   // the server can be unreachable at the start: keep trying
@@ -180,9 +184,9 @@ class HelperService : AccessibilityService() {
     private fun handle(relay: String, token: String, cmd: JSONObject) {
         val id = cmd.getString("id"); val tool = cmd.getString("tool"); val args = cmd.optJSONObject("args") ?: JSONObject()
         if (tool == "bye") { ended = true; return }
-        if (!args.optBoolean("view") && tool != "task_done") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
+        if (!args.optBoolean("view") && tool != "task_done" && tool != "hold") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done"
+        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done" || tool == "hold"
         if (!quiet) fx.setBusy(true)
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
@@ -252,6 +256,7 @@ class HelperService : AccessibilityService() {
         "sysinfo" -> ok(sysinfo().toString(2))
         "screenshot" -> screenshot(a)
         "click" -> click(a)
+        "hold" -> { phase = "hold"; opSeen = false; lastOpAt = 0; fx.setState("hold"); ok() }
         "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }
         "drag" -> { drag(a); ok() }

@@ -65,6 +65,16 @@ class MainActivity : Activity() {
         askSwitch = Switch(this).apply { text = t("Спрашивать подтверждение каждого действия", "Ask before every action"); setTextColor(Color.WHITE); isChecked = prefs.getBoolean("ask", true); setPadding(0, dp(18), 0, 0) }; col.addView(askSwitch)
         col.addView(TextView(this).apply { text = t("Сервер", "Server"); setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(16), 0, 0) })
         relay = EditText(this).apply { setText(prefs.getString("relay", BuildConfig.RELAY)); setTextColor(Color.WHITE); inputType = InputType.TYPE_TEXT_VARIATION_URI; textSize = 14f }; col.addView(relay)
+        val cornerTitle = TextView(this).apply { setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(16), 0, 0) }
+        fun cornerText(p: Int) { cornerTitle.text = t("Скругление углов экрана для обводки: ", "Screen corner radius for the glow: ") + (if (p == 0) t("авто", "auto") else "$p dp") }
+        col.addView(cornerTitle)
+        val corner = android.widget.SeekBar(this).apply { max = 60; progress = prefs.getInt("corner", 0).coerceIn(0, 60); cornerText(progress)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, u: Boolean) { cornerText(p) }
+                override fun onStartTrackingTouch(s: android.widget.SeekBar?) { }
+                override fun onStopTrackingTouch(s: android.widget.SeekBar?) { prefs.edit().putInt("corner", progress).apply(); HelperService.inst?.refreshFx() }
+            }) }
+        col.addView(corner)
         Crash.install(this)
         versionLine = TextView(this).apply { setTextColor(0xFF6B7A94.toInt()); textSize = 12f; setPadding(0, dp(18), 0, 0) }; col.addView(versionLine)
         setContentView(ScrollView(this).apply { setBackgroundColor(0xFF0F1724.toInt()); addView(col) })
@@ -91,6 +101,7 @@ class MainActivity : Activity() {
             "wait" -> t("◌ Ожидание помощника… назовите ему код", "◌ Waiting for the helper… give them the code")
             "ok" -> t("● Помощник подключён", "● Helper connected")
             "done" -> t("✓ Помощник закончил работу", "✓ The helper finished the work")
+            "hold" -> t("⏸ Помощник на паузе и вернётся", "⏸ The helper is on hold and will be back")
             "lost" -> t("◌ Связь потеряна, переподключение…", "◌ Connection lost, reconnecting…")
             "paused" -> t("⏸ Пауза: помощник ждёт", "⏸ Paused: the helper is waiting")
             else -> if (on) t("Готово к запуску", "Ready to start") else t("Сначала разрешите управление (шаг 1)", "Allow control first (step 1)")

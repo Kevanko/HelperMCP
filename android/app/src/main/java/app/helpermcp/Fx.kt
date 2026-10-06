@@ -274,11 +274,16 @@ fun captureMode(on: Boolean) {
         var path: Path? = null; var src = "fallback"
         try { if (Build.VERSION.SDK_INT >= 34) displayCutout()?.cutoutPath?.let { if (!it.isEmpty && covers(it)) { path = Path(it); src = "api" } } } catch (_: Throwable) { }
         if (path == null) pathFromResource(w)?.let { if (covers(it)) { path = it; src = "resource" } }
+        // some makers declare the cutout as a plain rectangle (realme: 116x140 around a round camera): that box is a margin, not the hole
+        if (path != null && rects.size == 1 && rects[0].height() >= rects[0].width() * 0.9f) {
+            val g = android.graphics.Region(); g.setPath(path!!, clipOf(rects[0])); val it = android.graphics.RegionIterator(g); val q = android.graphics.Rect(); var n = 0; while (it.next(q)) n++
+            if (n == 1 && g.bounds.width() >= rects[0].width() - 3) { path = null; src = "box->circle" }
+        }
         if (path == null) {   // nothing better: a circle for a square-ish box (punch hole), a rounded bar for a wide one (notch)
             val p = Path()
             for (r in rects) {
                 val rf = android.graphics.RectF(r)
-                if (r.height() >= r.width() * 0.9f) { val dm = r.width() * 0.62f; p.addOval(rf.centerX() - dm / 2, rf.centerY() - dm / 2, rf.centerX() + dm / 2, rf.centerY() + dm / 2, Path.Direction.CW) }
+                if (r.height() >= r.width() * 0.9f) { val dm = r.width() * 0.86f; p.addOval(rf.centerX() - dm / 2, rf.centerY() - dm / 2, rf.centerX() + dm / 2, rf.centerY() + dm / 2, Path.Direction.CW) }
                 else p.addRoundRect(rf, rf.height() * 0.5f, rf.height() * 0.5f, Path.Direction.CW)
             }
             path = p

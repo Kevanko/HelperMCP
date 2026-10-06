@@ -221,17 +221,76 @@ fun captureMode(on: Boolean) {
         updatePill(p); main.postDelayed({ tick() }, 500)
     }
 
-    private fun cutout(): android.graphics.Rect? {
-        val w = width
-        val sources = listOf<() -> android.view.DisplayCutout?>(
-            { (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout },
-            { pill?.rootWindowInsets?.displayCutout }, { wm.currentWindowMetrics.windowInsets.displayCutout })
-        for (src in sources) {
-            val r = try { src()?.boundingRects?.firstOrNull { it.top < dp(48) && it.bottom <= dp(120) && kotlin.math.abs((it.left + it.right) / 2 - w / 2) < w * 0.16 } } catch (_: Throwable) { null }
-            if (r != null) return r   // a camera hole or notch in the middle of the top edge
-        }
-        return null
+    // ---- the camera hole / notch: its real outline, not the bounding box the system reports (a punch hole is a circle, a waterdrop is a drop)
+    private var holePath: Path? = null
+    private var holeRect: android.graphics.Rect? = null
+    private var holeKey = ""
+    var holeSrc = "none"; private set
+
+    private fun displayCutout(): android.view.DisplayCutout? {
+        try { val c = (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout; if (c != null) return c } catch (_: Throwable) { }
+        return try { wm.currentWindowMetrics.windowInsets.displayCutout } catch (_: Throwable) { null }
     }
+
+    private fun isCentral(r: android.graphics.Rect, w: Int) = r.top < dp(48) && r.bottom <= dp(120) && kotlin.math.abs((r.left + r.right) / 2 - w / 2) < w * 0.16
+
+    /** a path out of the framework's own cutout description (config_mainBuiltInDisplayCutout), for Android versions that do not hand out the path */
+    private fun pathFromResource(w: Int): Path? = try {
+        val res = android.content.res.Resources.getSystem()
+        val id = res.getIdentifier("config_mainBuiltInDisplayCutout", "string", "android")
+        val spec = if (id != 0) res.getString(id).trim() else ""
+        if (spec.isEmpty() || "@bottom" in spec) null else {
+            val sc = if ("@dp" in spec) d else 1f
+            val ox = if ("@left" in spec) 0f else if ("@right" in spec) w.toFloat() else w / 2f
+            val tk = Regex("[MmLlHhVvCcQqZz]|-?\\d*\\.?\\d+(?:[eE][-+]?\\d+)?").findAll(spec.replace(Regex("@\\w+"), " ")).map { it.value }.toList()
+            val p = Path(); var i = 0; var cmd = 'M'; var cx = 0f; var cy = 0f; var sx0 = 0f; var sy0 = 0f; var ok = true
+            fun n() = tk[i++].toFloat()
+            fun X(v: Float) = ox + v * sc
+            fun Y(v: Float) = v * sc
+            while (i < tk.size && ok) {
+                if (tk[i][0].isLetter()) { cmd = tk[i][0]; i++; if (cmd == 'Z' || cmd == 'z') { p.close(); cx = sx0; cy = sy0; continue } }
+                val rel = cmd.isLowerCase(); val bx = if (rel) cx else 0f; val by = if (rel) cy else 0f
+                when (cmd.uppercaseChar()) {
+                    'M' -> { cx = bx + n(); cy = by + n(); p.moveTo(X(cx), Y(cy)); sx0 = cx; sy0 = cy; cmd = if (rel) 'l' else 'L' }
+                    'L' -> { cx = bx + n(); cy = by + n(); p.lineTo(X(cx), Y(cy)) }
+                    'H' -> { cx = bx + n(); p.lineTo(X(cx), Y(cy)) }
+                    'V' -> { cy = by + n(); p.lineTo(X(cx), Y(cy)) }
+                    'C' -> { val x1 = bx + n(); val y1 = by + n(); val x2 = bx + n(); val y2 = by + n(); cx = bx + n(); cy = by + n(); p.cubicTo(X(x1), Y(y1), X(x2), Y(y2), X(cx), Y(cy)) }
+                    'Q' -> { val x1 = bx + n(); val y1 = by + n(); cx = bx + n(); cy = by + n(); p.quadTo(X(x1), Y(y1), X(cx), Y(cy)) }
+                    else -> ok = false
+                }
+            }
+            if (ok) p else null
+        }
+    } catch (_: Throwable) { null }
+
+    private fun loadHole() {
+        val w = width; if (holeKey == "$w") return
+        val rects = displayCutout()?.boundingRects ?: emptyList()
+        holeKey = "$w"
+        if (rects.isEmpty()) { holePath = null; holeRect = null; holeSrc = "none"; return }
+        fun clipOf(r: android.graphics.Rect) = android.graphics.Region(r.left - dp(3), maxOf(0, r.top - dp(3)), r.right + dp(3), r.bottom + dp(3))
+        fun covers(p: Path) = rects.all { r -> val g = android.graphics.Region(); g.setPath(p, clipOf(r)); !g.isEmpty && g.bounds.width() >= r.width() * 0.3f }
+        var path: Path? = null; var src = "fallback"
+        try { if (Build.VERSION.SDK_INT >= 34) displayCutout()?.cutoutPath?.let { if (!it.isEmpty && covers(it)) { path = Path(it); src = "api" } } } catch (_: Throwable) { }
+        if (path == null) pathFromResource(w)?.let { if (covers(it)) { path = it; src = "resource" } }
+        if (path == null) {   // nothing better: a circle for a square-ish box (punch hole), a rounded bar for a wide one (notch)
+            val p = Path()
+            for (r in rects) {
+                val rf = android.graphics.RectF(r)
+                if (r.height() >= r.width() * 0.9f) { val dm = r.width() * 0.62f; p.addOval(rf.centerX() - dm / 2, rf.centerY() - dm / 2, rf.centerX() + dm / 2, rf.centerY() + dm / 2, Path.Direction.CW) }
+                else p.addRoundRect(rf, rf.height() * 0.5f, rf.height() * 0.5f, Path.Direction.CW)
+            }
+            path = p
+        }
+        holePath = path; holeSrc = src
+        val c = rects.firstOrNull { isCentral(it, w) }
+        holeRect = c?.let { r -> val g = android.graphics.Region(); g.setPath(path!!, clipOf(r)); if (g.isEmpty) r else g.bounds }
+    }
+
+    private fun cutout(): android.graphics.Rect? { loadHole(); return holeRect }
+    fun holeInfo() = "src=$holeSrc rect=${holeRect?.let { "${it.left},${it.top},${it.right},${it.bottom}" }}"
+
     private var expandUntil = 0L
     private var expandedNow = true
     private var padKey = ""
@@ -293,7 +352,8 @@ fun captureMode(on: Boolean) {
                 o.put("cutout_metrics", try { rects(wm.currentWindowMetrics.windowInsets.displayCutout) } catch (e: Throwable) { "err ${e.message}" })
                 try { val ins = wm.currentWindowMetrics.windowInsets; o.put("safe_top", ins.displayCutout?.safeInsetTop ?: 0); o.put("status_bar_h", ins.getInsets(android.view.WindowInsets.Type.statusBars()).top)
                     if (Build.VERSION.SDK_INT >= 31) o.put("round_corners", (0..3).map { ins.getRoundedCorner(it)?.radius ?: 0 }.toString()) } catch (_: Throwable) { }
-                o.put("cutout_used", cutout()?.let { "${it.left},${it.top},${it.right},${it.bottom}" } ?: "none")
+                o.put("cutout_used", cutout()?.let { "${it.left},${it.top},${it.right},${it.bottom}" } ?: "none"); o.put("hole", holeInfo())
+                try { val id = android.content.res.Resources.getSystem().getIdentifier("config_mainBuiltInDisplayCutout", "string", "android"); o.put("cutout_spec", if (id != 0) android.content.res.Resources.getSystem().getString(id).take(300) else "no resource") } catch (_: Throwable) { }
                 pill?.let { p -> val xy = IntArray(2); p.getLocationOnScreen(xy); o.put("label", "x=${xy[0]} y=${xy[1]} w=${p.width} h=${p.height} text=${p.text} expanded=$expandedNow state=$state") }
             } catch (e: Throwable) { o.put("diag_error", e.toString()) }
             l.countDown()
@@ -309,8 +369,10 @@ fun captureMode(on: Boolean) {
     private fun applyState() {
         val v = view ?: return
         v.color = colorOf(); pill?.let { updatePill(it) }
-        val w = width; val h = height; val col = colorOf(); val sh = shapeNow(w, h); val gen = ++glowGen
+        loadHole(); val hp = holePath
+        val w = width; val h = height; val col = colorOf(); val sh = shapeNow(); val gen = ++glowGen
         Thread {
+            sh.masks = hp?.let { maskOf(it, dp(36), w, h) }?.let { listOf(it) } ?: emptyList()
             val px = buildGlow(w, h, col, dp(36), sh)
             val bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
             val apply = { v.glowAt = SystemClock.uptimeMillis(); v.glowW = w; v.glowPx = px; v.glow = bmp; v.invalidate() }
@@ -318,10 +380,11 @@ fun captureMode(on: Boolean) {
         }.start()
     }
 
-    private class Shape(val rTL: Float, val rTR: Float, val rBL: Float, val rBR: Float, val holes: List<android.graphics.RectF>)
+    private class HoleMask(val x0: Int, val y0: Int, val w: Int, val h: Int, val d: FloatArray)   // d < 0: inside the hole, otherwise the distance to it in px
+    private class Shape(val rTL: Float, val rTR: Float, val rBL: Float, val rBR: Float) { var masks: List<HoleMask> = emptyList() }
 
-    /** what this particular phone looks like: the radius of each screen corner and every camera hole / notch */
-    private fun shapeNow(w: Int, h: Int): Shape {
+    /** what this particular phone looks like: the radius of each screen corner */
+    private fun shapeNow(): Shape {
         var r = floatArrayOf(0f, 0f, 0f, 0f)
         try {
             if (Build.VERSION.SDK_INT >= 31) {
@@ -334,12 +397,32 @@ fun captureMode(on: Boolean) {
                 if (id != 0) { val v = android.content.res.Resources.getSystem().getDimensionPixelSize(id).toFloat(); r = floatArrayOf(v, v, v, v) }
             }
         } catch (_: Throwable) { }
-        val holes = ArrayList<android.graphics.RectF>()
-        try {
-            val cut = (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout
-            cut?.boundingRects?.forEach { holes.add(android.graphics.RectF(it)) }
-        } catch (_: Throwable) { }
-        return Shape(r[0], r[1], r[2], r[3], holes)
+        return Shape(r[0], r[1], r[2], r[3])
+    }
+
+    /** the hole filled on a small bitmap and a distance map around it (two chamfer passes): the glow hugs the true outline */
+    private fun maskOf(path: Path, depth: Int, w: Int, h: Int): HoleMask? {
+        val b = android.graphics.RectF(); path.computeBounds(b, true); val pad = depth + 3
+        val x0 = max(0, b.left.toInt() - pad); val y0 = max(0, b.top.toInt() - pad); val x1 = min(w, b.right.toInt() + pad + 1); val y1 = min(h, b.bottom.toInt() + pad + 1)
+        val mw = x1 - x0; val mh = y1 - y0; if (mw <= 0 || mh <= 0 || mw.toLong() * mh > 6_000_000L) return null
+        val bmp = Bitmap.createBitmap(mw, mh, Bitmap.Config.ALPHA_8); val c = Canvas(bmp); c.translate(-x0.toFloat(), -y0.toFloat())
+        c.drawPath(path, Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = Color.BLACK })
+        val buf = java.nio.ByteBuffer.allocate(mw * mh); bmp.copyPixelsToBuffer(buf); val a = buf.array(); bmp.recycle()
+        val big = 1e9f; val dd = FloatArray(mw * mh) { if ((a[it].toInt() and 255) > 127) 0f else big }
+        for (y in 0 until mh) for (x in 0 until mw) {
+            val i = y * mw + x; var v = dd[i]
+            if (x > 0) v = min(v, dd[i - 1] + 1f)
+            if (y > 0) { v = min(v, dd[i - mw] + 1f); if (x > 0) v = min(v, dd[i - mw - 1] + 1.414f); if (x < mw - 1) v = min(v, dd[i - mw + 1] + 1.414f) }
+            dd[i] = v
+        }
+        for (y in mh - 1 downTo 0) for (x in mw - 1 downTo 0) {
+            val i = y * mw + x; var v = dd[i]
+            if (x < mw - 1) v = min(v, dd[i + 1] + 1f)
+            if (y < mh - 1) { v = min(v, dd[i + mw] + 1f); if (x < mw - 1) v = min(v, dd[i + mw + 1] + 1.414f); if (x > 0) v = min(v, dd[i + mw - 1] + 1.414f) }
+            dd[i] = v
+        }
+        for (i in dd.indices) if ((a[i].toInt() and 255) > 127) dd[i] = -1f
+        return HoleMask(x0, y0, mw, mh, dd)
     }
 
     /** signed distance from (px, py) to a rounded rectangle (negative inside) */
@@ -349,7 +432,7 @@ fun captureMode(on: Boolean) {
         return kotlin.math.sqrt(ox * ox + oy * oy) + min(max(qx, qy), 0f) - r
     }
 
-    /** alpha of every pixel is a fade of its distance to the nearest edge of the real screen shape (rounded corners) and to every camera hole: no seams, nothing overlaps */
+    /** alpha of every pixel is a fade of its distance to the nearest edge of the real screen shape (rounded corners) and to the true outline of every camera hole: no seams, nothing overlaps */
     private fun buildGlow(w: Int, h: Int, color: Int, depth: Int, sh: Shape): IntArray {
         val prof = IntArray(depth) { dd ->
             val t = (dd + 0.5) / depth
@@ -359,21 +442,20 @@ fun captureMode(on: Boolean) {
         }
         val px = IntArray(w * h)
         val hw = w / 2f; val hh = h / 2f; val maxR = max(max(sh.rTL, sh.rTR), max(sh.rBL, sh.rBR)); val band = depth + maxR + 2
-        val holeBand = sh.holes.map { android.graphics.RectF(it.left - depth - 2, it.top - depth - 2, it.right + depth + 2, it.bottom + depth + 2) }
         for (y in 0 until h) for (x in 0 until w) {
             val edge = min(min(x, y), min(w - 1 - x, h - 1 - y))
             var near = edge < band
-            if (!near) for (hb in holeBand) if (x >= hb.left && x <= hb.right && y >= hb.top && y <= hb.bottom) { near = true; break }
+            if (!near) for (m in sh.masks) if (x >= m.x0 && x < m.x0 + m.w && y >= m.y0 && y < m.y0 + m.h) { near = true; break }
             if (!near) continue
             val fx = x + 0.5f; val fy = y + 0.5f
             val r = if (fy < hh) (if (fx < hw) sh.rTL else sh.rTR) else (if (fx < hw) sh.rBL else sh.rBR)
             var dist = -sdRound(fx, fy, hw, hh, hw, hh, r)   // depth below the surface of the screen shape
             if (dist < 0f) continue                          // outside a rounded corner: not part of the screen
-            for (c in sh.holes) {
-                val rr = if (c.width() <= c.height() * 1.7f) min(c.width(), c.height()) / 2f else c.height() * 0.4f
-                val sd = sdRound(fx, fy, c.centerX(), c.centerY(), c.width() / 2f, c.height() / 2f, rr)
-                if (sd < 0f) { dist = -1f; break }          // inside the camera hole
-                dist = min(dist, sd)
+            for (m in sh.masks) {
+                if (x < m.x0 || x >= m.x0 + m.w || y < m.y0 || y >= m.y0 + m.h) continue
+                val v = m.d[(y - m.y0) * m.w + (x - m.x0)]
+                if (v < 0f) { dist = -1f; break }            // inside the camera hole
+                dist = min(dist, v)
             }
             if (dist < 0f) continue
             val di = dist.toInt(); if (di < depth) px[y * w + x] = prof[di]

@@ -2,7 +2,7 @@
 """HelperMCP agent for Linux. Python 3 stdlib only (GTK via python3-gi is used if present, for the overlay).
 Run: python3 <(curl -fsSL RELAY/p)"""
 import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, math, random, locale, os, platform, queue, shutil, signal, socket
-import subprocess, sys, tarfile, tempfile, threading, time
+import re, subprocess, sys, tarfile, tempfile, threading, time
 import urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
@@ -18,6 +18,12 @@ T = {
     "st_conn": ("Подключаюсь к серверу…", "Connecting to the server…"), "st_wait": ("Ожидание помощника… он подключается по коду", "Waiting for the helper to connect with the code…"),
     "st_ok": ("Помощник подключён", "Helper connected"), "st_lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
     "overlay_wait": ("Ожидание помощника…", "Waiting for the helper…"),
+    "menu_run": ("Меню:  [P] пауза    [X] завершить сеанс    [Esc] назад", "Menu:  [P] pause    [X] end the session    [Esc] back"),
+    "menu_paused": ("Пауза.  [R] продолжить    [X] завершить сеанс    [Esc] назад", "Paused.  [R] continue    [X] end the session    [Esc] back"),
+    "confirm_end": ("Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет", "End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no"),
+    "st_paused": ("Пауза: помощник ждёт. Esc — меню", "Paused: the helper is waiting. Esc = menu"),
+    "persist_q": ("Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]: ", "Keep this session through internet loss and reboots (the code stays the same)? [Y/n]: "),
+    "overlay_paused": ("Пауза", "Paused"), "resuming": ("Продолжаю прошлый сеанс", "Resuming the previous session"),
     "ready": ("Подключено. Жду действий.", "Connected. Waiting for actions."),
     "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ: ",
              "Mode: [1] ask before every action (recommended)  [2] full access: "),
@@ -338,7 +344,7 @@ def describe(name, a):
             + cut(a.get("command") or a.get("path") or a.get("name") or json.dumps(a, ensure_ascii=False), 90)]
 
 
-QUIET = {"screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
+QUIET = {"agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
          "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP")}
 
 
@@ -387,8 +393,8 @@ def copy_clip(text):
 
 
 def status_line():
-    st = "lost" if NET["s"] == "lost" else ("ok" if OP["seen"] else "wait")
-    return c("33", "  │ ") + (c("1;32", "● " + t("st_ok")) if st == "ok" else c("1;" + ORANGE, "◌ " + t("st_lost" if st == "lost" else "st_wait")))
+    st = "lost" if NET["s"] == "lost" else ("paused" if PAUSED.is_set() else ("ok" if OP["seen"] else "wait"))
+    return c("33", "  │ ") + (c("1;32", "● " + t("st_ok")) if st == "ok" else c("1;" + ORANGE, "⏸ " + t("st_paused") if st == "paused" else "◌ " + t("st_lost" if st == "lost" else "st_wait")))
 
 
 def show_status():
@@ -424,8 +430,190 @@ def key_pump():
         if ch == b"\x1b":
             if select.select([fd], [], [], 0.05)[0]:
                 os.read(fd, 8); continue                    # an arrow key or similar
-            END.set(); print(c("33", "  " + t("esc")), flush=True); os.kill(os.getpid(), signal.SIGTERM); return
+            esc_menu(fd); continue
         KEYS.put(ch.lower().decode(errors="ignore"))
+
+
+# ---- keeping the session: local state, autostart, a log, network diagnosis and one self-repair attempt --------------------
+STATE_DIR = os.environ.get("HELPER_STATE_DIR") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "helpermcp")
+SESSION_FILE = os.path.join(STATE_DIR, "session.json"); LOG_FILE = os.path.join(STATE_DIR, "agent.log")
+PAUSED = threading.Event(); FINAL = threading.Event(); PERSIST = {"on": False}
+AUTOSTART = os.path.expanduser("~/.config/autostart/helpermcp.desktop")
+
+
+def log(msg):
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1_000_000: os.replace(LOG_FILE, LOG_FILE + ".1")
+        with open(LOG_FILE, "a", encoding="utf-8") as f: f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg).replace("\n", "\n    ") + "\n")
+    except Exception: pass
+
+
+def boot_time():
+    try: return int(time.time() - float(open("/proc/uptime").read().split()[0]))
+    except Exception: return 0
+
+
+def save_session(code, token, mode):
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        fd = os.open(SESSION_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f: json.dump({"relay": RELAY, "code": code, "token": token, "mode": mode, "boot": boot_time(), "saved": int(time.time())}, f)
+    except Exception as e: log(f"cannot save the session: {e}")
+
+
+def load_session():
+    try:
+        d = json.load(open(SESSION_FILE))
+        return d if d.get("relay") == RELAY and d.get("code") and d.get("token") else None
+    except Exception: return None
+
+
+def install_autostart():
+    """after a reboot the helper starts again by itself (in a terminal, so the user sees it and can answer questions) and resumes the same session"""
+    if os.environ.get("HELPER_NO_AUTOSTART"): return
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        with urllib.request.urlopen(RELAY + "/p", timeout=20) as r: open(os.path.join(STATE_DIR, "agent.py"), "wb").write(r.read())   # the one-liner runs from memory: keep a copy
+        run = os.path.join(STATE_DIR, "start.sh")
+        open(run, "w").write("#!/usr/bin/env bash\nsleep 8\nA=\"" + os.path.join(STATE_DIR, "agent.py") + "\"\nif command -v gnome-terminal >/dev/null; then exec gnome-terminal -- python3 \"$A\"\n"
+                              "elif command -v konsole >/dev/null; then exec konsole -e python3 \"$A\"\nelif command -v xfce4-terminal >/dev/null; then exec xfce4-terminal -x python3 \"$A\"\n"
+                              "elif command -v x-terminal-emulator >/dev/null; then exec x-terminal-emulator -e python3 \"$A\"\nelse exec xterm -e python3 \"$A\"; fi\n"); os.chmod(run, 0o700)
+        os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+        open(AUTOSTART, "w").write("[Desktop Entry]\nType=Application\nName=HelperMCP (keeps your help session)\nExec=" + run + "\nX-GNOME-Autostart-enabled=true\n")
+        log("autostart installed")
+    except Exception as e: log(f"autostart failed: {e}")
+
+
+def forget_session():
+    for f in (SESSION_FILE, AUTOSTART, os.path.join(STATE_DIR, "start.sh"), os.path.join(STATE_DIR, "agent.py")):
+        try: os.remove(f)
+        except Exception: pass
+    log("session ended by the user: saved session and autostart removed")
+
+
+def set_paused(on, why="user"):
+    if on == PAUSED.is_set(): return
+    PAUSED.set() if on else PAUSED.clear(); log("paused" if on else "continued")
+    try: api("/a/state", {"paused": on}, TOKEN, timeout=8)
+    except Exception as e: log(f"could not tell the relay about the pause: {e}")
+    overlay_send("state paused" if on else ("state ok" if OP["seen"] else "state wait")); show_status()
+    print(c(ORANGE, "  ⏸ " + t("st_paused")) if on else c("32", "  ▶ " + ("продолжаем" if RU else "continuing")), flush=True)
+
+
+def end_final():
+    FINAL.set(); END.set(); log("the user confirmed the end")
+    try: api("/a/bye", {"final": True}, TOKEN, timeout=6)
+    except Exception: pass
+    forget_session(); print(c("33", "  " + t("esc")), flush=True); os.kill(os.getpid(), signal.SIGTERM)
+
+
+def esc_menu(fd):
+    """Esc opens a menu instead of ending anything: pause / continue / end (and an end needs a second confirmation)"""
+    import select
+    def key():
+        while True:
+            ch = os.read(fd, 1)
+            if not ch: return "esc"
+            if ch == b"\x1b":
+                if select.select([fd], [], [], 0.05)[0]: os.read(fd, 8); continue
+                return "esc"
+            return ch.lower().decode(errors="ignore")
+    print("\n" + c("1;30;43", "  " + (t("menu_paused") if PAUSED.is_set() else t("menu_run")) + "  "), flush=True)
+    while True:
+        k = key()
+        if k == "p" and not PAUSED.is_set(): set_paused(True); return
+        if k == "r" and PAUSED.is_set(): set_paused(False); return
+        if k == "x":
+            print(c("1;30;43", "  " + t("confirm_end") + "  "), flush=True)
+            k2 = key()
+            if k2 in ("y", "\n", "\r"): end_final(); return
+            print(c("2", "  …"), flush=True); return
+        if k in ("esc", "n", "\n", "\r"): return
+
+
+def run_cmd(cmd, tmo=5):
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=tmo, errors="replace"); return (r.stdout + r.stderr).strip()
+    except Exception as e: return f"{type(e).__name__}: {e}"
+
+
+def can_ping(host):
+    try: return subprocess.run(["ping", "-c", "1", "-W", "1", host], capture_output=True, timeout=4).returncode == 0
+    except Exception: return False
+
+
+def diagnose():
+    """what exactly is wrong with the network right now: adapters, route, gateway, internet, DNS, the relay itself"""
+    u = urllib.parse.urlparse(RELAY); host = u.hostname or ""; port = u.port or (443 if u.scheme == "https" else 80); d = {}
+    d["adapters"] = run_cmd("ip -br addr"); d["routes"] = run_cmd("ip route")
+    gw = (re.search(r"default via (\S+)", d["routes"]) or [None, None])[1]; d["gateway"] = gw
+    links = [ln.split() for ln in run_cmd("ip -br link").splitlines() if ln.strip()]
+    real = [x for x in links if x and not re.match(r"lo|docker|veth|br-|virbr", x[0])]
+    d["links_up"] = [x[0] for x in real if len(x) > 1 and x[1] in ("UP", "UNKNOWN")]
+    d["vpn"] = [x[0] for x in real if re.match(r"tun|tap|wg|ppp|ham|zt|tailscale|Meta|utun|nordlynx", x[0])]
+    d["ping_gateway"] = can_ping(gw) if gw else None; d["ping_internet"] = can_ping("1.1.1.1")
+    try: socket.getaddrinfo(host, port); d["dns_ok"] = True
+    except Exception as e: d["dns_ok"] = False; d["dns_error"] = str(e)[:120]
+    try: socket.create_connection((host, port), 3).close(); d["relay_tcp"] = True
+    except Exception as e: d["relay_tcp"] = False; d["relay_error"] = f"{type(e).__name__}: {e}"[:150]
+    if not d["links_up"]: d["class"] = "no_link"
+    elif gw and not d["ping_gateway"]: d["class"] = "lan_down"
+    elif not d["ping_internet"]: d["class"] = "isp_down"
+    elif not d["dns_ok"]: d["class"] = "dns"
+    elif not d["relay_tcp"]: d["class"] = "relay_unreachable" + ("_vpn" if d["vpn"] else "")
+    else: d["class"] = "http_or_tls"
+    return d
+
+
+def heal(d):
+    """one attempt per outage, by cause: flush DNS, or bring the active connection up again; never touches a VPN"""
+    acts = []; cls = d.get("class", "")
+    if cls == "dns":
+        acts.append("flush dns: " + (run_cmd("resolvectl flush-caches") or "ok"))
+    elif cls in ("no_link", "lan_down", "isp_down"):
+        if shutil.which("nmcli"):
+            for ln in run_cmd("nmcli -t -f NAME,DEVICE,TYPE connection show --active").splitlines():
+                parts = ln.split(":")
+                if len(parts) >= 3 and parts[2] in ("802-11-wireless", "802-3-ethernet", "ethernet", "wifi"):
+                    acts.append(f"nmcli connection up '{parts[0]}': " + (run_cmd(["nmcli", "connection", "up", parts[0]], 25)[:200] or "ok"))
+            if not acts: acts.append("no active wifi / ethernet connection to restart")
+        else: acts.append("nmcli is not installed: cannot restart the adapter")
+    elif cls.endswith("_vpn"): acts.append("a VPN adapter is up (" + ",".join(d.get("vpn", [])) + "): not touched; the relay is unreachable through it")
+    else: acts.append("nothing to repair automatically for: " + cls)
+    return acts
+
+
+OUT = {"t0": None, "diag": None, "acts": [], "healed": False}
+
+
+def outage_tick():
+    """called after every failed poll: diagnose after ~4 s, repair once after ~10 s"""
+    now = time.time()
+    if OUT["t0"] is None: OUT["t0"] = now; log("connection to the relay lost")
+    el = now - OUT["t0"]
+    if el >= 4 and OUT["diag"] is None:
+        OUT["diag"] = diagnose(); d = OUT["diag"]; log("diagnosis: class=%s gateway=%s ping_gw=%s ping_inet=%s dns=%s relay_tcp=%s vpn=%s\n%s" % (d["class"], d["gateway"], d["ping_gateway"], d["ping_internet"], d["dns_ok"], d["relay_tcp"], d["vpn"], d["adapters"]))
+    if el >= 10 and OUT["diag"] is not None and not OUT["healed"]:
+        OUT["healed"] = True; OUT["acts"] = heal(OUT["diag"]); log("repair attempt: " + " | ".join(OUT["acts"]))
+
+
+def outage_over():
+    if OUT["t0"] is None: return
+    el = int(time.time() - OUT["t0"]); d = OUT["diag"]
+    if el >= 3:
+        log(f"connection restored after {el} s")
+        ev = {"type": "outage", "duration_s": el, "class": d["class"] if d else "short", "actions": OUT["acts"], "diagnosis": json.dumps(d, ensure_ascii=False)[:3000] if d else ""}
+        try: api("/a/event", ev, TOKEN, timeout=8)
+        except Exception as e: log(f"could not send the outage report: {e}")
+    OUT.update(t0=None, diag=None, acts=[], healed=False)
+
+
+def agent_log(a):
+    n = int(a.get("lines") or 80)
+    try: lines = open(LOG_FILE, encoding="utf-8", errors="replace").read().splitlines()[-n:]
+    except Exception: lines = []
+    return {"text": "\n".join(lines) or "(the log is empty)"}
 
 
 def read_key():
@@ -780,6 +968,7 @@ from gi.repository import Gtk, Gdk, GLib
 
 label, ppid, lost_label = sys.argv[1], int(sys.argv[2]), (sys.argv[3] if len(sys.argv) > 3 else "Connection lost")
 wait_label = sys.argv[4] if len(sys.argv) > 4 else "Waiting for the helper…"
+paused_label = sys.argv[5] if len(sys.argv) > 5 else "Paused"
 BLUE, ORANGE, VIOLET = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0)
 disp = Gdk.Display.get_default()
 scr = disp.get_default_screen()
@@ -788,7 +977,7 @@ if not scr.is_composited() or scr.get_rgba_visual() is None:
 state = "ok"                         # ok | lost (connection to the relay) | wait (nobody has connected with the code yet)
 S_DEPTH = 70                         # glow depth in px
 
-def col(): return ORANGE if state in ("lost", "wait") else BLUE
+def col(): return ORANGE if state in ("lost", "wait", "paused") else BLUE
 
 def new_window(w, h, x, y):
     # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an
@@ -866,7 +1055,7 @@ def make_monitor(mon):
     pw = new_window(PILL_W + 2 * PM, 36 + 2 * PM, g.x + (g.width - PILL_W) // 2 - PM, g.y + 12 - PM)
     def pdraw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER); cr.translate(PM, PM)
-        r_, g_, b_ = col(); lost = state in ("lost", "wait"); text = lost_label if state == "lost" else wait_label if state == "wait" else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
+        r_, g_, b_ = col(); lost = state in ("lost", "wait", "paused"); text = lost_label if state == "lost" else wait_label if state == "wait" else paused_label if state == "paused" else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         ext = cr.text_extents(text); ph, rr, pad = 34, 17, 18
@@ -1209,7 +1398,7 @@ chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)
 chan.set_close_on_unref(False)
 GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
 GLib.timeout_add(16, tick)
-GLib.timeout_add(60, lambda: ([w.queue_draw() for w in pills] if (state in ("lost", "wait") or busy_fx) else None) or True)   # orange label pulses
+GLib.timeout_add(60, lambda: ([w.queue_draw() for w in pills] if (state in ("lost", "wait", "paused") or busy_fx) else None) or True)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
 GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()
@@ -1229,7 +1418,7 @@ def overlay_start():
     global OVERLAY_PROC
     if os.environ.get("HELPER_NO_OVERLAY") or not GUI["type"]: return
     try:
-        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost"), t("overlay_wait")],
+        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost"), t("overlay_wait"), t("overlay_paused")],
                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, HM_RELAY=RELAY))
     except Exception: pass
 
@@ -1269,7 +1458,7 @@ def post_result(res, token):
         api("/a/result", res, token, timeout=60)
 
 
-TOOLS = dict(actions=actions, move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
+TOOLS = dict(agent_log=agent_log, actions=actions, move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
@@ -1287,6 +1476,7 @@ def handle(cmd, mode, token):
     if not quiet_: overlay_send("busy")
     res = {"id": cmd["id"]}
     try:
+        if PAUSED.is_set() and name not in QUIET: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
         if mode == "ask" and name in ASK_TOOLS:
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
@@ -1315,13 +1505,14 @@ def net_state(st):
     if NET["s"] == st: return
     NET["s"] = st
     print(c(ORANGE, "  ◌ " + t("st_lost")) if st == "lost" else c("32", "  ● " + ("Связь восстановлена" if RU else "Connection restored")), flush=True)
-    overlay_send("state " + ("lost" if st == "lost" else ("ok" if OP["seen"] else "wait")))   # the overlay turns orange while the link is down or nobody has connected yet
+    overlay_send("state " + ("lost" if st == "lost" else ("paused" if PAUSED.is_set() else ("ok" if OP["seen"] else "wait"))))   # the overlay turns orange while the link is down or nobody has connected yet
     show_status()
 
 
-def register(mode, resume=None):
-    body = {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode}
+def register(mode, resume=None, resume_token=None, note=""):
+    body = {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode, "persist": PERSIST["on"], "note": note}
     if resume: body["resume"] = resume   # the server may have forgotten us (restart, long outage): ask for the same code back
+    if resume_token: body["resume_token"] = resume_token   # proof that it is the same PC: the server then keeps everything it has
     _, reg = api("/a/register", body, timeout=20)
     return reg
 
@@ -1330,15 +1521,29 @@ def main():
     global TOKEN
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))  # run cleanup()
     find_gui()
-    mode = os.environ.get("HELPER_MODE")
+    saved = None if os.environ.get("HELPER_NEW") else load_session()
+    mode = (saved or {}).get("mode") or os.environ.get("HELPER_MODE")
     if mode not in ("ask", "full"):
         mode = "full" if input(t("mode")).strip() == "2" else "ask"
+    persist = os.environ.get("HELPER_PERSIST")
+    if saved: PERSIST["on"] = True
+    elif persist in ("0", "1"): PERSIST["on"] = persist == "1"
+    elif sys.stdin.isatty(): PERSIST["on"] = input(t("persist_q")).strip().lower() not in ("n", "no", "н", "нет")
     wait = 1.0
+    note = ""
+    if saved:
+        print(c("33", "  " + t("resuming") + " " + saved["code"]), flush=True)
+        note = "after a reboot" if abs(saved.get("boot", 0) - boot_time()) > 90 else "restarted"
+        log(f"resuming session {saved['code']} ({note})")
     while True:   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
-        try: reg = register(mode); break
+        try: reg = register(mode, saved["code"], saved["token"], note) if saved else register(mode); break
         except Exception as e:
-            print(c(ORANGE, "  ◌ " + t("st_conn") + f" ({type(e).__name__})"), flush=True); time.sleep(min(wait, 10.0)); wait *= 1.7
+            print(c(ORANGE, "  ◌ " + t("st_conn") + f" ({type(e).__name__})"), flush=True); log(f"cannot reach the relay at start: {type(e).__name__}"); time.sleep(min(wait, 10.0)); wait *= 1.7
     token = TOKEN = reg["token"]; code = reg["code"]; LAST_OK[0] = time.time()
+    if PERSIST["on"]:
+        save_session(code, token, mode)
+        if not saved: install_autostart()
+    log(f"session {code} {'resumed' if reg.get('resumed') else 'started'} persist={PERSIST['on']} relay={RELAY}")
     overlay_start()
     copied = copy_clip(code)
     if sys.stdout.isatty(): header(code, copied)
@@ -1346,6 +1551,7 @@ def main():
     play("ok")
     if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()
     overlay_send("state wait")
+    if reg.get("resumed") and saved: OP["seen"] = True; overlay_send("state ok"); show_status()
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0
     def watchdog():   # a connection can die silently (the poll just hangs): do not stay blue for long
@@ -1360,12 +1566,16 @@ def main():
                 status, cmd = api("/a/poll", token=token, timeout=POLL_TIMEOUT)
             except urllib.error.HTTPError as e:
                 status = cmd = None
-                if e.code == 410: print("session closed (ended by the helper)"); return
-                if e.code == 401:   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
+                if e.code == 410: print("session closed (ended by the helper)"); FINAL.set(); return
+                if e.code == 401:   # unknown to the server (it was reset): register again, same code, same proof
                     try:
-                        reg = register(mode, code); token = TOKEN = reg["token"]
-                        print(f"[helper] registered again, session code: {reg['code']}", flush=True)
-                        code = reg["code"]; fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok"); continue
+                        reg = register(mode, code, token, "relay lost its state"); token = TOKEN = reg["token"]
+                        print(f"[helper] registered again, session code: {reg['code']}", flush=True); log("registered again after the relay lost its state")
+                        code = reg["code"]; fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
+                        if PERSIST["on"]: save_session(code, token, mode)
+                        continue
+                    except urllib.error.HTTPError as e2:
+                        if e2.code == 410: print("session closed"); FINAL.set(); return
                     except Exception: pass
                 failed = True
             except Exception:   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying
@@ -1373,19 +1583,24 @@ def main():
             if failed:
                 fails += 1
                 if fails >= 2: net_state("lost")
+                outage_tick()
                 time.sleep(min(delay, 10.0) * (0.8 + 0.4 * random.random())); delay *= 1.7
                 continue
+            if fails: outage_over()
             fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
             if status != 200 or not cmd: continue
-            if cmd["tool"] == "bye": print("session closed"); return
+            if cmd["tool"] == "bye": print("session closed"); FINAL.set(); return
             pool.submit(handle, cmd, mode, token)
     except KeyboardInterrupt:
         pass
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         cleanup()
-        try: api("/a/bye", {}, TOKEN, timeout=5)
+        final = FINAL.is_set() or not PERSIST["on"]   # a closed window or a reboot keeps a saved session; only the user's confirmed end (or the operator's) ends it
+        try: api("/a/bye", {"final": final}, TOKEN, timeout=5)
         except Exception: pass
+        log("stopped " + ("(session ended)" if final else "(session kept)"))
+        if final: forget_session()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ HelperMCP is a remote-control tool. Treat it like one.
 * **Operator** authenticates to `/mcp` with `OPERATOR_KEY` (constant-time compared; after 20 wrong keys an IP is locked out for 10 minutes). Anyone with the key can act on every connected agent: keep it secret and rotate it by changing the env var.
 * **Agents** authenticate with a random 256-bit token issued at registration; the relay stores only its SHA-256 (`data/state.json`, mode 0600). The short session code is only a label for the operator and grants nothing by itself.
 * **Links** (live viewer `/v/<token>`, file downloads `/f/<id>/<name>`) are unguessable (144 / 96 bits), tied to one session or one file, and expire (viewer 12 h, files 24 h). They do not reveal the operator key. Anyone who has such a link can use it, so share it only with people who may see that screen or file.
-* Agent sessions are dropped after 5 minutes without a poll (not while a call is running); the agent then registers again. At most 10 sessions per IP and 200 in total.
+* A plain session is dropped after 5 minutes without a poll (not while a call is running). A session the friend chose to **keep** (asked once when the helper starts) survives internet loss, VPN changes and reboots for up to 7 days: it stays listed as offline, the helper resumes it with the same code after the PC is back, and it ends only when the friend confirms the end in the Esc menu (or the operator ends it). Resuming needs the session's secret token (stored encrypted for the Windows user via DPAPI, `0600` on Linux), not just the code. At most 10 sessions per IP and 200 in total.
 * After the server lost its state the agent re-registers and asks for its old session code; the server hands it out if it is free. Codes are labels and never grant access (that takes the operator key), but anyone who knows a code and registers first could receive the commands meant for that PC: treat codes as private until the session ends.
 * The agent only makes outbound requests; the relay never connects into the friend's network.
 
@@ -20,6 +20,12 @@ HelperMCP is a remote-control tool. Treat it like one.
 * **Encryption at rest:** each fetched file is stored AES-256-GCM encrypted with a random key that exists only in the relay's memory (after a restart the files are unreadable and deleted). `state.json` (live sessions, so that a relay restart does not drop them) is AES-256-GCM encrypted with a key derived from `OPERATOR_KEY` and holds no screen content, file content or commands.
 * **On the friend's PC / phone:** nothing is installed. The script runs from memory, temporary files (cursor pack, overlay script, sounds) are removed on exit, the session code is removed from the clipboard when the session ends, and the system cursors / cursor theme are put back.
 * **Container:** the relay runs with a read-only root filesystem, no Linux capabilities, `no-new-privileges`, and memory / process limits (`docker-compose.yml`). Responses carry `nosniff`, `no-referrer`, HSTS and a strict Content-Security-Policy.
+
+## Staying connected
+
+* **Esc is a menu, not an exit:** pause / continue / end. Ending asks for a second confirmation. While paused every action is refused with a clear message and the session stays.
+* **Local state** (kept only when the friend chose to keep the session): `session.json` (encrypted token), the autostart entry (Windows: HKCU Run, Linux: ~/.config/autostart) and `agent.log` in `%APPDATA%\HelperMCP` / `~/.local/state/helpermcp`. All of it is removed when the session is ended.
+* **Network outage diagnosis:** after ~4 s without the relay the agent records adapters, route, gateway, internet, DNS and TCP to the relay and classifies the cause; after ~10 s it makes **one** repair attempt (flush DNS; restart the active adapter if it has the rights; it never touches a VPN) and writes everything to `agent.log`. When the link is back the report goes to the relay (`session_log`, `agent_log` for the operator).
 
 ## What a connected AI can do
 

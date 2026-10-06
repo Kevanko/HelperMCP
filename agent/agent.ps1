@@ -35,14 +35,39 @@ Add-Type -Namespace H -Name U__BUILD__ -MemberDefinition @'
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
 namespace K__BUILD__ {
-  public static class Keys {   // one reader for the keyboard: Esc ends the session at any moment, the other keys answer the questions
-    public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>(); public static volatile bool Esc; public static string Relay, Token;
+  public static class Keys {   // one reader for the keyboard: Esc opens a menu (pause / continue / end), the other keys answer the questions
+    public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>();
+    public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk;      // Esc = the user confirmed the end
+    public static string Relay, Token, MenuRun, MenuPaused, ConfirmEnd, StPaused, StRestore, Continuing;
+    public static System.IO.StreamWriter Overlay;
+    static string C(string code, string s) { return VT ? "\u001b[" + code + "m" + s + "\u001b[0m" : s; }
+    static void Say(string s) { try { Console.WriteLine(s); } catch { } }
+    static void Ov(string line) { try { var o = Overlay; if (o != null) lock (o) o.WriteLine(line); } catch { } }
+    static void Status(string text, bool ok) { if (!VT) return; try { Console.Write("\u001b7\u001b[5;1H\u001b[2K  \u001b[33m\u2502 \u001b[" + (ok ? "1;32m" : "1;38;5;208m") + text + "\u001b[0m\u001b8"); } catch { } }
+    public static void Post(string path, string json) {
+      try { var rq = (HttpWebRequest)WebRequest.Create(Relay + path); rq.Method = "POST"; rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/json"; rq.Timeout = 3000;
+        var b = System.Text.Encoding.UTF8.GetBytes(json); rq.ContentLength = b.Length; using (var st = rq.GetRequestStream()) st.Write(b, 0, b.Length); rq.GetResponse().Close(); } catch { }
+    }
+    static void SetPaused(bool on) {
+      Paused = on; Post("/a/state", on ? "{\"paused\":true}" : "{\"paused\":false}"); Ov(on ? "state paused" : (OpSeen ? "state ok" : "state wait"));
+      if (on) { Status(StPaused, false); Say(C("38;5;208", "  || " + StPaused)); } else { Status(StRestore, StRestoreOk); Say(C("32", "  \u25B6 " + Continuing)); }
+    }
+    static void Menu() {
+      Say(""); Say(C("1;30;43", "  " + (Paused ? MenuPaused : MenuRun) + "  "));
+      while (true) {
+        var k = Console.ReadKey(true).Key;
+        if (k == ConsoleKey.P && !Paused) { SetPaused(true); return; }
+        if (k == ConsoleKey.R && Paused) { SetPaused(false); return; }
+        if (k == ConsoleKey.X) {
+          Say(C("1;30;43", "  " + ConfirmEnd + "  ")); var k2 = Console.ReadKey(true).Key;
+          if (k2 == ConsoleKey.Y || k2 == ConsoleKey.Enter) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); }   // only now the session is over, for good
+          return;
+        }
+        if (k == ConsoleKey.Escape || k == ConsoleKey.N || k == ConsoleKey.Enter) return;
+      }
+    }
     public static void Start() {
-      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true);
-        if (k.Key == ConsoleKey.Escape) { Esc = true;   // tell the relay we are leaving: that also ends the poll that is waiting right now
-          try { var rq = (HttpWebRequest)WebRequest.Create(Relay + "/a/bye"); rq.Method = "POST"; rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/json"; rq.Timeout = 3000;
-                var b = System.Text.Encoding.UTF8.GetBytes("{}"); rq.ContentLength = b.Length; using (var st = rq.GetRequestStream()) st.Write(b, 0, b.Length); rq.GetResponse().Close(); } catch { } }
-        else Q.Enqueue(k.Key); } } catch { } });
+      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) Menu(); else Q.Enqueue(k.Key); } } catch { } });
       t.IsBackground = true; t.Start();
     }
   }
@@ -498,13 +523,13 @@ namespace O {
 "@
 [O.Pump]::Start()
 Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadCursorFromFile(string f); [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr h, uint id); [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);'
-$label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $ppid = [int]$env:HM_PPID
+$label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $pausedLabel = $env:HM_PAUSED; $ppid = [int]$env:HM_PPID
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 $script:state = 'ok'
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
 $BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
-function Cur() { if ($script:state -eq 'lost' -or $script:state -eq 'wait') { $ORANGE } else { $BLUE } }
+function Cur() { if ($script:state -eq 'lost' -or $script:state -eq 'wait' -or $script:state -eq 'paused') { $ORANGE } else { $BLUE } }
 
 function New-Win($x, $y, $w, $h) {
     $win = New-Object Windows.Window
@@ -541,7 +566,7 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $m = @{ win = $win; shadow = $pshadow; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
     $win.Show(); Click-Through $win; $mons += $m
 }
-function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
+function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } elseif ($script:state -eq 'paused') { $pausedLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 $script:busy = $false; $script:capHide = $false
 function Set-Busy($b) {   # working: the label's halo breathes; waiting for a command: a plain outline
@@ -562,7 +587,7 @@ function Apply-State {
         $m.img.Source = $m.cache[$key]
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
         $m.tb.Text = Label-Text
-        if ($script:state -eq 'lost' -or $script:state -eq 'wait') {   # the orange dot pulses while the link is down or nobody has connected yet
+        if ($script:state -eq 'lost' -or $script:state -eq 'wait' -or $script:state -eq 'paused') {   # the orange dot pulses while the link is down or nobody has connected yet
             $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
             $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
             $m.dot.BeginAnimation([Windows.UIElement]::OpacityProperty, $an)
@@ -821,7 +846,7 @@ function Start-Overlay {
         $psi.Arguments = '-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $file + '"'
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
         $psi.EnvironmentVariables['HM_RELAY'] = $RELAY; $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
-        $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'); $psi.EnvironmentVariables['HM_WAIT'] = (T 'Ожидание помощника…' 'Waiting for the helper…')
+        $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'); $psi.EnvironmentVariables['HM_WAIT'] = (T 'Ожидание помощника…' 'Waiting for the helper…'); $psi.EnvironmentVariables['HM_PAUSED'] = (T 'Пауза' 'Paused')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
         $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
     } catch { }   # a missing overlay must never block the help session
@@ -846,7 +871,7 @@ $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::Min
 $AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'
     write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
-$Quiet = @{ screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
+$Quiet = @{ agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
 function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
@@ -896,17 +921,114 @@ function Play-Sound($kind) {
 }
 function Enable-VT { try { $h = [H.U__BUILD__]::GetStdHandle(-11); $m = 0; if ([H.U__BUILD__]::GetConsoleMode($h, [ref]$m) -and [H.U__BUILD__]::SetConsoleMode($h, $m -bor 4)) { $script:VT = $true } } catch { } }
 $script:OperatorSeen = $false; $script:HdrDrawn = $false
+# ---- keeping the session: local state, autostart, a log, network diagnosis and one repair attempt
+$StateDir = if ($env:HELPER_STATE_DIR) { $env:HELPER_STATE_DIR } else { Join-Path $env:APPDATA 'HelperMCP' }
+$SessionFile = Join-Path $StateDir 'session.json'; $LogFile = Join-Path $StateDir 'agent.log'; $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$script:Persist = $false; $script:FinalEnd = $false
+function Write-AgentLog($m) {
+    try {
+        [void](New-Item $StateDir -ItemType Directory -Force)
+        if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 1MB) { Move-Item $LogFile "$LogFile.1" -Force }
+        Add-Content -Path $LogFile -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss ') + (([string]$m) -replace "`n", "`n    ")) -Encoding UTF8
+    } catch { }
+}
+function Get-BootTime { try { [int][DateTimeOffset]::new((Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeSeconds() } catch { 0 } }
+function Save-Session($code, $token, $mode) {   # the token is encrypted for this Windows user (DPAPI): the file is useless on another account or PC
+    try {
+        [void](New-Item $StateDir -ItemType Directory -Force)
+        $enc = ConvertFrom-SecureString (ConvertTo-SecureString $token -AsPlainText -Force)
+        @{ relay = $RELAY; code = $code; token = $enc; mode = $mode; boot = (Get-BootTime); saved = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json | Set-Content $SessionFile -Encoding UTF8
+    } catch { Write-AgentLog "cannot save the session: $_" }
+}
+function Load-Session {
+    try {
+        $d = Get-Content $SessionFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($d.relay -ne $RELAY -or -not $d.code -or -not $d.token) { return $null }
+        $tok = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $d.token)))
+        @{ code = $d.code; token = $tok; mode = $d.mode; boot = [int]$d.boot }
+    } catch { $null }
+}
+function Install-Autostart {   # after a reboot the helper starts again by itself, in a visible window, and resumes the same session
+    if ($env:HELPER_NO_AUTOSTART) { return }
+    try {
+        [void](New-Item $StateDir -ItemType Directory -Force)
+        $f = Join-Path $StateDir 'agent.ps1'
+        [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))   # the one-liner runs from memory: keep a copy
+        Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $f + '"')
+        Write-AgentLog 'autostart installed'
+    } catch { Write-AgentLog "autostart failed: $_" }
+}
+function Forget-Session {
+    foreach ($f in $SessionFile, (Join-Path $StateDir 'agent.ps1')) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
+    try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }
+    Write-AgentLog 'session ended by the user: saved session and autostart removed'
+}
+function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
+function Diagnose-Net {   # what exactly is wrong right now: adapters, route, gateway, internet, DNS, the relay itself
+    $u = [Uri]$RELAY; $d = [ordered]@{}
+    try { $ad = @(Get-NetAdapter -ErrorAction Stop | Select-Object Name, Status, InterfaceDescription, LinkSpeed); $d.adapters = ($ad | ForEach-Object { "$($_.Name) [$($_.Status)] $($_.InterfaceDescription) $($_.LinkSpeed)" }) -join '; ' } catch { $ad = @(); $d.adapters = "unavailable: $_" }
+    $up = @($ad | Where-Object { $_.Status -eq 'Up' }); $d.links_up = @($up | ForEach-Object { $_.Name })
+    $d.vpn = @($up | Where-Object { $_.InterfaceDescription -match 'TAP|TUN|WireGuard|Wintun|VPN|Meta|Tailscale|ZeroTier|Hamachi|Cisco|Fortinet|NordLynx|Clash' } | ForEach-Object { $_.Name })
+    try { $d.gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1).NextHop } catch { $d.gateway = $null }
+    if ($d.gateway -and $d.gateway -ne '0.0.0.0') { $d.ping_gateway = Test-Ping $d.gateway } else { $d.ping_gateway = $null }
+    $d.ping_internet = Test-Ping '1.1.1.1'
+    try { [void][Net.Dns]::GetHostAddresses($u.Host); $d.dns_ok = $true } catch { $d.dns_ok = $false; $d.dns_error = "$($_.Exception.InnerException.Message)" }
+    try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect($u.Host, $u.Port, $null, $null); $d.relay_tcp = ($iar.AsyncWaitHandle.WaitOne(3000) -and $c.Connected); $c.Close() } catch { $d.relay_tcp = $false; $d.relay_error = "$($_.Exception.Message)" }
+    $d.class = if (-not $d.links_up.Count) { 'no_link' } elseif ($d.gateway -and $d.ping_gateway -eq $false) { 'lan_down' } elseif (-not $d.ping_internet) { 'isp_down' } elseif (-not $d.dns_ok) { 'dns' } elseif (-not $d.relay_tcp) { if ($d.vpn.Count) { 'relay_unreachable_vpn' } else { 'relay_unreachable' } } else { 'http_or_tls' }
+    $d
+}
+function Heal-Net($d) {   # one attempt per outage, by cause; a VPN is never touched
+    $acts = @(); $cls = [string]$d.class
+    if ($cls -eq 'dns') { ipconfig /flushdns | Out-Null; $acts += 'ipconfig /flushdns' }
+    elseif ($cls -in 'no_link', 'lan_down', 'isp_down') {
+        ipconfig /flushdns | Out-Null; $acts += 'ipconfig /flushdns'
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if ($isAdmin) {
+            try { foreach ($a in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -ne 'Disabled' -and $_.InterfaceDescription -notmatch 'Bluetooth' })) { Restart-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop; $acts += "Restart-NetAdapter '$($a.Name)'" } } catch { $acts += "adapter restart failed: $($_.Exception.Message)" }
+        } else { $acts += 'restarting an adapter needs administrator rights: not done' }
+    }
+    elseif ($cls -like '*_vpn') { $acts += "a VPN adapter is up ($(@($d.vpn) -join ',')): not touched; the relay is unreachable through it" }
+    else { $acts += "nothing to repair automatically for: $cls" }
+    $acts
+}
+$script:Out = @{ t0 = $null; diag = $null; acts = @(); healed = $false }
+function Outage-Tick {   # after every failed poll: diagnose after ~4 s, repair once after ~10 s
+    $now = [DateTime]::UtcNow
+    if (-not $script:Out.t0) { $script:Out.t0 = $now; Write-AgentLog 'connection to the relay lost' }
+    $el = ($now - $script:Out.t0).TotalSeconds
+    if ($el -ge 4 -and -not $script:Out.diag) {
+        $script:Out.diag = Diagnose-Net; $d = $script:Out.diag
+        Write-AgentLog ("diagnosis: class=$($d.class) gateway=$($d.gateway) ping_gw=$($d.ping_gateway) ping_inet=$($d.ping_internet) dns=$($d.dns_ok) relay_tcp=$($d.relay_tcp) vpn=$(@($d.vpn) -join ',')`n$($d.adapters)")
+    }
+    if ($el -ge 10 -and $script:Out.diag -and -not $script:Out.healed) { $script:Out.healed = $true; $script:Out.acts = @(Heal-Net $script:Out.diag); Write-AgentLog ('repair attempt: ' + ($script:Out.acts -join ' | ')) }
+}
+function Outage-Over {
+    if (-not $script:Out.t0) { return }
+    $el = [int]([DateTime]::UtcNow - $script:Out.t0).TotalSeconds; $d = $script:Out.diag
+    if ($el -ge 3) {
+        Write-AgentLog "connection restored after $el s"
+        try { [void](Api '/a/event' @{ type = 'outage'; duration_s = $el; class = $(if ($d) { $d.class } else { 'short' }); actions = @($script:Out.acts); diagnosis = $(if ($d) { ($d | ConvertTo-Json -Compress -Depth 3) } else { '' }) } $script:Token 8) } catch { Write-AgentLog "could not send the outage report: $_" }
+    }
+    $script:Out = @{ t0 = $null; diag = $null; acts = @(); healed = $false }
+}
+function Do-AgentLog($a) {
+    $n = if ($a.lines) { [int]$a.lines } else { 80 }
+    $t = if (Test-Path $LogFile) { (Get-Content $LogFile -Tail $n -Encoding UTF8) -join "`n" } else { '' }
+    @{ text = $(if ($t) { $t } else { '(the log is empty)' }) }
+}
 function Orange($text) { if ($script:VT) { "$([char]27)[38;5;208m$text$([char]27)[0m" } else { $text } }
 function Write-Orange($text) { if ($script:VT) { [Console]::WriteLine((Orange $text)) } else { Write-Host $text -ForegroundColor DarkYellow } }
 function Status-Text {
-    $st = if ($script:Net -eq 'lost') { 'lost' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }
+    $st = if ($script:Net -eq 'lost') { 'lost' } elseif ([K__BUILD__.Keys]::Paused) { 'paused' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }
     switch ($st) {
+        'paused' { @('wait', ("||" + ' ' + (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'))) }
         'ok' { @('ok', ([char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected'))) }
         'lost' { @('lost', ([char]0x25CC + ' ' + (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'))) }
         default { @('wait', ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…'))) }
     }
 }
 function Show-Status {   # redraw only the status row (row 5) of the pinned header
+    try { [K__BUILD__.Keys]::OpSeen = $script:OperatorSeen; if (-not [K__BUILD__.Keys]::Paused) { $xx = Status-Text; [K__BUILD__.Keys]::StRestore = $xx[1]; [K__BUILD__.Keys]::StRestoreOk = ($xx[0] -eq 'ok') } } catch { }
     if (-not $script:VT -or -not $script:HdrDrawn) { return }
     try { $e = [char]27; $x = Status-Text; $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::Write("${e}7$e[5;1H$e[2K  $e[33m$([char]0x2502) $col$($x[1])$e[0m${e}8") } catch { }
 }
@@ -1004,11 +1126,12 @@ function Process-Command($cmd) {
     $quietCall = $Quiet.ContainsKey($name); if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
+        if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name)) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
         if ($script:Mode -eq 'ask' -and $AskTools -contains $name) { Ask-Permission $name $a }
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
@@ -1045,8 +1168,9 @@ function Net-State($st) {
     Show-Status
 }
 
-function Register-Agent($mode, $resume) {
-    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode }
+function Register-Agent($mode, $resume, $resumeToken, $note) {
+    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note }
+    if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
 }
@@ -1058,18 +1182,32 @@ function Start-Helper {
         $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
     }
     $script:Mode = $mode
+    $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
+    if ($saved) { $script:Mode = $mode = $saved.mode; $script:Persist = $true }
+    elseif ($env:HELPER_PERSIST -in '0', '1') { $script:Persist = ($env:HELPER_PERSIST -eq '1') }
+    elseif (-not [Console]::IsInputRedirected) { $script:Persist = ((Read-Host (T 'Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]' 'Keep this session through internet loss and reboots (the code stays the same)? [Y/n]')).Trim().ToLower() -notin 'n', 'no', 'н', 'нет') }
+    $note = ''
+    if ($saved) { Write-Host ('  ' + (T 'Продолжаю прошлый сеанс ' 'Resuming the previous session ') + $saved.code) -ForegroundColor Yellow; $note = if ([Math]::Abs($saved.boot - (Get-BootTime)) -gt 90) { 'after a reboot' } else { 'restarted' }; Write-AgentLog "resuming session $($saved.code) ($note)" }
     $wait = 1.0
     while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
-        try { $r = Register-Agent $mode $null; break }
+        try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
         catch { Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…')); Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
     }
     $token = $r.token; $script:Token = $token; $code = $r.code
+    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } }
+    Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     Play-Sound 'ok'
     Start-Overlay
     Overlay-Send 'state wait'
+    $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
+    $k::MenuRun = (T 'Меню:  [P] пауза    [X] завершить сеанс    [Esc] назад' 'Menu:  [P] pause    [X] end the session    [Esc] back'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] завершить сеанс    [Esc] назад' 'Paused.  [R] continue    [X] end the session    [Esc] back')
+    $k::ConfirmEnd = (T 'Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет' 'End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no')
+    $k::StPaused = (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'); $k::Continuing = (T 'продолжаем' 'continuing')
+    $k::StRestore = ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…')); $k::StRestoreOk = $false
+    if ($r.resumed -and $saved) { $script:OperatorSeen = $true; Overlay-Send 'state ok'; Show-Status }
     $fails = 0; $delay = 1.0
     try {
         while ($true) {
@@ -1081,34 +1219,39 @@ function Start-Helper {
                 catch {
                     if ([K__BUILD__.Keys]::Esc) { $script:EndRequested = $true; Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
                     $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }
-                    if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); return }
+                    if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); $script:FinalEnd = $true; return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
-                            $r = Register-Agent $mode $code; $script:Token = $r.token; $code = $r.code
+                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
-                        } catch { }
+                        } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }
                     }
                     $failed = $true
                 }
                 if ($failed) {   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying with backoff
                     $fails++
                     if ($fails -ge 2) { Net-State 'lost' }
+                    Outage-Tick
                     try { [Net.ServicePointManager]::FindServicePoint([Uri]$RELAY).CloseConnectionGroup('') | Out-Null } catch { }   # drop connections that died with the old route
                     Start-Sleep -Milliseconds ([int]([Math]::Min($delay, 10.0) * 1000 * (0.8 + 0.4 * (Get-Random -Maximum 1.0))))
                     $delay = $delay * 1.7; continue
                 }
+                if ($fails) { Outage-Over }
                 $fails = 0; $delay = 1.0; Net-State 'ok'
                 if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
                 $cmd = $resp.Content | ConvertFrom-Json
             }
-            if ($cmd.tool -eq 'bye') { Write-Host 'session closed'; return }
+            if ($cmd.tool -eq 'bye') { Write-Host 'session closed'; $script:FinalEnd = $true; return }
             Process-Command $cmd
             if ($script:EndRequested -or [K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
         }
     } finally {
         Cleanup-Children
-        try { [void](Api '/a/bye' @{} $script:Token 5) } catch { }
+        $final = [K__BUILD__.Keys]::Final -or $script:FinalEnd -or -not $script:Persist   # a closed window or a reboot keeps a saved session; only the user's confirmed end (or the operator's) ends it
+        try { [void](Api '/a/bye' @{ final = $final } $script:Token 5) } catch { }
+        Write-AgentLog $(if ($final) { 'stopped (session ended)' } else { 'stopped (session kept)' })
+        if ($final) { Forget-Session }
         try { if ((Get-Clipboard -Raw).Trim() -eq $code) { Set-Clipboard -Value ' ' } } catch { }   # the session code does not stay in the clipboard
         if ($script:VT) { try { $e = [char]27; [Console]::Write("$e[r$e[$([Console]::WindowHeight);1H`n") } catch { } }   # the header's scroll region off, the prompt back at the bottom
     }

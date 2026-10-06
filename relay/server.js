@@ -21,6 +21,7 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 const RECIPES_DIR = process.env.RECIPES_DIR || path.join(here, '..', 'recipes');
 const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
 const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 300_000);
+const KEEP_MS = Number(process.env.KEEP_MS || 7 * 24 * 3600_000);   // a session the user chose to keep (survives reboots and outages) waits this long for its PC
 const ONLINE_MS = 30_000;   // an agent that has not polled for this long is shown as offline (it polls every <= 15 s)
 const POLL_MS = 15_000;   // agents time out a poll after ~22 s, so a silently dead connection (VPN switch, firewall) is noticed quickly
 const MAX_SESSIONS = 200;
@@ -50,7 +51,7 @@ function save() {
     saveTimer = null;
     try {
       const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created })),
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, paused: !!s.paused, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp })),
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -59,7 +60,7 @@ function save() {
     } catch (e) { console.error('state save failed:', e.message); }
   }, 300);
 }
-const newSession = (o) => ({ ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
+const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
@@ -89,7 +90,11 @@ const safeEq = (a, b) => {
 function call(code, tool, args = {}, timeoutMs = 60_000) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
+  if (s.paused && tool !== 'bye') {
+    return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
+  }
   if (Date.now() - s.lastSeen > ONLINE_MS && !s.pending.size && tool !== 'bye') {
+    if (s.persist) return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet loss, VPN change, sleep or reboot). This session is KEPT and its agent reconnects by itself with the same code. Use wait_online to wait for it, then session_log to read what happened.`));
     return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
   // in "ask" mode a human must click through prompts, give them time
@@ -121,9 +126,11 @@ function flush(s) {
   }
 }
 
+const ended = new Map();   // codes the user (or operator) ended: an agent that still tries to come back with one is told to stop (for an hour)
 function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
+  ended.set(code, Date.now());
   sessions.delete(code); s.log.length = 0; s.queue.length = 0;
   for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }   // files fetched in this session die with it
   for (const [t, v] of viewers) if (v.code === code) { v.last = null; viewers.delete(t); }                          // so do viewer links and their last frame
@@ -138,7 +145,7 @@ setInterval(() => {
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   for (const [ip, r] of regRate) if (Date.now() - r.t > 60_000) regRate.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
-  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > SESSION_IDLE_MS) drop(code, 'Agent disconnected.');
+  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > (s.persist ? KEEP_MS : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
 
 // ---- adapting to the network: viewer frames step through quality levels, "lite" mode shrinks the AI's screenshots on slow links
@@ -191,9 +198,29 @@ const tools = [
       text: JSON.stringify([...sessions].map(([code, s]) => ({
         code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
         online: Date.now() - s.lastSeen <= ONLINE_MS, last_seen_s: Math.round((Date.now() - s.lastSeen) / 1000),
-        connected_s: Math.round((Date.now() - s.created) / 1000),
+        connected_s: Math.round((Date.now() - s.created) / 1000), paused: s.paused, kept: s.persist, events: s.events.length,
+        last_event: s.events.length ? { type: s.events[s.events.length - 1].type, ago_s: Math.round((Date.now() - s.events[s.events.length - 1].t) / 1000) } : undefined,
       })), null, 2),
     }) },
+  { name: 'session_log', session: true,
+    description: 'What happened to this remote machine: pauses, outages (with the network diagnosis the agent made and what it tried), reboots, and your recent actions. Read it after a session comes back online, and before repeating work that was interrupted.',
+    props: {}, run: async (code) => {
+      const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
+      const ago = (t) => Math.round((Date.now() - t) / 1000);
+      return { text: JSON.stringify({ online: Date.now() - s.lastSeen <= ONLINE_MS, paused: s.paused, kept_across_reboots: s.persist, last_seen_s: ago(s.lastSeen),
+        events: s.events.slice(-15).map((e) => ({ ...(e.data || {}), ago_s: ago(e.t), type: e.type })),
+        recent_actions: s.log.slice(-15).map((l) => ({ ago_s: ago(l.t), tool: l.tool, args: l.args })) }, null, 2) };
+    } },
+  { name: 'wait_online', session: true,
+    description: 'Wait until the remote machine is online again and not paused (it reconnects by itself after an internet loss or a reboot, with the same code). Returns when it is back or after timeout_s.',
+    props: { timeout_s: { type: 'integer', minimum: 1, maximum: 55, description: 'default 40' } },
+    run: async (code, a) => {
+      const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session (it was ended)');
+      const until = Date.now() + (a.timeout_s || 40) * 1000;
+      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (Date.now() - s.lastSeen <= ONLINE_MS && !s.paused) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
+      return { text: s.paused ? 'still paused by the user' : `still offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago); call wait_online again or ask the operator` };
+    } },
+  { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
   { name: 'screenshot', agent: true, description: 'Screenshot of the remote screen (what the user sees): all monitors side by side, or a single one with "monitor" (0-based, see sysinfo). Click/scroll coordinates refer to the last screenshot.',
     props: { monitor: { type: 'integer', minimum: 0, description: 'omit for all monitors' },
@@ -284,8 +311,9 @@ Workflow for any task:
 6. The network may be slow: take screenshots only when needed (monitor=N crops to one screen), avoid huge command output.
 7. The user watches the screen: make your work visible. Do windowing with the mouse (drag a title bar to move a window, drag an edge or corner to resize, click the minimise / maximise / close buttons, click taskbar icons to open or hide an app) instead of keyboard shortcuts or commands when a mouse action exists. When you read or check something, use move to glide the pointer to the text you are reading first (like a person following a line with the cursor). Skip this for background work (files, commands, MCP calls).
 8. Talk to the user while you work. At the start say whether the connection worked (list_sessions, sysinfo) and that the friend can end the session at any time with Esc. Before a group of actions say in one short line what you are going to do, afterwards whether it worked. Bundle small GUI steps (move + click, click + type, drag, scroll) into ONE actions call so the friend confirms once instead of per step. If any call comes back "ended", "denied", "Agent left" or "No such session": stop, do not retry, tell the operator.
-9. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
-10. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
+9. The session survives internet loss, VPN changes and reboots (the user chose to keep it): it comes back by itself with the same code. If a call says the PC is offline or paused, do not start over: wait_online, then read session_log (it holds the network diagnosis and what the agent already tried) and agent_log, and continue where you stopped. Only the user ending the session in their console ends it.
+10. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
+11. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -330,7 +358,7 @@ function buildMcp(fixed) {
       if (!t) throw new Error(`Unknown tool ${name}`);
       if (t.local) return fmt(await t.run(a));
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
-      if (t.run) return fmt(await t.run(session));
+      if (t.run) return fmt(await t.run(session, a));
       return fmt(await callJob(session, name, a, t.ms?.(a)));
     } catch (e) {
       return { isError: true, content: [{ type: 'text', text: e.message }] };
@@ -518,7 +546,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         state_encrypted: !!STATE_FILE, apk: fs.existsSync(APK_FILE), cursor_pack: fs.existsSync(CURSOR_DIR),
         counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => now - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size, auth_lockouts: authFails.size },
         limits: { max_sessions: MAX_SESSIONS, per_ip: MAX_PER_IP, idle_s: Math.round(SESSION_IDLE_MS / 1000) },
-        sessions: [...sessions].map(([code, x]) => ({ code, os: x.info?.os || '', host: x.info?.host || '', user: x.info?.user || '', mode: x.mode, online: now - x.lastSeen < ONLINE_MS, last_seen_s: Math.round((now - x.lastSeen) / 1000), running: x.pending.size, queued: x.queue.length, age_s: Math.round((now - x.created) / 1000) })),
+        sessions: [...sessions].map(([code, x]) => ({ code, os: x.info?.os || '', host: x.info?.host || '', user: x.info?.user || '', mode: x.mode, online: now - x.lastSeen < ONLINE_MS, last_seen_s: Math.round((now - x.lastSeen) / 1000), running: x.pending.size, queued: x.queue.length, age_s: Math.round((now - x.created) / 1000), paused: x.paused, kept: x.persist })),
       });
     }
     const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
@@ -550,11 +578,20 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const rl = regRate.get(ip) || { n: 0, t: Date.now() }; if (Date.now() - rl.t > 60_000) { rl.n = 0; rl.t = Date.now(); }   // a client PC cannot flood the server with registrations
       if (++rl.n > 20) return json(res, 429, { error: 'slow down' }); regRate.set(ip, rl);
       const info = JSON.parse((await body(req, 10_000)) || '{}');
-      let code = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(info.resume || '') && !sessions.has(info.resume) ? info.resume : null;   // same code after a server reset
+      const want = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(info.resume || '') ? info.resume : null;
+      const old = want && sessions.get(want);
+      if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
+      if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
+        old.lastSeen = Date.now(); old.ip = ip; old.mode = info.mode === 'ask' ? 'ask' : 'full'; old.persist = !!info.persist; old.paused = false;
+        old.events.push({ t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
+        console.log(`~ ${want} resumed from ${ip}`);
+        return json(res, 200, { code: want, token: info.resume_token, resumed: true });
+      }
+      let code = want && !old ? want : null;   // same code after a server reset
       if (!code) do code = newCode(); while (sessions.has(code));
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
-        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(),
+        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(), persist: !!info.persist,
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
       });
       sessions.set(code, s); save();
@@ -601,7 +638,24 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS, code, key, iv, tag: enc.getAuthTag() });
         return json(res, 200, { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n });
       }
-      if (p === '/a/bye') { console.log(`- ${code} bye`); drop(code, 'The user closed the helper or pressed Esc. STOP: do not retry, tell the operator.'); return json(res, 200, {}); }
+      if (p === '/a/state' && req.method === 'POST') {   // the user paused / resumed from the console (Esc menu)
+        const st = JSON.parse((await body(req, 2000)) || '{}'); s.paused = !!st.paused;
+        s.events.push({ t: Date.now(), type: s.paused ? 'paused' : 'continued' }); save(); return json(res, 200, {});
+      }
+      if (p === '/a/event' && req.method === 'POST') {   // what the agent saw: outages, repairs, reboots
+        const ev = JSON.parse((await body(req, 20_000)) || '{}');
+        s.events.push({ t: Date.now(), type: String(ev.type || 'event').slice(0, 40), data: JSON.parse(JSON.stringify(ev, (k, v) => (typeof v === 'string' ? v.slice(0, 3500) : v))) });
+        if (s.events.length > 40) s.events.splice(0, s.events.length - 40); save(); return json(res, 200, {});
+      }
+      if (p === '/a/bye') {
+        const b = JSON.parse((await body(req, 2000)) || '{}');
+        if (s.persist && !b.final) {   // the window closed / the PC is going down but the user did not end the session: keep it for the PC to come back
+          console.log(`- ${code} left (kept)`); s.lastSeen = 0; s.events.push({ t: Date.now(), type: 'agent_left' });
+          for (const pd of s.pending.values()) { clearTimeout(pd.timer); pd.reject(new Error('The agent went away (reboot or closed window). The session is kept: use wait_online.')); } s.pending.clear(); save();
+          return json(res, 200, {});
+        }
+        console.log(`- ${code} bye`); drop(code, 'The user ended the session (confirmed in the console). STOP: do not retry, tell the operator.'); return json(res, 200, {});
+      }
     }
     json(res, 404, { error: 'not found' });
   } catch (e) {

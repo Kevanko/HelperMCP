@@ -479,7 +479,7 @@ function landing(req, res) {
     APK_TAB: apk ? '<button class="tab" role="tab" data-p="and">android</button>' : '',
     APK_PANE: apk ? `<section class="win" id="and" role="tabpanel"><div class="bar"><i></i><i></i><i></i><span>~/android</span></div><div class="body">
 <div class="qr"><img alt="QR code with the link to the app" src="${esc(b)}/qr.svg?u=${encodeURIComponent(b + '/apk')}"><div>
-<ol><li data-i="a1">Scan the code with the phone camera, or open the link, and download the app.</li><li data-i="a2">Allow the install and open <b>HelperMCP</b>.</li><li data-i="a3">Tap <b>Allow control</b>, switch HelperMCP on, then tap <b>Start help</b>.</li></ol>
+<ol><li data-i="a1">Scan the code with the phone camera, or open the link, and download the app.</li><li data-i="a2">Allow the install and open <b>HelperMCP</b>. If Google warns about a dangerous app, tap <b>More details</b> → <b>Install anyway</b> (not Cancel). Android 11 or newer.</li><li data-i="a3">Tap <b>Allow control</b>, switch HelperMCP on, then tap <b>Start help</b>.</li></ol>
 <div class="cmd"><small data-i="aLink">Link</small><pre>${esc(b)}/apk</pre><button class="cp" data-t="${esc(b)}/apk">Copy</button></div>
 <a class="btn" href="${esc(b)}/apk" data-i="aBtn">Download APK</a></div></div></div></section>` : '',
   };

@@ -240,6 +240,20 @@ const tools = [
       let L = []; try { L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-(a.limit || 20)); } catch { /* none yet */ }
       return { text: L.length ? '[' + L.join(',\n') + ']' : 'no mistakes logged yet' };
     } },
+  { name: 'set_look', session: true,
+    description: 'Android phone: choose how your presence looks to the user. "color" (#RRGGBB) is the glow and label colour while you work: pick one you like, ONCE at the start; it cannot be changed again in this session (no flicker of colours). "note" (up to 90 chars) is a short line shown in the app and on the label, e.g. "Checking the subscription again in 5 min"; update it whenever it helps the user to know what is going on (not more than once a minute). Other systems: only logged.',
+    props: { color: str('#RRGGBB, once per session'), note: str('short status line, you may update it') },
+    run: async (code, a) => {
+      const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
+      const now = Date.now();
+      if (a.note && s.lastNoteAt && now - s.lastNoteAt < 30_000) throw new Error('The note was changed a moment ago: wait, the user needs time to read it (once per 30 s at most).');
+      if (a.note) s.lastNoteAt = now;
+      if (a.color && s.lookColor) a = { ...a, color: '' };   // the colour is fixed after the first time
+      else if (a.color) s.lookColor = String(a.color).slice(0, 9);
+      s.events.push({ t: now, type: 'look', data: { color: s.lookColor || '', note: String(a.note || '').slice(0, 90) } });
+      if (/android/i.test(s.info?.os || '')) return { text: String((await call(c, 'look', { color: a.color || '', note: String(a.note || '').slice(0, 90) })).text || 'ok') };
+      return { text: 'noted (only phones show it)' };
+    } },
   { name: 'hold', session: true,
     description: 'Put the session on hold when you must stop for a while (your token or rate limit is running out, a long break, waiting for the user). The phone shows an orange "helper is on hold, back soon" label, keeps its screen awake and the session open; your next action continues it. Unlike pause (which the user presses) you start it yourself. Elsewhere it is only logged.',
     props: { reason: str('why you stop'), back_in_minutes: { type: 'integer', minimum: 1, maximum: 1440, description: 'when you expect to continue' } },
@@ -362,7 +376,7 @@ Workflow for any task:
 9. The session survives internet loss, VPN changes and reboots (the user chose to keep it): it comes back by itself with the same code. If a call says the PC is offline or paused, do not start over: wait_online, then read session_log (it holds the network diagnosis and what the agent already tried) and agent_log, and continue where you stopped. Only the user ending the session in their console ends it.
 10. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
 11. This is the user's real machine: only touch what the task needs, and say what you installed or changed.
-12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done. If you must stop for a while (token or rate limit, a long break) call hold first, so the phone stays awake and the session stays open.`;
+12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done. If you must stop for a while (token or rate limit, a long break) call hold first, so the phone stays awake and the session stays open. On a phone you may also call set_look once at the start (a colour you like) and keep its note line current.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });

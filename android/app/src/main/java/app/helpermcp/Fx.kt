@@ -149,7 +149,7 @@ fun captureMode(on: Boolean) {
         val px = IntArray(w * h); b.getPixels(px, 0, w, 0, 0, w, h)
         // which colour is really on the screen (a swap can be a frame behind): the right one never takes a channel below zero
         var best = view?.color ?: BLUE; var bestErr = Long.MAX_VALUE
-        for (c in intArrayOf(BLUE, ORANGE, GREEN)) {
+        for (c in intArrayOf(okColor, BLUE, ORANGE, GREEN)) {
             var err = 0L; var i = 0
             while (i < px.size) {
                 val gp = g[i]; val a = gp ushr 24
@@ -195,12 +195,37 @@ fun captureMode(on: Boolean) {
     private var anim: ValueAnimator? = null
     val width get() = wm.currentWindowMetrics.bounds.width()
     val height get() = wm.currentWindowMetrics.bounds.height()
-    private fun colorOf() = when (state) { "ok" -> BLUE; "done" -> GREEN; else -> ORANGE }
+    // the helper's own look: a colour for the working state (set once per session, never flipped) and a short note shown in the app and on the label
+    private var okColor = BLUE
+    private var lookLocked = false
+    var noteText = ""; private set
+    private fun colorOf() = when (state) { "ok" -> okColor; "done" -> GREEN; else -> ORANGE }
+
+    /** returns what was applied; the colour only the first time in a session */
+    fun setLook(color: String, note: String): String {
+        val out = StringBuilder()
+        if (color.isNotBlank()) {
+            if (lookLocked) out.append("colour is already fixed for this session (not changed). ")
+            else try {
+                val hsv = FloatArray(3); Color.colorToHSV(Color.parseColor(if (color.startsWith("#")) color else "#$color"), hsv)
+                hsv[1] = max(hsv[1], 0.55f); hsv[2] = max(hsv[2], 0.85f)   // always bright and saturated enough to be seen on any screen
+                val c = Color.HSVToColor(hsv); lookLocked = true
+                main.post { okColor = c; if (state == "ok") applyState() else view?.color = c }
+                out.append("colour set (fixed for the session). ")
+            } catch (_: Throwable) { out.append("colour not understood (use #RRGGBB). ") }
+        }
+        if (note.isNotBlank() || note == " ") {
+            val n = note.trim().take(90); main.post { noteText = n; expandUntil = SystemClock.uptimeMillis() + 6000; pill?.let { updatePill(it) } }; out.append("note shown. ")
+        }
+        return out.toString().trim().ifEmpty { "nothing to change" }
+    }
+
+    fun clearLook() { okColor = BLUE; lookLocked = false; noteText = "" }
     private fun dp(v: Int) = (v * d).toInt()
 
     fun show() = main.post {
         if (view != null) return@post
-        startedAt = SystemClock.elapsedRealtime()
+        startedAt = SystemClock.elapsedRealtime(); clearLook()
         val v = FxView(svc); view = v
         wm.addView(v, WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
@@ -311,7 +336,7 @@ fun captureMode(on: Boolean) {
         if (exp) {
             val key = "e"; if (padKey != key) { padKey = key; p.setPadding(m + dp(18), m + dp(8), m + dp(18), m + dp(8)) }
             p.text = when (state) {
-                "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
+                "ok" -> "●  " + (if (noteText.isNotEmpty()) noteText else t("Удалённое управление", "Remote control")) + "  $clock"
                 "done" -> "✓  " + t("Работа выполнена", "Work finished")
                 "hold" -> "||  " + t("Помощник на паузе, вернётся", "The helper is on hold, back soon")
                 "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")

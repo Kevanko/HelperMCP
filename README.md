@@ -120,6 +120,7 @@ A separate app (`android/`, Kotlin, no dependencies, Android 11+) instead of the
 * **Mistake log:** a tap that lands on nothing tappable is answered with `MISS: …nearest tappable "X" at x,y` and written to `data/misses.jsonl` with the last 8 actions before it (typed text is never stored, only its length). The AI also calls `report_miss` when it had to redo something (what it wanted, what happened, what worked); read the log with the `misses` tool to find patterns.
 * **Phone label states:** blue island = working (the timer starts with the first action); `task_done` shows a green "Work finished" label and resets the timer; 150 s without a call returns it to orange "waiting for the helper". Screen off = pause; it continues 4 s after the phone is on and unlocked.
 * **Long sessions:** the AI can call `hold` before it stops (token or rate limit, a long break): the phone shows an orange "helper is on hold, back soon" label, keeps the screen awake and the session open, and the next action continues it. The screen is kept on for the whole session (the CPU lock is renewed every 30 min). The app has a slider for the screen corner radius of the glow (0 = automatic).
+* **The AI chooses its look:** `set_look` sets the working colour once per session (it cannot be changed again, so colours never flicker) and a short note (90 chars, at most once per 30 s) that the app shows under the status and on the label, e.g. "checking the subscription again in 5 min".
 
 ## Stability: pause, outages, reboots
 

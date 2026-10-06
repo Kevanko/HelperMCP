@@ -37,6 +37,7 @@ class HelperService : AccessibilityService() {
         @Volatile var phase = "off"        // off (service not enabled) | ready | connecting | wait | ok | lost
         @Volatile var code: String? = null
         @Volatile var running = false
+        @Volatile var note = ""
         @Volatile var paused = false
     }
 
@@ -65,7 +66,7 @@ class HelperService : AccessibilityService() {
     // ------------------------------------------------------------------------------------------ session
     fun startSession(relay: String, ask: Boolean) {
         if (running) return
-        paused = false; registerScreenReceiver()
+        paused = false; note = ""; registerScreenReceiver()
         running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; phase = "connecting"
         fx.onEnd = { endSession() }
         Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
@@ -184,9 +185,9 @@ class HelperService : AccessibilityService() {
     private fun handle(relay: String, token: String, cmd: JSONObject) {
         val id = cmd.getString("id"); val tool = cmd.getString("tool"); val args = cmd.optJSONObject("args") ?: JSONObject()
         if (tool == "bye") { ended = true; return }
-        if (!args.optBoolean("view") && tool != "task_done" && tool != "hold") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
+        if (!args.optBoolean("view") && tool != "task_done" && tool != "hold" && tool != "look") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done" || tool == "hold"
+        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done" || tool == "hold" || tool == "look"
         if (!quiet) fx.setBusy(true)
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
@@ -256,6 +257,7 @@ class HelperService : AccessibilityService() {
         "sysinfo" -> ok(sysinfo().toString(2))
         "screenshot" -> screenshot(a)
         "click" -> click(a)
+        "look" -> { val r = fx.setLook(a.optString("color"), a.optString("note")); if (a.optString("note").isNotBlank()) note = a.optString("note").trim().take(90); ok(r) }
         "hold" -> { phase = "hold"; opSeen = false; lastOpAt = 0; fx.setState("hold"); ok() }
         "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }

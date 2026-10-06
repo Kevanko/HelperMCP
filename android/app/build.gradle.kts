@@ -13,8 +13,8 @@ android {
         applicationId = "app.helpermcp"
         minSdk = 30            // AccessibilityService.takeScreenshot needs Android 11
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.4.7"
+        versionCode = 17
+        versionName = "0.4.8"
         buildConfigField("String", "RELAY", "\"$relayUrl\"")
     }
     buildFeatures { buildConfig = true }

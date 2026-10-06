@@ -41,7 +41,9 @@ object Update {
                     while (true) { val n = ins.read(buf); if (n < 0) break; out.write(buf, 0, n); done += n; if (total > 0) progress = "downloading ${done * 100 / total}%" }
                 } }
                 val pi = ctx.packageManager.packageInstaller
-                val id = pi.createSession(PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL))
+                val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+                if (Build.VERSION.SDK_INT >= 31) params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)   // an update by the app that installed it: Android 12+ may then apply it without the confirmation dialog
+                val id = pi.createSession(params)
                 pi.openSession(id).use { s ->
                     file.inputStream().use { ins -> s.openWrite("app", 0, file.length()).use { out -> ins.copyTo(out); s.fsync(out) } }
                     val pending = PendingIntent.getBroadcast(ctx, id, Intent(ctx, InstallReceiver::class.java), PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)

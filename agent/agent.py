@@ -1080,7 +1080,7 @@ CW = 140; HX = HY = 44               # cursor window size and where the arrow ti
 cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-busy_fx = False; last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
+busy_fx = False; busy_off = 0; last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -1358,7 +1358,15 @@ def on_line(line):
     if not f: return
     if f[0] == "state" and len(f) > 1: set_state(f[1]); return
     if f[0] in ("busy", "idle"):
-        global busy_fx; busy_fx = f[0] == "busy"; [w.queue_draw() for w in pills]; return
+        global busy_fx, busy_off
+        if busy_off: GLib.source_remove(busy_off); busy_off = 0
+        if f[0] == "busy": busy_fx = True; [w.queue_draw() for w in pills]
+        else:   # the halo stays through the gap between two calls of the AI
+            def off():
+                global busy_fx, busy_off
+                busy_fx = False; busy_off = 0; [w.queue_draw() for w in pills]; return False
+            busy_off = GLib.timeout_add(2500, off)
+        return
     if f[0] == "clip" and len(f) > 1:
         cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD); cb.set_text(f[1], -1); cb.store(); return
     if f[0] == "pre":                               # about to click: over the panel the arrow window would swallow the click

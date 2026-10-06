@@ -569,6 +569,7 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
 function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } elseif ($script:state -eq 'paused') { $pausedLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 $script:busy = $false; $script:capHide = $false
+$script:busyOff = New-Object Windows.Threading.DispatcherTimer; $script:busyOff.Interval = [TimeSpan]::FromMilliseconds(2500); $script:busyOff.Add_Tick({ $script:busyOff.Stop(); Set-Busy $false })
 function Set-Busy($b) {   # working: the label's halo breathes; waiting for a command: a plain outline
     $script:busy = $b
     foreach ($m in $mons) {
@@ -740,8 +741,8 @@ function On-Line($line) {
     if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { $script:state = $f[1]; Apply-State }; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
     if ($f[0] -eq 'uncap') { $script:capHide = $false; foreach ($m in $mons) { $m.win.Opacity = 1 }; $rwin.Opacity = 1; return }
-    if ($f[0] -eq 'busy') { Set-Busy $true; return }
-    if ($f[0] -eq 'idle') { Set-Busy $false; return }
+    if ($f[0] -eq 'busy') { $script:busyOff.Stop(); Set-Busy $true; return }
+    if ($f[0] -eq 'idle') { $script:busyOff.Stop(); $script:busyOff.Start(); return }   # the halo stays through the gap between two calls of the AI
     $script:lastActive = $now
     switch ($f[0]) {
         'click' { $script:pressedT = $now; $c = if ($f[3] -eq 'right') { $VIOLET } else { Cur }; $script:rip = @{ x = [double]$f[1]; y = [double]$f[2]; t = $now; c = $c } }

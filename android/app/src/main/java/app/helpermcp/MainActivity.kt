@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var codeView: TextView
     private lateinit var hint: TextView
     private lateinit var allow: TextView
+    private lateinit var pauseBtn: TextView
     private lateinit var versionLine: TextView
     private lateinit var updateBtn: TextView
     private val allowViews = ArrayList<View>()
@@ -60,6 +61,7 @@ class MainActivity : Activity() {
         val appInfo = button(t("Сведения о приложении", "App info"), 0xFF37474F.toInt()) { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) }
         col.addView(appInfo); allowViews.add(appInfo)
         start = button(t("2. Начать помощь", "2. Start help"), 0xFF2E7D32.toInt()) { toggle() }; col.addView(start)
+        pauseBtn = button(t("Пауза", "Pause"), 0xFF8D6E63.toInt()) { HelperService.inst?.setPaused(!HelperService.paused) }; col.addView(pauseBtn)
         askSwitch = Switch(this).apply { text = t("Спрашивать подтверждение каждого действия", "Ask before every action"); setTextColor(Color.WHITE); isChecked = prefs.getBoolean("ask", true); setPadding(0, dp(18), 0, 0) }; col.addView(askSwitch)
         col.addView(TextView(this).apply { text = t("Сервер", "Server"); setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(16), 0, 0) })
         relay = EditText(this).apply { setText(prefs.getString("relay", BuildConfig.RELAY)); setTextColor(Color.WHITE); inputType = InputType.TYPE_TEXT_VARIATION_URI; textSize = 14f }; col.addView(relay)
@@ -89,15 +91,18 @@ class MainActivity : Activity() {
             "wait" -> t("◌ Ожидание помощника… назовите ему код", "◌ Waiting for the helper… give them the code")
             "ok" -> t("● Помощник подключён", "● Helper connected")
             "lost" -> t("◌ Связь потеряна, переподключение…", "◌ Connection lost, reconnecting…")
+            "paused" -> t("⏸ Пауза: помощник ждёт", "⏸ Paused: the helper is waiting")
             else -> if (on) t("Готово к запуску", "Ready to start") else t("Сначала разрешите управление (шаг 1)", "Allow control first (step 1)")
         }
         status.setTextColor(if (HelperService.phase == "ok") 0xFF66BB6A.toInt() else 0xFFFFB347.toInt())
         val code = HelperService.code
         codeView.visibility = if (code != null && HelperService.running) View.VISIBLE else View.GONE
         codeView.text = code ?: ""
-        hint.text = if (code != null && HelperService.running) t("Код скопирован в буфер. Чтобы закончить, удерживайте плашку «✕» сверху экрана или нажмите кнопку ниже.", "The code is copied. To stop, hold the “✕” label at the top of the screen or tap the button below.") else ""
+        hint.text = if (code != null && HelperService.running) t("Код скопирован в буфер. Экран выключили — помощь встанет на паузу сама и продолжится после разблокировки. Чтобы закончить, нажмите кнопку ниже.", "The code is copied. Switching the screen off pauses the help by itself; it continues after you unlock. To stop, tap the button below.") else ""
         allow.visibility = if (on) View.GONE else View.VISIBLE
         allowViews.forEach { it.visibility = if (on) View.GONE else View.VISIBLE }
+        pauseBtn.visibility = if (HelperService.running) View.VISIBLE else View.GONE
+        pauseBtn.text = if (HelperService.paused) t("Продолжить", "Continue") else t("Пауза", "Pause")
         start.text = if (HelperService.running) t("Завершить помощь", "End help") else t("2. Начать помощь", "2. Start help")
         if (System.currentTimeMillis() % 20000 < 600) Update.check(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY })
         versionLine.text = "v" + BuildConfig.VERSION_NAME + (if (up != null) "  →  " + up.optString("versionName") else if (Update.checked == "ok") t("  (последняя версия)", "  (up to date)") else if (Update.checked.isNotEmpty()) "  (" + Update.checked + ")" else "")

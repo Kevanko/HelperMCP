@@ -126,8 +126,13 @@ class Fx(private val svc: AccessibilityService) {
     private var pulse: ValueAnimator? = null
     private var pulseV = 0f
     fun captureMode(on: Boolean) { if (SECURE_WORKS) return; val l = CountDownLatch(1); main.post { for (v in listOf<View?>(view, pill, card)) v?.visibility = if (on) View.INVISIBLE else View.VISIBLE; l.countDown() }; l.await(1, TimeUnit.SECONDS); if (on) Thread.sleep(60) }
+    private val busyOff = Runnable { applyBusy(false) }
     fun setBusy(b: Boolean) = main.post {
-        if (busy == b) return@post; busy = b; pulse?.cancel()
+        main.removeCallbacks(busyOff)
+        if (b) applyBusy(true) else main.postDelayed(busyOff, 2500)   // the halo stays through the gap between two calls of the AI
+    }
+    private fun applyBusy(b: Boolean) {
+        if (busy == b) return; busy = b; pulse?.cancel()
         if (b) pulse = ValueAnimator.ofFloat(0f, 1f).apply { duration = 700; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; addUpdateListener { pulseV = it.animatedValue as Float; pill?.let { p -> updatePill(p) } }; start() }
         else { pulseV = 0f; pill?.let { updatePill(it) } }
     }
@@ -146,35 +151,47 @@ class Fx(private val svc: AccessibilityService) {
         val v = FxView(svc); view = v
         wm.addView(v, WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
-            .apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES })
+            .apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES; setFitInsetsTypes(0) })
         val p = TextView(svc).apply {
             setTextColor(Color.WHITE); textSize = 14f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
-            setPadding(dp(18 + 22), dp(8 + 22), dp(18 + 22), dp(8 + 22)); setOnLongClickListener { onEnd?.invoke(); true }   // long press only: an injected tap that lands here must not end the session
+            setPadding(dp(18 + 22), dp(8 + 22), dp(18 + 22), dp(8 + 22))   // the label is not touchable: taps go through it
         }
         pill = p
         wm.addView(p, WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(8) })
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT).apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; y = dp(8); layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES })
         pendingPointer?.let { v.pointer = it.first; v.hotX = it.second; v.hotY = it.third }
         applyState(); tick()
     }
 
     private fun tick() {
         val p = pill ?: return
-        updatePill(p); main.postDelayed({ tick() }, 1000)
+        updatePill(p); main.postDelayed({ tick() }, 500)
     }
 
+    private var expandUntil = 0L
+    private var expandedNow = true
     private fun updatePill(p: TextView) {
         val s = ((SystemClock.elapsedRealtime() - startedAt) / 1000).toInt()
-        p.text = when (state) {
-            "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  %02d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) + "   ✕"
-            "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…") + "   ✕"
-            else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…") + "   ✕"
+        val clock = if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) else "%02d:%02d".format(s / 60, s % 60)
+        // an island by the camera while everything is fine; the full label opens for a few seconds on a change and stays open while something needs attention
+        val exp = state != "ok" || SystemClock.uptimeMillis() < expandUntil
+        if (exp != expandedNow) {
+            expandedNow = exp
+            p.textSize = if (exp) 14f else 11f
+            p.setPadding(dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22), dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22))
+            try { val lp = p.layoutParams as WindowManager.LayoutParams; lp.y = if (exp) dp(8) else -dp(14); wm.updateViewLayout(p, lp) } catch (_: Throwable) { }
+        }
+        p.text = if (!exp) "●  $clock" else when (state) {
+            "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
+            "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")
+            "paused" -> "||  " + t("Пауза: помощник ждёт", "Paused: the helper is waiting")
+            else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…")
         }
         val bg = (p.background as? PillBg) ?: PillBg(dp(22)).also { p.background = it }
         bg.col = colorOf(); bg.busy = busy; bg.pulse = pulseV; bg.r = dp(20).toFloat(); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
     }
 
-    fun setState(s: String) = main.post { if (state != s) { state = s; applyState() } }
+    fun setState(s: String) = main.post { if (state != s) { state = s; expandUntil = SystemClock.uptimeMillis() + 3500; applyState() } }
 
     private fun applyState() {
         val v = view ?: return

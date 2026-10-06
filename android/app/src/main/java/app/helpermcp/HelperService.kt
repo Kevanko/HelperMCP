@@ -36,6 +36,7 @@ class HelperService : AccessibilityService() {
         @Volatile var phase = "off"        // off (service not enabled) | ready | connecting | wait | ok | lost
         @Volatile var code: String? = null
         @Volatile var running = false
+        @Volatile var paused = false
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -57,12 +58,40 @@ class HelperService : AccessibilityService() {
     // ------------------------------------------------------------------------------------------ session
     fun startSession(relay: String, ask: Boolean) {
         if (running) return
+        paused = false; registerScreenReceiver()
         running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; phase = "connecting"
         fx.onEnd = { endSession() }
         Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
     }
 
-    fun endSession() { ended = true; fx.hide() }
+    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); fx.hide() }
+
+    /** pause / continue: by the button in the app, and automatically when the screen is switched off (and back on after unlock) */
+    fun setPaused(on: Boolean) {
+        if (!running || paused == on) return
+        paused = on; phase = if (on) "paused" else if (opSeen) "ok" else "wait"; fx.setState(if (on) "paused" else phase)
+        val relayUrl = prefsRelay()
+        Thread { try { Net.req(relayUrl, "POST", "/a/state", sessionToken, "{\"paused\":$on}".toByteArray(), timeoutMs = 8000) } catch (_: Throwable) { } }.start()
+        if (!on) Sound.play("ok")
+    }
+    private fun prefsRelay() = getSharedPreferences("cfg", MODE_PRIVATE).getString("relay", BuildConfig.RELAY) ?: BuildConfig.RELAY
+    @Volatile private var sessionToken = ""
+    private var screenRx: android.content.BroadcastReceiver? = null
+    private fun registerScreenReceiver() {
+        if (screenRx != null) return
+        screenRx = object : android.content.BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                when (i.action) {
+                    Intent.ACTION_SCREEN_OFF -> setPaused(true)       // the user switched the screen off: nobody should be tapping on it
+                    Intent.ACTION_USER_PRESENT -> setPaused(false)    // unlocked again: the helper continues
+                    Intent.ACTION_SCREEN_ON -> if (!(getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked) setPaused(false)   // no lock screen: on means back
+                }
+            }
+        }
+        val f = android.content.IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_USER_PRESENT) }
+        registerReceiver(screenRx, f)
+    }
+    private fun unregisterScreenReceiver() { try { screenRx?.let { unregisterReceiver(it) } } catch (_: Throwable) { }; screenRx = null }
 
     private fun register(relay: String, resume: String?): JSONObject {
         val body = JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("host", "${Build.MANUFACTURER} ${Build.MODEL}")
@@ -82,7 +111,7 @@ class HelperService : AccessibilityService() {
             if (ended) return
             try { reg = register(relay, null); break } catch (_: Throwable) { Thread.sleep(wait.coerceAtMost(10000)); wait = (wait * 1.7).toLong() }
         }
-        token = reg.getString("token"); code = reg.getString("code")
+        token = reg.getString("token"); code = reg.getString("code"); sessionToken = token
         main.post { try { (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("code", code)) } catch (_: Throwable) { } }
         fx.show(); fx.setState("wait"); phase = "wait"; Sound.play("ok")
         Thread { loadPointer(relay) }.start()
@@ -140,6 +169,7 @@ class HelperService : AccessibilityService() {
         val quiet = tool == "screenshot" || tool == "sysinfo"
         if (!quiet) fx.setBusy(true)
         try {
+            if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
             data = exec(tool, args)
         } catch (e: Throwable) { error = e.message ?: e.javaClass.simpleName }

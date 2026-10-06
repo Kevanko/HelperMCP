@@ -60,6 +60,18 @@ function save() {
     } catch (e) { console.error('state save failed:', e.message); }
   }, 300);
 }
+// ---- mistakes: an action that missed (a tap on nothing, a wrong screen) is kept with the path that led to it, to analyse and fix later
+const MISS_FILE = process.env.MISS_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'misses.jsonl') : path.join(os.tmpdir(), 'helpermcp-misses.jsonl'));
+function recordMiss(s, code, kind, info) {
+  try {
+    const redact = (a) => String(a || '').replace(/("text"\s*:\s*")((?:[^"\\]|\\.)*)(")/g, (_m, p, v, q) => `${p}<${v.length} chars>${q}`);
+    const e = { t: new Date().toISOString(), session: code, kind, device: `${s.info?.host || ''} / ${s.info?.os || ''}`, ...info,
+      trail: s.log.slice(-8).map((l) => ({ ago_s: Math.round((Date.now() - l.t) / 1000), tool: l.tool, args: redact(l.args) })) };
+    fs.appendFileSync(MISS_FILE, JSON.stringify(e) + '\n', { mode: 0o600 });
+    if (fs.statSync(MISS_FILE).size > 2_000_000) { const L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n'); fs.writeFileSync(MISS_FILE, L.slice(-500).join('\n') + '\n', { mode: 0o600 }); }
+    s.events.push({ t: Date.now(), type: 'miss', data: { kind, ...info } });
+  } catch (e) { console.error('miss log failed:', e.message); }
+}
 const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
@@ -100,9 +112,11 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'ask') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
+  let argStr = '';
   if (!args.view) { // live-viewer frames are not "actions"
     const a = JSON.stringify(args, (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v));
-    s.log.push({ t: Date.now(), tool, args: a === '{}' ? '' : a.slice(0, 160) });
+    argStr = a === '{}' ? '' : a.slice(0, 160);
+    s.log.push({ t: Date.now(), tool, args: argStr });
     if (s.log.length > 60) s.log.shift();
   }
   const id = crypto.randomUUID();
@@ -111,7 +125,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
       s.pending.delete(id);
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
     }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, view: !!args.view });
+    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view });
     s.queue.push({ id, tool, args });
     flush(s);
   });
@@ -210,6 +224,30 @@ const tools = [
       return { text: JSON.stringify({ online: Date.now() - s.lastSeen <= ONLINE_MS, paused: s.paused, kept_across_reboots: s.persist, last_seen_s: ago(s.lastSeen),
         events: s.events.slice(-15).map((e) => ({ ...(e.data || {}), ago_s: ago(e.t), type: e.type })),
         recent_actions: s.log.slice(-15).map((l) => ({ ago_s: ago(l.t), tool: l.tool, args: l.args })) }, null, 2) };
+    } },
+  { name: 'report_miss', session: true,
+    description: 'Log a mistake you made on this device so it can be analysed and fixed later: you tapped/typed/opened the wrong thing, then corrected it. Call it right after you noticed (the last actions are attached automatically). Example: wanted to open Telegram and check a subscription, tapped beside the icon, got it on the 2nd try.',
+    props: { wanted: str('what you meant to do'), happened: str('what actually happened (wrong tap, wrong screen, nothing)'), fixed_by: str('what finally worked'), app: str('app or screen, if known') }, required: ['wanted', 'happened'],
+    run: async (code, a) => {
+      const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
+      recordMiss(s, String(code).toUpperCase(), 'reported', { wanted: String(a.wanted).slice(0, 300), happened: String(a.happened).slice(0, 400), fixed_by: String(a.fixed_by || '').slice(0, 300), app: String(a.app || '').slice(0, 100) });
+      return { text: 'logged' };
+    } },
+  { name: 'misses', local: true,
+    description: 'Read the mistake log (taps that hit nothing, wrong screens, with the path of actions before each) to find patterns and fix the instructions or the app.',
+    props: { limit: { type: 'integer', minimum: 1, maximum: 100, description: 'default 20' } },
+    run: async (a) => {
+      let L = []; try { L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-(a.limit || 20)); } catch { /* none yet */ }
+      return { text: L.length ? '[' + L.join(',\n') + ']' : 'no mistakes logged yet' };
+    } },
+  { name: 'task_done', session: true,
+    description: 'Tell the user you have finished the job on this device. A phone shows a green "work finished" label and resets its timer; the session stays open and turns blue again on your next action. Call it when you are done, before you stop.',
+    props: { summary: str('one line of what was done') },
+    run: async (code, a) => {
+      const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
+      s.events.push({ t: Date.now(), type: 'done', data: { summary: String(a.summary || '').slice(0, 200) } });
+      if (/android/i.test(s.info?.os || '')) await call(c, 'task_done', {});
+      return { text: 'marked as finished' };
     } },
   { name: 'wait_online', session: true,
     description: 'Wait until the remote machine is online again and not paused (it reconnects by itself after an internet loss or a reboot, with the same code). Returns when it is back or after timeout_s.',
@@ -313,7 +351,8 @@ Workflow for any task:
 8. Talk to the user while you work. At the start say whether the connection worked (list_sessions, sysinfo) and that the friend can end the session at any time with Esc. Before a group of actions say in one short line what you are going to do, afterwards whether it worked. Bundle small GUI steps (move + click, click + type, drag, scroll) into ONE actions call so the friend confirms once instead of per step. If any call comes back "ended", "denied", "Agent left" or "No such session": stop, do not retry, tell the operator.
 9. The session survives internet loss, VPN changes and reboots (the user chose to keep it): it comes back by itself with the same code. If a call says the PC is offline or paused, do not start over: wait_online, then read session_log (it holds the network diagnosis and what the agent already tried) and agent_log, and continue where you stopped. Only the user ending the session in their console ends it.
 10. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
-11. This is the user's real machine: only touch what the task needs, and say what you installed or changed.`;
+11. This is the user's real machine: only touch what the task needs, and say what you installed or changed.
+12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -623,6 +662,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         if (pend) {
           s.pending.delete(r.id); clearTimeout(pend.timer);
           adapt(s, pend, r.data?.jpeg?.length || 0);
+          if (r.ok && r.data?.miss) recordMiss(s, code, 'auto', { tool: pend.tool, args: pend.argStr, note: String(r.data.text || '').slice(0, 400) });
           r.ok ? pend.resolve(r.data) : pend.reject(new Error(r.error || 'agent error'));
         }
         return json(res, 200, {});

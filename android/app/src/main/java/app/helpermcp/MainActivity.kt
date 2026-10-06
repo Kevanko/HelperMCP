@@ -90,11 +90,12 @@ class MainActivity : Activity() {
             "connecting" -> t("◌ Подключаюсь к серверу…", "◌ Connecting to the server…")
             "wait" -> t("◌ Ожидание помощника… назовите ему код", "◌ Waiting for the helper… give them the code")
             "ok" -> t("● Помощник подключён", "● Helper connected")
+            "done" -> t("✓ Помощник закончил работу", "✓ The helper finished the work")
             "lost" -> t("◌ Связь потеряна, переподключение…", "◌ Connection lost, reconnecting…")
             "paused" -> t("⏸ Пауза: помощник ждёт", "⏸ Paused: the helper is waiting")
             else -> if (on) t("Готово к запуску", "Ready to start") else t("Сначала разрешите управление (шаг 1)", "Allow control first (step 1)")
         }
-        status.setTextColor(if (HelperService.phase == "ok") 0xFF66BB6A.toInt() else 0xFFFFB347.toInt())
+        status.setTextColor(if (HelperService.phase == "ok" || HelperService.phase == "done") 0xFF66BB6A.toInt() else 0xFFFFB347.toInt())
         val code = HelperService.code
         codeView.visibility = if (code != null && HelperService.running) View.VISIBLE else View.GONE
         codeView.text = code ?: ""

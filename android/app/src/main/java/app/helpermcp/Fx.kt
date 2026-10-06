@@ -37,6 +37,7 @@ import kotlin.math.min
 
 private const val BLUE = 0xFF4C8DFF.toInt()
 private const val ORANGE = 0xFFFF8A1E.toInt()
+private const val GREEN = 0xFF3DDC84.toInt()
 private const val VIOLET = 0xFFA880FF.toInt()
 
 class Ripple(val x: Float, val y: Float, val t0: Long, val color: Int)
@@ -148,7 +149,7 @@ fun captureMode(on: Boolean) {
         val px = IntArray(w * h); b.getPixels(px, 0, w, 0, 0, w, h)
         // which colour is really on the screen (a swap can be a frame behind): the right one never takes a channel below zero
         var best = view?.color ?: BLUE; var bestErr = Long.MAX_VALUE
-        for (c in intArrayOf(BLUE, ORANGE)) {
+        for (c in intArrayOf(BLUE, ORANGE, GREEN)) {
             var err = 0L; var i = 0
             while (i < px.size) {
                 val gp = g[i]; val a = gp ushr 24
@@ -194,7 +195,7 @@ fun captureMode(on: Boolean) {
     private var anim: ValueAnimator? = null
     val width get() = wm.currentWindowMetrics.bounds.width()
     val height get() = wm.currentWindowMetrics.bounds.height()
-    private fun colorOf() = if (state == "ok") BLUE else ORANGE
+    private fun colorOf() = when (state) { "ok" -> BLUE; "done" -> GREEN; else -> ORANGE }
     private fun dp(v: Int) = (v * d).toInt()
 
     fun show() = main.post {
@@ -233,40 +234,56 @@ fun captureMode(on: Boolean) {
     }
     private var expandUntil = 0L
     private var expandedNow = true
+    private var padKey = ""
     private fun updatePill(p: TextView) {
         val s = ((SystemClock.elapsedRealtime() - startedAt) / 1000).toInt()
         val clock = if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) else "%02d:%02d".format(s / 60, s % 60)
-        // an island by the camera while everything is fine; the full label opens for a few seconds on a change and stays open while something needs attention
-        val exp = state != "ok" || SystemClock.uptimeMillis() < expandUntil
-        if (exp != expandedNow) {
-            expandedNow = exp
-            p.textSize = if (exp) 14f else 11f
-            p.setPadding(dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22), dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22))
-            if (exp) try { val lp = p.layoutParams as WindowManager.LayoutParams; lp.y = dp(8); wm.updateViewLayout(p, lp) } catch (_: Throwable) { }
-        }
-        if (!exp) {   // an island: a dot on the left, the time on the right, and between them room for the camera
-            val cut = cutout(); val gap = (cut?.width() ?: 0) + dp(if (cut != null) 14 else 10)
+        // collapsed: an island that looks like the camera hole stretched, a dot on the left and the time on the right; it opens for a few seconds on a change and stays open while something needs attention
+        val exp = (state != "ok" && state != "done") || SystemClock.uptimeMillis() < expandUntil
+        val cut = cutout(); val m = dp(22)
+        if (exp != expandedNow) { expandedNow = exp; p.textSize = if (exp) 14f else 11f; padKey = "" }
+        val lp = p.layoutParams as WindowManager.LayoutParams
+        var innerH: Int; var ny: Int
+        if (exp) {
+            val key = "e"; if (padKey != key) { padKey = key; p.setPadding(m + dp(18), m + dp(8), m + dp(18), m + dp(8)) }
+            p.text = when (state) {
+                "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
+                "done" -> "✓  " + t("Работа выполнена", "Work finished")
+                "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")
+                "paused" -> "||  " + t("Пауза: помощник ждёт", "Paused: the helper is waiting")
+                else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…")
+            }
+            ny = if (cut != null) cut.bottom + dp(6) - m else dp(8)   // under the camera, never over it
+        } else {
+            val fm = p.paint.fontMetrics; val lineH = fm.descent - fm.ascent
+            val targetH = if (cut != null) cut.height() + dp(4) else dp(26)
+            val padV = max(dp(2), ((targetH - lineH) / 2).toInt()); innerH = (lineH + 2 * padV).toInt()
+            val key = "c$padV"; if (padKey != key) { padKey = key; p.setPadding(m + dp(12), m + padV, m + dp(12), m + padV) }
+            val right = if (state == "done") "✓" else clock
+            val dotW = p.paint.measureText("●"); val timeW = p.paint.measureText(right)
+            val base = dp(if (cut != null) 8 else 6).toFloat()
+            // the camera hole sits exactly in the middle of the capsule: the shorter wing is padded to the length of the longer one
+            val g1 = base + max(0f, timeW - dotW); val g2 = base + max(0f, dotW - timeW)
+            val gap = (g1 + (cut?.width() ?: 0) + g2).toInt()
             val sb = android.text.SpannableStringBuilder("●"); sb.setSpan(android.text.style.ForegroundColorSpan(colorOf()), 0, 1, 0)
             sb.append(" "); sb.setSpan(object : android.text.style.ReplacementSpan() {
                 override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?) = gap
                 override fun draw(canvas: Canvas, text: CharSequence?, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) { }
             }, 1, 2, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            sb.append(clock); p.text = sb
-            val ph = if (p.height > 0) p.height - dp(44) else dp(22)
+            sb.append(right); p.text = sb
             val sbTop = try { wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.statusBars()).top } catch (_: Throwable) { 0 }
-            val ny = (if (cut != null) (cut.top + cut.bottom) / 2 else (if (sbTop > 0) sbTop / 2 else dp(14))) - ph / 2 - dp(22)   // the pill is centred on the camera, or sits at the very top without one
-            try { val lp = p.layoutParams as WindowManager.LayoutParams; if (lp.y != ny) { lp.y = ny; wm.updateViewLayout(p, lp) } } catch (_: Throwable) { }
-        } else p.text = when (state) {
-            "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
-            "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")
-            "paused" -> "||  " + t("Пауза: помощник ждёт", "Paused: the helper is waiting")
-            else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…")
+            val centre = if (cut != null) (cut.top + cut.bottom) / 2 else (if (sbTop > 0) sbTop / 2 else dp(14))
+            ny = centre - innerH / 2 - m
         }
-        val bg = (p.background as? PillBg) ?: PillBg(dp(22)).also { p.background = it }
-        bg.col = colorOf(); bg.level = haloLevel; bg.pulse = pulseV; bg.r = dp(20).toFloat(); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
+        if (lp.y != ny) { lp.y = ny; try { wm.updateViewLayout(p, lp) } catch (_: Throwable) { } }
+        val bg = (p.background as? PillBg) ?: PillBg(m).also { p.background = it }
+        bg.col = colorOf(); bg.level = haloLevel; bg.pulse = pulseV; bg.island = !exp
+        bg.r = if (exp) dp(20).toFloat() else (if (p.height > 0) (p.height - 2 * m) / 2f else dp(13).toFloat()); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
     }
 
-    fun setState(s: String) = main.post { if (state != s) { state = s; expandUntil = SystemClock.uptimeMillis() + 3500; applyState() } }
+    fun resetClock() = main.post { startedAt = SystemClock.elapsedRealtime() }
+
+    fun setState(s: String) = main.post { if (state != s) { state = s; expandUntil = SystemClock.uptimeMillis() + (if (s == "done") 7000 else 3500); applyState() } }
 
     private var glowGen = 0
     private fun applyState() {
@@ -431,7 +448,7 @@ fun captureMode(on: Boolean) {
 
 /** the label's background: a dark pill with a plain outline; while the AI works a soft blurred halo (a fade in every direction) breathes around it */
 class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
-    var col = BLUE; var level = 0f; var pulse = 0f; var r = 40f; var stroke = 4f
+    var col = BLUE; var level = 0f; var pulse = 0f; var r = 40f; var stroke = 4f; var island = false
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private var halo: android.graphics.Bitmap? = null; private var haloKey = ""
     override fun draw(c: Canvas) {
@@ -447,6 +464,7 @@ class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
             }
             p.reset(); p.alpha = ((0.45f + 0.55f * pulse) * level * 255).toInt(); c.drawBitmap(halo!!, bounds.left.toFloat(), bounds.top.toFloat(), p)
         }
+        if (island) { p.reset(); p.isAntiAlias = true; p.color = 0xFF000000.toInt(); c.drawRoundRect(rect, r, r, p); return }   // the island is plain black: it reads as the camera hole stretched
         p.reset(); p.isAntiAlias = true; p.color = 0xF20F1724.toInt(); c.drawRoundRect(rect, r, r, p)
         p.style = Paint.Style.STROKE; p.strokeWidth = stroke; p.color = col; c.drawRoundRect(rect, r, r, p)
     }

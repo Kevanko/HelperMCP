@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -46,6 +47,11 @@ class HelperService : AccessibilityService() {
     private val allowed = HashSet<String>()
     private var opSeen = false
     private var askMode = true
+    @Volatile private var lastOpAt = 0L
+    @Volatile private var pauseBy = ""
+    private var unlockedSince = 0L
+    private val stateExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val IDLE_MS = 150_000L   // no call from the helper for this long: the label goes back to "waiting for the helper" and the timer restarts
     private var wake: PowerManager.WakeLock? = null
 
     override fun onServiceConnected() {
@@ -67,11 +73,13 @@ class HelperService : AccessibilityService() {
     fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); fx.hide() }
 
     /** pause / continue: by the button in the app, and automatically when the screen is switched off (and back on after unlock) */
-    fun setPaused(on: Boolean) {
+    fun setPaused(on: Boolean, by: String = "user") {
         if (!running || paused == on) return
-        paused = on; phase = if (on) "paused" else if (opSeen) "ok" else "wait"; fx.setState(if (on) "paused" else phase)
+        paused = on; pauseBy = if (on) by else ""; unlockedSince = 0
+        phase = if (on) "paused" else if (opSeen) "ok" else "wait"; fx.setState(if (on) "paused" else phase)
         val relayUrl = prefsRelay()
-        Thread { try { Net.req(relayUrl, "POST", "/a/state", sessionToken, "{\"paused\":$on}".toByteArray(), timeoutMs = 8000) } catch (_: Throwable) { } }.start()
+        // one at a time and always the latest value: two quick changes must not reach the server in the wrong order (that left the helper paused for good)
+        stateExec.execute { for (n in 0 until 3) { try { Net.req(relayUrl, "POST", "/a/state", sessionToken, "{\"paused\":$paused}".toByteArray(), timeoutMs = 8000); break } catch (_: Throwable) { Thread.sleep(700) } } }
         if (!on) Sound.play("ok")
     }
     private fun prefsRelay() = getSharedPreferences("cfg", MODE_PRIVATE).getString("relay", BuildConfig.RELAY) ?: BuildConfig.RELAY
@@ -81,17 +89,25 @@ class HelperService : AccessibilityService() {
         if (screenRx != null) return
         screenRx = object : android.content.BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
-                when (i.action) {
-                    Intent.ACTION_SCREEN_OFF -> setPaused(true)       // the user switched the screen off: nobody should be tapping on it
-                    Intent.ACTION_USER_PRESENT -> setPaused(false)    // unlocked again: the helper continues
-                    Intent.ACTION_SCREEN_ON -> if (!(getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked) setPaused(false)   // no lock screen: on means back
-                }
+                if (i.action == Intent.ACTION_SCREEN_OFF) setPaused(true, "screen")   // the user switched the screen off: nobody should be tapping on it (resuming is the watcher's job)
             }
         }
-        val f = android.content.IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_USER_PRESENT) }
+        val f = android.content.IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF) }
         registerReceiver(screenRx, f)
+        main.removeCallbacks(watcher); main.post(watcher)
     }
-    private fun unregisterScreenReceiver() { try { screenRx?.let { unregisterReceiver(it) } } catch (_: Throwable) { }; screenRx = null }
+    /** every half second: continue after a screen pause once the phone is on and unlocked for 4 s (the pause stays visible, it never blinks), and fall back to "waiting" when the helper has been silent for a while */
+    private val watcher = object : Runnable {
+        override fun run() {
+            if (!running) return
+            val now = SystemClock.uptimeMillis()
+            val ready = (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive && !(getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
+            if (paused && pauseBy == "screen") { if (!ready) unlockedSince = 0 else if (unlockedSince == 0L) unlockedSince = now else if (now - unlockedSince >= 4000) setPaused(false) }
+            if (!paused && phase == "ok" && lastOpAt > 0 && now - lastOpAt > IDLE_MS) { opSeen = false; phase = "wait"; fx.setState("wait"); fx.resetClock() }
+            main.postDelayed(this, 500)
+        }
+    }
+    private fun unregisterScreenReceiver() { main.removeCallbacks(watcher); try { screenRx?.let { unregisterReceiver(it) } } catch (_: Throwable) { }; screenRx = null }
 
     private fun register(relay: String, resume: String?): JSONObject {
         val body = JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("host", "${Build.MANUFACTURER} ${Build.MODEL}")
@@ -164,9 +180,9 @@ class HelperService : AccessibilityService() {
     private fun handle(relay: String, token: String, cmd: JSONObject) {
         val id = cmd.getString("id"); val tool = cmd.getString("tool"); val args = cmd.optJSONObject("args") ?: JSONObject()
         if (tool == "bye") { ended = true; return }
-        if (!opSeen) { opSeen = true; phase = "ok"; fx.setState("ok") }
+        if (!args.optBoolean("view") && tool != "task_done") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "sysinfo"
+        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done"
         if (!quiet) fx.setBusy(true)
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
@@ -235,7 +251,8 @@ class HelperService : AccessibilityService() {
     private fun exec(tool: String, a: JSONObject): Any = when (tool) {
         "sysinfo" -> ok(sysinfo().toString(2))
         "screenshot" -> screenshot(a)
-        "click" -> { click(a); ok() }
+        "click" -> click(a)
+        "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }
         "drag" -> { drag(a); ok() }
         "scroll" -> { scroll(a); ok() }
@@ -306,14 +323,49 @@ class HelperService : AccessibilityService() {
 
     private fun tap(x: Float, y: Float, dur: Long = 50): Boolean = gesture(Path().apply { moveTo(x, y); lineTo(x + 0.5f, y) }, dur)
 
-    private fun click(a: JSONObject) {
+    /** what is under the finger: the tappable element there, or (a miss) the nearest one, so the helper can correct itself at once and the mistake is logged with its path */
+    private fun probe(x: Float, y: Float): Pair<String, Boolean>? {
+        val root = rootInActiveWindow ?: return null
+        val dens = resources.displayMetrics.density; val r = android.graphics.Rect()
+        var total = 0; var hit: String? = null; var hitArea = Long.MAX_VALUE; var under: String? = null; var underArea = Long.MAX_VALUE
+        var near: String? = null; var nearD = Float.MAX_VALUE; var nearX = 0f; var nearY = 0f
+        fun lab(n: AccessibilityNodeInfo): String? = (n.text ?: n.contentDescription ?: n.hintText)?.toString()?.trim()?.take(40)?.takeIf { it.isNotEmpty() }
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 45 || total > 2500) return
+            total++
+            if (!n.isVisibleToUser) return
+            n.getBoundsInScreen(r)
+            if (r.width() > 0 && r.height() > 0) {
+                val tappable = n.isClickable || n.isLongClickable || n.isCheckable
+                if (r.contains(x.toInt(), y.toInt())) {
+                    val area = r.width().toLong() * r.height()
+                    if (tappable && area < hitArea) { hitArea = area; hit = lab(n) ?: n.className?.toString()?.substringAfterLast('.') ?: "element" }
+                    lab(n)?.let { if (area < underArea) { underArea = area; under = it } }
+                } else if (tappable) {
+                    val dx = maxOf(r.left - x, 0f, x - r.right); val dy = maxOf(r.top - y, 0f, y - r.bottom); val dd = hypot(dx, dy)
+                    if (dd < nearD) { nearD = dd; near = lab(n) ?: n.className?.toString()?.substringAfterLast('.') ?: "element"; nearX = r.centerX().toFloat(); nearY = r.centerY().toFloat() }
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
+        }
+        walk(root, 0)
+        if (total < 3) return null
+        if (hit != null) return "ok, tapped: \"$hit\"" to false
+        val seen = under?.let { " (text there: \"$it\")" } ?: ""
+        if (near != null && nearD <= 120 * dens) return "MISS: nothing tappable under ${(x / scale).toInt()},${(y / scale).toInt()}$seen. Nearest tappable: \"$near\" at ${(nearX / scale).toInt()},${(nearY / scale).toInt()} (${(nearD / scale).toInt()} px away). The tap WAS sent anyway: take a screenshot, then tap the suggested spot if the screen did not react." to true
+        return "ok (no tappable element reported under ${(x / scale).toInt()},${(y / scale).toInt()}$seen; fine for games, web views and canvases)" to false
+    }
+
+    private fun click(a: JSONObject): JSONObject {
         val x = px(a, "x"); val y = py(a, "y"); val right = a.optString("button") == "right"
+        val pr = try { probe(x, y) } catch (_: Throwable) { null }
         fx.active(); fx.glideBlocking(x, y); Thread.sleep(50)
         repeat(if (a.optBoolean("double")) 2 else 1) {
             fx.ripple(x, y, right); fx.press()
             if (!tap(x, y, if (right) 650 else 50)) throw RuntimeException("The tap was not delivered (is the service allowed to perform gestures?)")
             Thread.sleep(110)
         }
+        return ok(pr?.first ?: "ok").apply { if (pr?.second == true) put("miss", true) }
     }
 
     private fun drag(a: JSONObject) {

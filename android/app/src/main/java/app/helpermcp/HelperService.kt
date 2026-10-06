@@ -258,28 +258,29 @@ class HelperService : AccessibilityService() {
             .put("note", "Android: screenshot, click, drag, scroll, type_text, press_key (home, back, recents, notifications, enter, ...), actions, start_process (app name, package or URL).")
     }
 
+    @Volatile private var lastErr = -1
     private fun capture(): Bitmap {
         repeat(5) {
             val latch = CountDownLatch(1); var bmp: Bitmap? = null; var err = 0
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(r: ScreenshotResult) {
-                    try { val hb = r.hardwareBuffer; bmp = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false); hb.close() } catch (_: Throwable) { }
+                    try { val hb = r.hardwareBuffer; bmp = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, true); hb.close() } catch (_: Throwable) { }
                     latch.countDown()
                 }
-                override fun onFailure(code: Int) { err = code; latch.countDown() }
+                override fun onFailure(code: Int) { err = code; lastErr = code; latch.countDown() }
             })
             latch.await(8, TimeUnit.SECONDS)
             bmp?.let { return it }
             if (err == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) Thread.sleep(450) else return@repeat
         }
-        throw RuntimeException("Screenshot failed (a protected screen, or the service has no screenshot permission).")
+        throw RuntimeException("Screenshot failed (a protected screen, or the service has no screenshot permission). code=$lastErr")
     }
 
     private fun screenshot(a: JSONObject): Shot {
         val maxW = a.optInt("max_width", 900).coerceIn(200, 4000); val q = a.optInt("quality", 70).coerceIn(20, 95)
         val view = a.optBoolean("view")
         fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
-        val bmp = try { capture() } finally { fx.captureMode(false) }
+        val bmp = fx.removeGlow(try { capture() } finally { fx.captureMode(false) })
         val sc = if (bmp.width > maxW) bmp.width.toFloat() / maxW else 1f
         val out = if (sc > 1f) Bitmap.createScaledBitmap(bmp, (bmp.width / sc).toInt(), (bmp.height / sc).toInt(), true) else bmp
         val bo = ByteArrayOutputStream(); out.compress(Bitmap.CompressFormat.JPEG, q, bo)

@@ -13,6 +13,7 @@ import android.graphics.RadialGradient
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -44,6 +45,11 @@ class Ripple(val x: Float, val y: Float, val t0: Long, val color: Int)
 class FxView(ctx: Context) : View(ctx) {
     private val d = resources.displayMetrics.density
     var glow: Bitmap? = null
+    @Volatile var glowPx: IntArray? = null; @Volatile var glowW = 0
+    @Volatile var drawn = 0
+    @Volatile var glowAt = 0L
+    var freeze = false; var pending: (() -> Unit)? = null   // while a screenshot is taken the glow is not swapped, so it can be taken out exactly
+    @Volatile var hideTop = false   // the pointer, ripples and dots are not part of a screenshot
     var pointer: Bitmap? = null; var hotX = 0; var hotY = 0   // the cursor pack's pointer (the same one the PC agents use), when the relay has it
     var color = BLUE
     var cx = -1f; var cy = -1f
@@ -60,9 +66,10 @@ class FxView(ctx: Context) : View(ctx) {
     }
 
     override fun onDraw(c: Canvas) {
+        drawn++
         val now = SystemClock.uptimeMillis(); var busy = false
         glow?.let { c.drawBitmap(it, 0f, 0f, null) }
-        for (r in ripples.toList()) {
+        for (r in (if (hideTop) emptyList() else ripples.toList())) {
             val p = (now - r.t0) / 600f
             if (p > 1.4f) { ripples.remove(r); continue }
             busy = true
@@ -76,7 +83,7 @@ class FxView(ctx: Context) : View(ctx) {
             if (p0 in 0f..1f) { paint.style = Paint.Style.FILL; paint.color = withAlpha(Color.WHITE, 0.9f * (1 - p0)); c.drawCircle(r.x, r.y, (9 * (1 - p0) + 2) * d, paint) }
         }
         val age = now - lastActive
-        val alpha = if (cx < 0) 0f else if (dragging || age < 2500) 1f else max(0f, 1f - (age - 2500) / 500f)
+        val alpha = if (hideTop || cx < 0) 0f else if (dragging || age < 2500) 1f else max(0f, 1f - (age - 2500) / 500f)
         if (alpha > 0.01f) {
             busy = true
             val k = d * 1.25f
@@ -126,7 +133,43 @@ class Fx(private val svc: AccessibilityService) {
     private var busy = false
     private var pulse: ValueAnimator? = null
     private var pulseV = 0f
-    fun captureMode(on: Boolean) { if (SECURE_WORKS) return; val l = CountDownLatch(1); main.post { for (v in listOf<View?>(view, pill, card)) v?.visibility = if (on) View.INVISIBLE else View.VISIBLE; l.countDown() }; l.await(1, TimeUnit.SECONDS); if (on) Thread.sleep(60) }
+fun captureMode(on: Boolean) {
+        val l = CountDownLatch(1); val d0 = view?.drawn ?: 0
+        main.post { view?.let { it.hideTop = on; it.freeze = on; it.invalidate(); if (!on) { it.pending?.invoke(); it.pending = null } }; for (v in listOf<View?>(pill, card)) v?.visibility = if (on) View.INVISIBLE else View.VISIBLE; l.countDown() }
+        l.await(1, TimeUnit.SECONDS)
+        if (on) { while (SystemClock.uptimeMillis() - (view?.glowAt ?: 0L) < 900) Thread.sleep(30) }   // a glow that was just swapped may not be on the screen yet
+        if (on) { val t0 = SystemClock.uptimeMillis(); while ((view?.drawn ?: 0) <= d0 + 0 && SystemClock.uptimeMillis() - t0 < 900) Thread.sleep(10); Thread.sleep(350) }   // wait until the screen really shows the frame without the label
+    }
+
+    /** bg = (captured - glow) / (1 - alpha): the edge glow is a known translucent layer, so it can be taken out of a screenshot exactly */
+    fun removeGlow(b: Bitmap): Bitmap {
+        val g = view?.glowPx ?: return b; val w = b.width; val h = b.height
+        if (w != view?.glowW || w * h != g.size) return b
+        val px = IntArray(w * h); b.getPixels(px, 0, w, 0, 0, w, h)
+        // which colour is really on the screen (a swap can be a frame behind): the right one never takes a channel below zero
+        var best = view?.color ?: BLUE; var bestErr = Long.MAX_VALUE
+        for (c in intArrayOf(BLUE, ORANGE)) {
+            var err = 0L; var i = 0
+            while (i < px.size) {
+                val gp = g[i]; val a = gp ushr 24
+                if (a in 100..249) { val p = px[i]; for (sh in intArrayOf(16, 8, 0)) { val d = (p shr sh and 255) - (c shr sh and 255) * a / 255; if (d < 0) err += -d } }
+                i += 7
+            }
+            if (err < bestErr) { bestErr = err; best = c }
+        }
+        val rgb = best and 0x00FFFFFF
+        for (i in px.indices) {
+            val a0 = g[i] ushr 24; if (a0 == 0) continue
+            val gp = (a0 shl 24) or rgb
+            val a = gp ushr 24; if (a >= 250) continue
+            val k = 255f / (255 - a); val p = px[i]
+            val r = (((p shr 16 and 255) - (gp shr 16 and 255) * a / 255) * k).toInt().coerceIn(0, 255)
+            val gg = (((p shr 8 and 255) - (gp shr 8 and 255) * a / 255) * k).toInt().coerceIn(0, 255)
+            val bb = (((p and 255) - (gp and 255) * a / 255) * k).toInt().coerceIn(0, 255)
+            px[i] = (0xFF shl 24) or (r shl 16) or (gg shl 8) or bb
+        }
+        b.setPixels(px, 0, w, 0, 0, w, h); return b
+    }
     private val busyOff = Runnable { applyBusy(false) }
     fun setBusy(b: Boolean) = main.post {
         main.removeCallbacks(busyOff)
@@ -159,7 +202,7 @@ class Fx(private val svc: AccessibilityService) {
         startedAt = SystemClock.elapsedRealtime()
         val v = FxView(svc); view = v
         wm.addView(v, WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT)
             .apply { layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES; setFitInsetsTypes(0) })
         val p = TextView(svc).apply {
             setTextColor(Color.WHITE); textSize = 14f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER
@@ -210,7 +253,8 @@ class Fx(private val svc: AccessibilityService) {
             }, 1, 2, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             sb.append(clock); p.text = sb
             val ph = if (p.height > 0) p.height - dp(44) else dp(22)
-            val ny = if (cut != null) (cut.top + cut.bottom) / 2 - ph / 2 - dp(22) else -dp(14)   // the pill is centred on the camera, or sits at the very top without one
+            val sbTop = try { wm.currentWindowMetrics.windowInsets.getInsets(android.view.WindowInsets.Type.statusBars()).top } catch (_: Throwable) { 0 }
+            val ny = (if (cut != null) (cut.top + cut.bottom) / 2 else (if (sbTop > 0) sbTop / 2 else dp(14))) - ph / 2 - dp(22)   // the pill is centred on the camera, or sits at the very top without one
             try { val lp = p.layoutParams as WindowManager.LayoutParams; if (lp.y != ny) { lp.y = ny; wm.updateViewLayout(p, lp) } } catch (_: Throwable) { }
         } else p.text = when (state) {
             "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
@@ -224,29 +268,80 @@ class Fx(private val svc: AccessibilityService) {
 
     fun setState(s: String) = main.post { if (state != s) { state = s; expandUntil = SystemClock.uptimeMillis() + 3500; applyState() } }
 
+    private var glowGen = 0
     private fun applyState() {
         val v = view ?: return
         v.color = colorOf(); pill?.let { updatePill(it) }
-        val w = width; val h = height; val col = colorOf()
+        val w = width; val h = height; val col = colorOf(); val sh = shapeNow(w, h); val gen = ++glowGen
         Thread {
-            val bmp = buildGlow(w, h, col, dp(36))
-            main.post { v.glow = bmp; v.invalidate() }
+            val px = buildGlow(w, h, col, dp(36), sh)
+            val bmp = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+            val apply = { v.glowAt = SystemClock.uptimeMillis(); v.glowW = w; v.glowPx = px; v.glow = bmp; v.invalidate() }
+            main.post { if (gen == glowGen) { if (v.freeze) v.pending = apply else apply() } }   // a slower, older build must never overwrite a newer one
         }.start()
     }
 
-    /** alpha of every pixel is a fade of its distance to the nearest screen edge: no seams, nothing overlaps */
-    private fun buildGlow(w: Int, h: Int, color: Int, depth: Int): Bitmap {
+    private class Shape(val rTL: Float, val rTR: Float, val rBL: Float, val rBR: Float, val holes: List<android.graphics.RectF>)
+
+    /** what this particular phone looks like: the radius of each screen corner and every camera hole / notch */
+    private fun shapeNow(w: Int, h: Int): Shape {
+        var r = floatArrayOf(0f, 0f, 0f, 0f)
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val ins = wm.currentWindowMetrics.windowInsets
+                val pos = intArrayOf(android.view.RoundedCorner.POSITION_TOP_LEFT, android.view.RoundedCorner.POSITION_TOP_RIGHT, android.view.RoundedCorner.POSITION_BOTTOM_LEFT, android.view.RoundedCorner.POSITION_BOTTOM_RIGHT)
+                for (i in 0..3) r[i] = ins.getRoundedCorner(pos[i])?.radius?.toFloat() ?: 0f
+            }
+            if (r.all { it == 0f }) {   // older Android: the radius the system itself uses for its corner masks
+                val id = android.content.res.Resources.getSystem().getIdentifier("rounded_corner_radius", "dimen", "android")
+                if (id != 0) { val v = android.content.res.Resources.getSystem().getDimensionPixelSize(id).toFloat(); r = floatArrayOf(v, v, v, v) }
+            }
+        } catch (_: Throwable) { }
+        val holes = ArrayList<android.graphics.RectF>()
+        try {
+            val cut = (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout
+            cut?.boundingRects?.forEach { holes.add(android.graphics.RectF(it)) }
+        } catch (_: Throwable) { }
+        return Shape(r[0], r[1], r[2], r[3], holes)
+    }
+
+    /** signed distance from (px, py) to a rounded rectangle (negative inside) */
+    private fun sdRound(px: Float, py: Float, cx: Float, cy: Float, hw: Float, hh: Float, r: Float): Float {
+        val qx = kotlin.math.abs(px - cx) - (hw - r); val qy = kotlin.math.abs(py - cy) - (hh - r)
+        val ox = max(qx, 0f); val oy = max(qy, 0f)
+        return kotlin.math.sqrt(ox * ox + oy * oy) + min(max(qx, qy), 0f) - r
+    }
+
+    /** alpha of every pixel is a fade of its distance to the nearest edge of the real screen shape (rounded corners) and to every camera hole: no seams, nothing overlaps */
+    private fun buildGlow(w: Int, h: Int, color: Int, depth: Int, sh: Shape): IntArray {
         val prof = IntArray(depth) { dd ->
             val t = (dd + 0.5) / depth
             val a = if (t <= 0.35) 0.59 + (0.18 - 0.59) * t / 0.35 else 0.18 * (1 - (t - 0.35) / 0.65)
-            ((a * 255).toInt() shl 24) or (color and 0x00FFFFFF)
+            val al = (a * 255).toInt()
+            (al shl 24) or (color and 0x00FFFFFF)
         }
         val px = IntArray(w * h)
+        val hw = w / 2f; val hh = h / 2f; val maxR = max(max(sh.rTL, sh.rTR), max(sh.rBL, sh.rBR)); val band = depth + maxR + 2
+        val holeBand = sh.holes.map { android.graphics.RectF(it.left - depth - 2, it.top - depth - 2, it.right + depth + 2, it.bottom + depth + 2) }
         for (y in 0 until h) for (x in 0 until w) {
-            val dd = min(min(x, y), min(w - 1 - x, h - 1 - y))
-            if (dd < depth) px[y * w + x] = prof[dd]
+            val edge = min(min(x, y), min(w - 1 - x, h - 1 - y))
+            var near = edge < band
+            if (!near) for (hb in holeBand) if (x >= hb.left && x <= hb.right && y >= hb.top && y <= hb.bottom) { near = true; break }
+            if (!near) continue
+            val fx = x + 0.5f; val fy = y + 0.5f
+            val r = if (fy < hh) (if (fx < hw) sh.rTL else sh.rTR) else (if (fx < hw) sh.rBL else sh.rBR)
+            var dist = -sdRound(fx, fy, hw, hh, hw, hh, r)   // depth below the surface of the screen shape
+            if (dist < 0f) continue                          // outside a rounded corner: not part of the screen
+            for (c in sh.holes) {
+                val rr = if (c.width() <= c.height() * 1.7f) min(c.width(), c.height()) / 2f else c.height() * 0.4f
+                val sd = sdRound(fx, fy, c.centerX(), c.centerY(), c.width() / 2f, c.height() / 2f, rr)
+                if (sd < 0f) { dist = -1f; break }          // inside the camera hole
+                dist = min(dist, sd)
+            }
+            if (dist < 0f) continue
+            val di = dist.toInt(); if (di < depth) px[y * w + x] = prof[di]
         }
-        return Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+        return px
     }
 
     fun hide() = main.post {

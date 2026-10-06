@@ -1062,10 +1062,10 @@ def make_monitor(mon):
         w_ = pad + 10 + 9 + ext.x_advance + pad; x0, y0 = (PILL_W - w_) / 2, 1          # the pill hugs its content and sits in the middle of the window
         def rrect(e):
             cr.new_sub_path(); cr.arc(x0 + w_ - rr, y0 + rr, rr + e, -math.pi / 2, math.pi / 2); cr.arc(x0 + rr, y0 + rr, rr + e, math.pi / 2, 3 * math.pi / 2); cr.close_path()
-        if busy_fx:   # working: a soft halo that fades out in every direction and breathes
+        if halo_lvl > 0.02:   # working: a soft halo that fades out in every direction, breathes, and comes and goes softly
             br = 0.5 + 0.5 * math.sin(time.monotonic() * 6)
             for i in range(PM, 0, -2):
-                rrect(i * 0.9 + 0.0); a = (1 - i / PM) ** 2 * (0.20 + 0.22 * br); cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(2.2); cr.stroke()
+                rrect(i * 0.9 + 0.0); a = (1 - i / PM) ** 2 * (0.20 + 0.22 * br) * halo_lvl; cr.set_source_rgba(r_, g_, b_, a); cr.set_line_width(2.2); cr.stroke()
         rrect(0)
         cr.set_source_rgba(0.06, 0.09, 0.14, 0.9); cr.fill_preserve(); cr.set_source_rgba(r_, g_, b_, 0.95); cr.set_line_width(1.5); cr.stroke()
         cr.arc(x0 + pad + 5, y0 + ph / 2, 5, 0, 2 * math.pi); cr.set_source_rgba(r_, g_, b_, pulse); cr.fill()
@@ -1080,7 +1080,7 @@ CW = 140; HX = HY = 44               # cursor window size and where the arrow ti
 cursor = new_popup(CW, CW, -500, -500)
 RW = 220
 ripple = new_window(RW, RW, -500, -500)
-busy_fx = False; busy_off = 0; last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
+busy_fx = False; halo_lvl = 0.0; busy_off = 0; last_active = 0.0; opacity = 0.0; pre_until = 0.0; lean = 0.0; lastp = None; vel = (0.0, 0.0); rot_tgt = 0.0; moving_t = -9.0; type_anim = None   # (t0, dur, [line lengths])
 pressed_t = -9.0; dragging = False; scroll_dir = 0; scroll_t = -9.0; typing_t = -9.0
 rip = None                            # (x, y, t0, rgb)
 trail = deque(maxlen=14)
@@ -1406,7 +1406,13 @@ chan = GLib.IOChannel.unix_new(0); chan.set_flags(GLib.IOFlags.NONBLOCK)
 chan.set_close_on_unref(False)
 GLib.io_add_watch(chan, GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP, on_stdin)
 GLib.timeout_add(16, tick)
-GLib.timeout_add(60, lambda: ([w.queue_draw() for w in pills] if (state in ("lost", "wait", "paused") or busy_fx) else None) or True)   # orange label pulses
+def halo_tick():
+    global halo_lvl
+    tgt = 1.0 if busy_fx else 0.0; halo_lvl += (tgt - halo_lvl) * (0.3 if tgt else 0.07)
+    if halo_lvl < 0.01 and not busy_fx: halo_lvl = 0.0
+    if halo_lvl > 0 or state in ("lost", "wait", "paused"): [w.queue_draw() for w in pills]
+    return True
+GLib.timeout_add(60, halo_tick)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
 GLib.timeout_add(1000, lambda: ([w.queue_draw() for w in pills]) or True)   # the session clock in the label
 Gtk.main()

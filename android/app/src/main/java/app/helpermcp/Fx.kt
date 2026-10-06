@@ -18,6 +18,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.view.Display
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -131,10 +132,18 @@ class Fx(private val svc: AccessibilityService) {
         main.removeCallbacks(busyOff)
         if (b) applyBusy(true) else main.postDelayed(busyOff, 2500)   // the halo stays through the gap between two calls of the AI
     }
+    private var haloLevel = 0f
+    private var levelAnim: ValueAnimator? = null
     private fun applyBusy(b: Boolean) {
-        if (busy == b) return; busy = b; pulse?.cancel()
-        if (b) pulse = ValueAnimator.ofFloat(0f, 1f).apply { duration = 700; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; addUpdateListener { pulseV = it.animatedValue as Float; pill?.let { p -> updatePill(p) } }; start() }
-        else { pulseV = 0f; pill?.let { updatePill(it) } }
+        if (busy == b) return; busy = b
+        if (b && pulse == null) pulse = ValueAnimator.ofFloat(0f, 1f).apply { duration = 700; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE; addUpdateListener { pulseV = it.animatedValue as Float; pill?.let { p -> updatePill(p) } }; start() }
+        levelAnim?.cancel()   // the halo comes in softly and goes out softly, it never snaps
+        levelAnim = ValueAnimator.ofFloat(haloLevel, if (b) 1f else 0f).apply {
+            duration = if (b) 350L else 1400L; interpolator = android.view.animation.AccelerateDecelerateInterpolator()
+            addUpdateListener { haloLevel = it.animatedValue as Float; pill?.let { p -> updatePill(p) } }
+            if (!b) addListener(object : android.animation.AnimatorListenerAdapter() { override fun onAnimationEnd(a: android.animation.Animator) { if (!busy) { pulse?.cancel(); pulse = null; pulseV = 0f; haloLevel = 0f; pill?.let { p -> updatePill(p) } } } })
+            start()
+        }
     }
     private var startedAt = 0L
     var onEnd: (() -> Unit)? = null
@@ -168,6 +177,17 @@ class Fx(private val svc: AccessibilityService) {
         updatePill(p); main.postDelayed({ tick() }, 500)
     }
 
+    private fun cutout(): android.graphics.Rect? {
+        val w = width
+        val sources = listOf<() -> android.view.DisplayCutout?>(
+            { (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout },
+            { pill?.rootWindowInsets?.displayCutout }, { wm.currentWindowMetrics.windowInsets.displayCutout })
+        for (src in sources) {
+            val r = try { src()?.boundingRects?.firstOrNull { it.top <= 2 && kotlin.math.abs((it.left + it.right) / 2 - w / 2) < w * 0.12 } } catch (_: Throwable) { null }
+            if (r != null) return r   // a camera hole or notch in the middle of the top edge
+        }
+        return null
+    }
     private var expandUntil = 0L
     private var expandedNow = true
     private fun updatePill(p: TextView) {
@@ -179,16 +199,27 @@ class Fx(private val svc: AccessibilityService) {
             expandedNow = exp
             p.textSize = if (exp) 14f else 11f
             p.setPadding(dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22), dp((if (exp) 18 else 9) + 22), dp((if (exp) 8 else 3) + 22))
-            try { val lp = p.layoutParams as WindowManager.LayoutParams; lp.y = if (exp) dp(8) else -dp(14); wm.updateViewLayout(p, lp) } catch (_: Throwable) { }
+            if (exp) try { val lp = p.layoutParams as WindowManager.LayoutParams; lp.y = dp(8); wm.updateViewLayout(p, lp) } catch (_: Throwable) { }
         }
-        p.text = if (!exp) "●  $clock" else when (state) {
+        if (!exp) {   // an island: a dot on the left, the time on the right, and between them room for the camera
+            val cut = cutout(); val gap = (cut?.width() ?: 0) + dp(if (cut != null) 14 else 10)
+            val sb = android.text.SpannableStringBuilder("●"); sb.setSpan(android.text.style.ForegroundColorSpan(colorOf()), 0, 1, 0)
+            sb.append(" "); sb.setSpan(object : android.text.style.ReplacementSpan() {
+                override fun getSize(paint: Paint, text: CharSequence?, start: Int, end: Int, fm: Paint.FontMetricsInt?) = gap
+                override fun draw(canvas: Canvas, text: CharSequence?, start: Int, end: Int, x: Float, top: Int, y: Int, bottom: Int, paint: Paint) { }
+            }, 1, 2, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append(clock); p.text = sb
+            val ph = if (p.height > 0) p.height - dp(44) else dp(22)
+            val ny = if (cut != null) (cut.top + cut.bottom) / 2 - ph / 2 - dp(22) else -dp(14)   // the pill is centred on the camera, or sits at the very top without one
+            try { val lp = p.layoutParams as WindowManager.LayoutParams; if (lp.y != ny) { lp.y = ny; wm.updateViewLayout(p, lp) } } catch (_: Throwable) { }
+        } else p.text = when (state) {
             "ok" -> "●  " + t("Удалённое управление", "Remote control") + "  $clock"
             "lost" -> "◌  " + t("Связь потеряна, переподключение…", "Connection lost, reconnecting…")
             "paused" -> "||  " + t("Пауза: помощник ждёт", "Paused: the helper is waiting")
             else -> "◌  " + t("Ожидание помощника…", "Waiting for the helper…")
         }
         val bg = (p.background as? PillBg) ?: PillBg(dp(22)).also { p.background = it }
-        bg.col = colorOf(); bg.busy = busy; bg.pulse = pulseV; bg.r = dp(20).toFloat(); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
+        bg.col = colorOf(); bg.level = haloLevel; bg.pulse = pulseV; bg.r = dp(20).toFloat(); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
     }
 
     fun setState(s: String) = main.post { if (state != s) { state = s; expandUntil = SystemClock.uptimeMillis() + 3500; applyState() } }
@@ -305,12 +336,12 @@ class Fx(private val svc: AccessibilityService) {
 
 /** the label's background: a dark pill with a plain outline; while the AI works a soft blurred halo (a fade in every direction) breathes around it */
 class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
-    var col = BLUE; var busy = false; var pulse = 0f; var r = 40f; var stroke = 4f
+    var col = BLUE; var level = 0f; var pulse = 0f; var r = 40f; var stroke = 4f
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private var halo: android.graphics.Bitmap? = null; private var haloKey = ""
     override fun draw(c: Canvas) {
         val m = margin.toFloat(); val rect = android.graphics.RectF(bounds.left + m, bounds.top + m, bounds.right - m, bounds.bottom - m)
-        if (busy && bounds.width() > 0) {
+        if (level > 0.01f && bounds.width() > 0) {
             val key = "$col ${bounds.width()} ${bounds.height()} $r"
             if (halo == null || haloKey != key) {   // the blur is made once; only its opacity breathes (cheap enough for a busy phone)
                 val bmp = android.graphics.Bitmap.createBitmap(bounds.width(), bounds.height(), android.graphics.Bitmap.Config.ARGB_8888); val bc = Canvas(bmp)
@@ -319,7 +350,7 @@ class PillBg(private val margin: Int) : android.graphics.drawable.Drawable() {
                 q.maskFilter = android.graphics.BlurMaskFilter(m * 0.5f, android.graphics.BlurMaskFilter.Blur.NORMAL); bc.drawRoundRect(rr, r, r, q)
                 halo?.recycle(); halo = bmp; haloKey = key
             }
-            p.reset(); p.alpha = ((0.45f + 0.55f * pulse) * 255).toInt(); c.drawBitmap(halo!!, bounds.left.toFloat(), bounds.top.toFloat(), p)
+            p.reset(); p.alpha = ((0.45f + 0.55f * pulse) * level * 255).toInt(); c.drawBitmap(halo!!, bounds.left.toFloat(), bounds.top.toFloat(), p)
         }
         p.reset(); p.isAntiAlias = true; p.color = 0xF20F1724.toInt(); c.drawRoundRect(rect, r, r, p)
         p.style = Paint.Style.STROKE; p.strokeWidth = stroke; p.color = col; c.drawRoundRect(rect, r, r, p)

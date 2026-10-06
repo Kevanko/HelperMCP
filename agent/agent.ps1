@@ -574,7 +574,7 @@ function Set-Busy($b) {   # working: the label's halo breathes; waiting for a co
     $script:busy = $b
     foreach ($m in $mons) {
         if ($b) { $m.shadow.Color = (Cur); $an = New-Object Windows.Media.Animation.DoubleAnimation 0.3, 1.0, ([TimeSpan]::FromMilliseconds(600)); $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever; $m.shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $an) }
-        else { $m.shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $null); $m.shadow.Opacity = 0 }
+        else { $cur = $m.shadow.Opacity; $fade = New-Object Windows.Media.Animation.DoubleAnimation $cur, 0.0, ([TimeSpan]::FromMilliseconds(1400)); $fade.EasingFunction = New-Object Windows.Media.Animation.SineEase; $m.shadow.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $fade) }   # fades out softly instead of snapping
     }
 }
 function Apply-State {

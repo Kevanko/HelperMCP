@@ -271,7 +271,7 @@ class HelperService : AccessibilityService() {
         val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
         return JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
             .put("screen", "${fx.width}x${fx.height}").put("battery", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).toString() + "%")
-            .put("foreground_app", rootInActiveWindow?.packageName?.toString() ?: "?").put("screenshot_scale", scale.toDouble())
+            .put("foreground_app", rootInActiveWindow?.packageName?.toString() ?: "?").put("screenshot_scale", scale.toDouble()).put("display", fx.diag())
             .put("note", "Android: screenshot, click, drag, scroll, type_text, press_key (home, back, recents, notifications, enter, ...), actions, start_process (app name, package or URL).")
     }
 
@@ -296,8 +296,9 @@ class HelperService : AccessibilityService() {
     private fun screenshot(a: JSONObject): Shot {
         val maxW = a.optInt("max_width", 900).coerceIn(200, 4000); val q = a.optInt("quality", 70).coerceIn(20, 95)
         val view = a.optBoolean("view")
-        fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
-        val bmp = fx.removeGlow(try { capture() } finally { fx.captureMode(false) })
+        val withOverlay = a.optBoolean("overlay")   // overlay=true: show exactly what the user sees (glow, label, pointer), to check how it looks on this phone
+        if (!withOverlay) fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
+        val bmp = try { capture() } finally { if (!withOverlay) fx.captureMode(false) }.let { if (withOverlay) it else fx.removeGlow(it) }
         val sc = if (bmp.width > maxW) bmp.width.toFloat() / maxW else 1f
         val out = if (sc > 1f) Bitmap.createScaledBitmap(bmp, (bmp.width / sc).toInt(), (bmp.height / sc).toInt(), true) else bmp
         val bo = ByteArrayOutputStream(); out.compress(Bitmap.CompressFormat.JPEG, q, bo)

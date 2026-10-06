@@ -227,7 +227,7 @@ fun captureMode(on: Boolean) {
             { (svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout },
             { pill?.rootWindowInsets?.displayCutout }, { wm.currentWindowMetrics.windowInsets.displayCutout })
         for (src in sources) {
-            val r = try { src()?.boundingRects?.firstOrNull { it.top <= 2 && kotlin.math.abs((it.left + it.right) / 2 - w / 2) < w * 0.12 } } catch (_: Throwable) { null }
+            val r = try { src()?.boundingRects?.firstOrNull { it.top < dp(48) && it.bottom <= dp(120) && kotlin.math.abs((it.left + it.right) / 2 - w / 2) < w * 0.16 } } catch (_: Throwable) { null }
             if (r != null) return r   // a camera hole or notch in the middle of the top edge
         }
         return null
@@ -279,6 +279,26 @@ fun captureMode(on: Boolean) {
         val bg = (p.background as? PillBg) ?: PillBg(m).also { p.background = it }
         bg.col = colorOf(); bg.level = haloLevel; bg.pulse = pulseV; bg.island = !exp
         bg.r = if (exp) dp(20).toFloat() else (if (p.height > 0) (p.height - 2 * m) / 2f else dp(13).toFloat()); bg.stroke = dp(2).toFloat(); bg.invalidateSelf()
+    }
+
+    /** what this phone reports about its camera and where the label really ended up: read through sysinfo, to fix a wrong placement from facts */
+    fun diag(): org.json.JSONObject {
+        val o = org.json.JSONObject(); val l = CountDownLatch(1)
+        main.post {
+            try {
+                fun rects(c: android.view.DisplayCutout?) = org.json.JSONArray().also { a -> c?.boundingRects?.forEach { a.put("${it.left},${it.top},${it.right},${it.bottom}") } }
+                o.put("density", d.toDouble()).put("window", "$width x $height")
+                o.put("cutout_display", try { rects((svc.getSystemService(Context.DISPLAY_SERVICE) as android.hardware.display.DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.cutout) } catch (e: Throwable) { "err ${e.message}" })
+                o.put("cutout_pill_insets", try { rects(pill?.rootWindowInsets?.displayCutout) } catch (e: Throwable) { "err ${e.message}" })
+                o.put("cutout_metrics", try { rects(wm.currentWindowMetrics.windowInsets.displayCutout) } catch (e: Throwable) { "err ${e.message}" })
+                try { val ins = wm.currentWindowMetrics.windowInsets; o.put("safe_top", ins.displayCutout?.safeInsetTop ?: 0); o.put("status_bar_h", ins.getInsets(android.view.WindowInsets.Type.statusBars()).top)
+                    if (Build.VERSION.SDK_INT >= 31) o.put("round_corners", (0..3).map { ins.getRoundedCorner(it)?.radius ?: 0 }.toString()) } catch (_: Throwable) { }
+                o.put("cutout_used", cutout()?.let { "${it.left},${it.top},${it.right},${it.bottom}" } ?: "none")
+                pill?.let { p -> val xy = IntArray(2); p.getLocationOnScreen(xy); o.put("label", "x=${xy[0]} y=${xy[1]} w=${p.width} h=${p.height} text=${p.text} expanded=$expandedNow state=$state") }
+            } catch (e: Throwable) { o.put("diag_error", e.toString()) }
+            l.countDown()
+        }
+        l.await(2, TimeUnit.SECONDS); return o
     }
 
     fun resetClock() = main.post { startedAt = SystemClock.elapsedRealtime() }

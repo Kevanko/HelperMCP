@@ -300,7 +300,7 @@ ASK_GROUP = {"click": "input", "move": "input", "drag": "input", "scroll": "inpu
 GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
-KEYS = queue.Queue(); PUMP = {"on": False, "old": None}
+KEYQ = queue.Queue(); PUMP = {"on": False, "old": None}
 HDR = 6   # lines of the pinned header
 OP = {"seen": False}   # has the helper sent anything yet
 ORANGE = "38;5;208"
@@ -431,7 +431,7 @@ def key_pump():
             if select.select([fd], [], [], 0.05)[0]:
                 os.read(fd, 8); continue                    # an arrow key or similar
             esc_menu(fd); continue
-        KEYS.put(ch.lower().decode(errors="ignore"))
+        KEYQ.put(ch.lower().decode(errors="ignore"))
 
 
 # ---- keeping the session: local state, autostart, a log, network diagnosis and one self-repair attempt --------------------
@@ -618,9 +618,9 @@ def agent_log(a):
 
 def read_key():
     if not PUMP["on"]: raise RuntimeError("No keyboard to ask on (the helper must run in a terminal in ask mode).")
-    while not KEYS.empty(): KEYS.get_nowait()          # keys typed before the question must not answer it
+    while not KEYQ.empty(): KEYQ.get_nowait()          # keys typed before the question must not answer it
     while True:
-        k = KEYS.get()
+        k = KEYQ.get()
         if k in ("y", "\n", "\r"): return "y"
         if k in ("a", "n"): return k
 

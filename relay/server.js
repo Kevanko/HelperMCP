@@ -51,7 +51,7 @@ function save() {
     saveTimer = null;
     try {
       const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, paused: !!s.paused, events: (s.events || []).slice(-30) })),
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp })),
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -159,7 +159,7 @@ setInterval(() => {
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   for (const [ip, r] of regRate) if (Date.now() - r.t > 60_000) regRate.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
-  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > (s.persist ? KEEP_MS : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
+  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > (s.persist ? (s.keepMs || KEEP_MS) : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
 
 // ---- adapting to the network: viewer frames step through quality levels, "lite" mode shrinks the AI's screenshots on slow links
@@ -645,7 +645,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const old = want && sessions.get(want);
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
-        old.lastSeen = Date.now(); old.ip = ip; old.mode = info.mode === 'ask' ? 'ask' : 'full'; old.persist = !!info.persist; old.paused = false;
+        old.lastSeen = Date.now(); old.ip = ip; old.mode = info.mode === 'ask' ? 'ask' : 'full'; old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         old.events.push({ t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true });
@@ -654,7 +654,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!code) do code = newCode(); while (sessions.has(code));
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
-        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(), persist: !!info.persist,
+        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
       });
       sessions.set(code, s); save();

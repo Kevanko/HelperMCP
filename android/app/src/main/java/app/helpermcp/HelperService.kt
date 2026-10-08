@@ -52,14 +52,16 @@ class HelperService : AccessibilityService() {
     @Volatile private var pauseBy = ""
     private var unlockedSince = 0L
     private var lastWakeAt = 0L
+    @Volatile private var phaseBeforeLost = "wait"
+    @Volatile private var lastEventAt = 0L
     private val stateExec = java.util.concurrent.Executors.newSingleThreadExecutor()
-    private val IDLE_MS = 150_000L   // no call from the helper for this long: the label goes back to "waiting for the helper" and the timer restarts
+    private val IDLE_MS = 15 * 60_000L   // no call from the helper for this long: the label goes back to "waiting for the helper" and the timer restarts
     private var wake: PowerManager.WakeLock? = null
 
     override fun onServiceConnected() {
         Crash.install(this)
         inst = this; fx = Fx(this); phase = if (running) phase else "ready" }
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) { }
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) { if (e?.packageName?.toString() != packageName) lastEventAt = SystemClock.uptimeMillis() }   // our own label is not a screen change
     override fun onInterrupt() { }
     override fun onDestroy() { endSession(); inst = null; phase = "off"; super.onDestroy() }
 
@@ -116,7 +118,7 @@ class HelperService : AccessibilityService() {
 
     private fun register(relay: String, resume: String?): JSONObject {
         val body = JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("host", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("user", "android").put("mode", if (askMode) "ask" else "full")
+            .put("user", "android").put("mode", if (askMode) "ask" else "full").put("persist", true)   // a network loss must not end the session: the relay keeps it and the helper is told to wait_online, not to stop
         if (resume != null) body.put("resume", resume)
         val (st, data) = Net.req(relay, "POST", "/a/register", null, body.toString().toByteArray(), timeoutMs = 20000)
         if (st != 200) throw RuntimeException("register: HTTP $st")
@@ -146,15 +148,15 @@ class HelperService : AccessibilityService() {
                         401 -> { reg = register(relay, code); token = reg.getString("token"); code = reg.getString("code"); continue }
                     }
                     fails = 0; delay = 1000
-                    if (lost) { lost = false; phase = if (opSeen) "ok" else "wait"; fx.setState(phase) }
+                    if (lost) { lost = false; phase = phaseBeforeLost; fx.setState(phase) }   // back to exactly what was shown (ok, done, hold, paused ...), not a guess
                     if (st == 200 && body.isNotEmpty()) handle(relay, token, JSONObject(String(body)))
                 } catch (e: Throwable) {
                     if (ended) break
-                    fails++; if (fails >= 2 && !lost) { lost = true; phase = "lost"; fx.setState("lost") }
+                    fails++; if (fails >= 2 && !lost) { lost = true; if (phase != "lost") phaseBeforeLost = phase; phase = "lost"; fx.setState("lost") }
                     Thread.sleep(delay.coerceAtMost(10000)); delay = (delay * 1.7).toLong()
                 }
             }
-        } finally { try { Net.req(relay, "POST", "/a/bye", token, "{}".toByteArray(), timeoutMs = 5000) } catch (_: Throwable) { } }
+        } finally { try { Net.req(relay, "POST", "/a/bye", token, "{\"final\":$ended}".toByteArray(), timeoutMs = 5000) } catch (_: Throwable) { } }   // final only when the user ended it
     }
 
     /** the pointer of the operator's cursor pack (data/cursor/pointer.cur on the relay): the AI's pointer looks the same on every device */
@@ -193,6 +195,7 @@ class HelperService : AccessibilityService() {
             if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
             data = exec(tool, args)
+            if (tool in GUI || tool == "start_process") settle(if (tool == "start_process") 2500L else 1100L)   // the next screenshot must show the result of this action, not the screen before it
         } catch (e: Throwable) { error = e.message ?: e.javaClass.simpleName }
         if (!quiet) fx.setBusy(false)
         for (attempt in 0 until 4) {
@@ -207,6 +210,12 @@ class HelperService : AccessibilityService() {
             } catch (_: Throwable) { Thread.sleep(1000L * (attempt + 1)) }
         }
         if (ended) return
+    }
+
+    /** wait until the screen stops changing (no window events for a moment): slow pages and animations otherwise swallow the next tap */
+    private fun settle(maxMs: Long, quietMs: Long = 260) {
+        val t0 = SystemClock.uptimeMillis(); Thread.sleep(150)
+        while (true) { val now = SystemClock.uptimeMillis(); if (now - lastEventAt >= quietMs || now - t0 >= maxMs) break; Thread.sleep(40) }
     }
 
     private val GUI = setOf("click", "move", "drag", "scroll", "type_text", "press_key", "actions")

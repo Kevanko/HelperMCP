@@ -155,7 +155,8 @@ assert.ok((await tool('start_process', { session: code, command: 'definitely-not
 console.log('start_process ok');
 
 // persistence: the relay restarts in the middle of a session; the agent keeps polling, the session and the viewer link survive
-const vurl0 = txt(await tool('open_viewer', { session: code }));
+const viewLink = (t) => t.match(/https?:\/\/\S+?\/v\/[0-9a-f]+(?=\s|$|#)/)[0];   // open_viewer gives a view link and a control link
+const vurl0 = viewLink(txt(await tool('open_viewer', { session: code })));
 await new Promise((x) => setTimeout(x, 500));          // let the debounced state file be written
 relay.kill(); await new Promise((x) => setTimeout(x, 800));
 relay = await startRelay();
@@ -177,7 +178,8 @@ assert.match(agentOut, /connection lost|Связь потеряна|Connection l
 console.log('outage + fresh server: agent reconnects with the same code ok');
 
 // live viewer: link from open_viewer, page, action log, frame (frame needs a desktop: GUI=1)
-const vurl = txt(await tool('open_viewer', { session: code }));
+const vtxt = txt(await tool('open_viewer', { session: code })); const vurl = viewLink(vtxt);
+assert.ok(/#c=[0-9a-f]{24}/.test(vtxt), 'open_viewer also gives a control link');
 assert.match(vurl, new RegExp(`^${BASE}/v/[0-9a-f]{36}$`));
 const page = await (await fetch(vurl)).text();
 assert.match(page, /Remote screen/);
@@ -186,6 +188,7 @@ assert.ok(!/fetch\('(frame|log)/.test(page) && page.includes("location.pathname.
 const vlog = await (await fetch(vurl + '/log')).json();
 assert.ok(vlog.some((e) => e.tool === 'run') && !vlog.some((e) => e.args.includes('view')), 'log shows actions, not viewer frames');
 assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);
+assert.equal((await fetch(vurl + '/input', { method: 'POST', body: '{"a":"key","keys":"x"}' })).status, 403, 'the view-only link cannot control');
 if (process.env.GUI) { const fr = await fetch(vurl + '/frame'); assert.equal(fr.headers.get('content-type'), 'image/jpeg'); assert.ok((await fr.arrayBuffer()).byteLength > 1000); }
 console.log('viewer ok');
 

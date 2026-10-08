@@ -108,6 +108,7 @@ $Scale = 1.0
 $script:OriginX = [Windows.Forms.SystemInformation]::VirtualScreen.Left; $script:OriginY = [Windows.Forms.SystemInformation]::VirtualScreen.Top   # real px of the screenshot's top-left
 
 function Do-Screenshot($a) {
+    if ($a.view) { return (Do-Screenshot-Inner $a) }   # the live viewer sees the overlay too: no flicker on the friend's screen
     Overlay-Send 'cap'; Start-Sleep -Milliseconds 180   # the glow, label and pointer are not part of what the operator sees
     try { Do-Screenshot-Inner $a } finally { Overlay-Send 'uncap' }
 }
@@ -142,7 +143,7 @@ function Do-Screenshot-Inner($a) {
     $bytes = $ms.ToArray()
     $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)).Replace('-', '').ToLower()
     if ($a.prev -and $a.prev -eq $hash) { return @{ same = $true; h = $hash } }   # nothing changed: send nothing
-    @{ jpeg = $bytes; mime = 'image/jpeg'; h = $hash }
+    @{ jpeg = $bytes; mime = 'image/jpeg'; h = $hash; ox = $s.Left; oy = $s.Top; sc = $sc }
 }
 
 # Screenshots go as the raw JPEG body (no base64 inflation), everything else as (gzipped) JSON.
@@ -175,7 +176,7 @@ function Glide($x, $y, $dur) {
     }
     [void][H.U__BUILD__]::SetCursorPos([int]$x, [int]$y)
 }
-function Target($a, $kx = 'x', $ky = 'y') { @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
+function Target($a, $kx = 'x', $ky = 'y') { if ($a.raw) { return @([int]$a.$kx, [int]$a.$ky) }; @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
 function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
 
 function Do-Move($a) { Overlay-Send 'active'; $t = Target $a; Glide $t[0] $t[1] $null; @{ text = 'ok' } }

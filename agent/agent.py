@@ -154,7 +154,7 @@ def screenshot(a):
     if want is not None and not (0 <= int(want) < len(mons)): raise RuntimeError(f"No monitor {want}. Monitors: {mons}")
     d = tempfile.mkdtemp()
     try:
-        path = capture_file(d)
+        path = capture_file(d); fo = (0, 0, 1.0)
         try:  # crop to one monitor if asked, downscale, remember offset+factor for click coordinates
             import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
             pb = GdkPixbuf.Pixbuf.new_from_file(path); org = (0, 0)
@@ -163,14 +163,16 @@ def screenshot(a):
             w = pb.get_width(); sc = max(1.0, w / cap)
             if sc > 1: pb = pb.scale_simple(cap, int(pb.get_height() / sc), GdkPixbuf.InterpType.BILINEAR)
             if not view: SCALE, ORIGIN = sc, org
+            fo = (org[0], org[1], sc)
             _, buf = pb.save_to_bufferv("jpeg", ["quality"], [str(qual)]); mime = "image/jpeg"
         except Exception:
             if not view: SCALE, ORIGIN = 1.0, (0, 0)
+            fo = (0, 0, 1.0)
             with open(path, "rb") as f: buf = f.read()
             mime = "image/jpeg" if path.endswith("jpg") else "image/png"
         h = hashlib.md5(buf).hexdigest()
         if a.get("prev") and a["prev"] == h: return {"same": True, "h": h}   # nothing changed: send nothing
-        return {"jpeg": bytes(buf), "mime": mime, "h": h}
+        return {"jpeg": bytes(buf), "mime": mime, "h": h, "ox": fo[0], "oy": fo[1], "sc": fo[2]}
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -214,6 +216,7 @@ def glide(x, y, dur=None):
 
 
 def _target(a, kx="x", ky="y"):
+    if a.get("raw"): return int(a[kx]), int(a[ky])   # real screen pixels (the live viewer)
     return int(a[kx] * SCALE) + ORIGIN[0], int(a[ky] * SCALE) + ORIGIN[1]
 
 

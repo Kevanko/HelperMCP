@@ -68,6 +68,8 @@ Two ways to connect:
 
 `open_viewer` returns a link (valid 12 h, usable only for that session; it does not expose your operator key). Open it in a browser and you get a **live view of the remote screen** (about 1 frame/s) next to a log of what the AI is doing. Ask your AI to open it for you, e.g. `start <url>` on Windows or `xdg-open <url>` on Linux. The viewer never moves the mouse and does not change the coordinates the AI clicks with.
 
+`open_viewer` gives two links. The first is **view only** (safe to share). The second ends with `#c=…` and is the **control** link: in the page press "Take control" (Управлять сам), then click, drag and scroll on the picture, type into the box at the bottom (Enter types it and presses Enter) or use the quick keys (Enter, Backspace, Tab, Esc, arrows; Back / Home / Recents on phones). While you control, the AI's calls are refused with a clear message and `wait_online` waits until you press "Give back to the helper" (or 5 minutes after your last input). The secret is in the URL fragment, so it never reaches a server log. The stream keeps two frames in flight, adapts its quality to the link and shows the helper's overlay without flicker; Windows/Linux pages have a monitor selector.
+
 ## Tools
 
 | Tool | What |

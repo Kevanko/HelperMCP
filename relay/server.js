@@ -52,7 +52,7 @@ function save() {
     try {
       const out = {
         sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, events: (s.events || []).slice(-30) })),
-        viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp })),
+        viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
@@ -99,11 +99,16 @@ const safeEq = (a, b) => {
 };
 
 // ---- session / command plumbing ------------------------------------------
-function call(code, tool, args = {}, timeoutMs = 60_000) {
+const TAKEOVER_MS = 5 * 60_000;
+const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   // the operator is fixing something by hand in the live viewer
+function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
-  if (s.paused && tool !== 'bye') {
+  if (s.paused && tool !== 'bye' && !(opts.human && tool === 'screenshot')) {   // the live viewer keeps showing the screen while it is paused
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
+  }
+  if (takenOver(s) && !opts.human && tool !== 'bye') {
+    return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
   if (Date.now() - s.lastSeen > ONLINE_MS && !s.pending.size && tool !== 'bye') {
     if (s.persist) return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet loss, VPN change, sleep or reboot). This session is KEPT and its agent reconnects by itself with the same code. Use wait_online to wait for it, then session_log to read what happened.`));
@@ -122,7 +127,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000) {
   const id = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      s.pending.delete(id);
+      s.pending.delete(id); s.queue = s.queue.filter((q) => q.id !== id);   // a caller that gave up must not have its command run later
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
     }, timeoutMs);
     s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view });
@@ -170,9 +175,9 @@ function adapt(s, pend, bytes) {
   const dur = Date.now() - pend.t0;
   if (pend.view) {                                   // aim for a frame about every second
     s.vl = s.vl ?? 3;
-    if (dur > 1800 && s.vl > 0) { s.vl--; s.fast = 0; }
-    else if (dur < 700 && bytes && ++s.fast >= 3 && s.vl < LEVELS.length - 1) { s.vl++; s.fast = 0; }
-    else if (dur >= 700) s.fast = 0;
+    if (dur > 2200 && s.vl > 0) { s.vl--; s.fast = 0; }
+    else if (dur < 900 && bytes && ++s.fast >= 3 && s.vl < LEVELS.length - 1) { s.vl++; s.fast = 0; }
+    else if (dur >= 900) s.fast = 0;
   } else if (pend.tool === 'screenshot' && bytes) {
     s.lite = bytes / Math.max(dur, 1) < 60 && dur > 3000 ? true : (dur < 1500 ? false : s.lite);   // < ~60 KB/s and slow => lite
   }
@@ -278,8 +283,8 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session (it was ended)');
       const until = Date.now() + (a.timeout_s || 40) * 1000;
-      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (Date.now() - s.lastSeen <= ONLINE_MS && !s.paused) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
-      return { text: s.paused ? 'still paused by the user' : `still offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago); call wait_online again or ask the operator` };
+      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (Date.now() - s.lastSeen <= ONLINE_MS && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
+      return { text: takenOver(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago); call wait_online again or ask the operator` };
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
@@ -345,8 +350,9 @@ const tools = [
       const c = code.toUpperCase();
       if (!sessions.has(c)) throw new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`);
       const token = crypto.randomBytes(18).toString('hex');
-      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS }); save();
-      return { text: `${lastBase}/v/${token}` };
+      const ctl = crypto.randomBytes(12).toString('hex');
+      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
+      return { text: `Watch (view only, safe to share): ${lastBase}/v/${token}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${lastBase}/v/${token}#c=${ctl}` };
     } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
     run: async (code) => { await call(code, 'bye').catch(() => {}); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },
@@ -493,37 +499,66 @@ function launcherCmd(b) {
   return lines.join('\r\n') + '\r\n';
 }
 
-function viewerPage(s) {
+function viewerPage(s, canControl) {
   const who = s ? `${s.info.user}@${s.info.host}` : '';
+  const android = s && /android/i.test(s.info?.os || '') ? 1 : 0;
   const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
   return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Remote screen ${esc(who)}</title>
 <style>html,body{margin:0;height:100%;background:#0b0f16;color:#cfd8e6;font:14px system-ui}
-#top{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#111826;border-bottom:1px solid #26324a}
+#top{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#111826;border-bottom:1px solid #26324a;flex-wrap:wrap}
 #dot{width:9px;height:9px;border-radius:50%;background:#888}#dot.on{background:#4c8dff;box-shadow:0 0 8px #4c8dff}
-#main{display:flex;height:calc(100% - 41px)}#scr{flex:1;display:flex;align-items:center;justify-content:center;min-width:0}
-#scr img{max-width:100%;max-height:100%;box-shadow:0 0 0 1px #26324a}
-#log{width:340px;overflow:auto;border-left:1px solid #26324a;padding:8px 12px;font:12px ui-monospace,monospace}
+button,select,input{font:inherit;color:#cfd8e6;background:#1a2438;border:1px solid #2c3a57;border-radius:8px;padding:5px 10px}
+button{cursor:pointer}button:hover{background:#22304d}button.on{background:#2e7d32;border-color:#43a047;color:#fff}
+#main{display:flex;height:calc(100% - 41px - var(--kb,0px))}#scr{flex:1;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0}
+#cv{max-width:100%;max-height:100%;box-shadow:0 0 0 1px #26324a;background:#000}#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px #43a047}
+#log{width:300px;overflow:auto;border-left:1px solid #26324a;padding:8px 12px;font:12px ui-monospace,monospace}
 #log div{padding:2px 0;border-bottom:1px solid #1a2233;word-break:break-all}#log b{color:#7fb0ff}#log i{color:#6b7a94;font-style:normal}
-@media(max-width:800px){#main{flex-direction:column}#log{width:auto;height:30%;border-left:0;border-top:1px solid #26324a}}</style>
-<div id=top><span id=dot></span><b id=st>…</b><span style="color:#6b7a94">${esc(who)}</span></div>
-<div id=main><div id=scr><img id=img alt=""></div><div id=log></div></div>
+#kb{--h:46px;position:fixed;left:0;right:0;bottom:0;display:none;gap:6px;padding:6px 10px;background:#111826;border-top:1px solid #26324a;align-items:center;flex-wrap:wrap}
+#kb input{flex:1;min-width:140px}
+@media(max-width:800px){#main{flex-direction:column}#log{width:auto;height:25%;border-left:0;border-top:1px solid #26324a}}</style>
+<div id=top><span id=dot></span><b id=st>…</b><span style="color:#6b7a94">${esc(who)}</span>
+<select id=mon title="monitor"><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
+<button id=ctl style="display:none"></button><span id=hint style="color:#6b7a94"></span></div>
+<div id=main><div id=scr><canvas id=cv width=16 height=9></canvas></div><div id=log></div></div>
+<div id=kb><input id=txt autocomplete=off><button id=send></button><button data-k="enter">Enter</button><button data-k="backspace">⌫</button><button data-k="tab">Tab</button><button data-k="esc">Esc</button><button data-k="up">↑</button><button data-k="down">↓</button><button data-k="left">←</button><button data-k="right">→</button>${android ? '<button data-k="back">Back</button><button data-k="home">Home</button><button data-k="recents">Recents</button>' : ''}</div>
 <script>
-const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён'}:{live:'Live',wait:'Waiting for a frame…',end:'Session ended'};
-const dot=document.getElementById('dot'),st=document.getElementById('st'),img=document.getElementById('img'),log=document.getElementById('log');
+const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён',take:'Управлять сам',give:'Вернуть помощнику',hint:'Вы управляете: клик, перетаскивание, колесо. Помощник ждёт.',send:'Ввод',ph:'текст (Enter — ввести и нажать Enter)'}:{live:'Live',wait:'Waiting for a frame…',end:'Session ended',take:'Take control',give:'Give back to the helper',hint:'You are in control: click, drag, wheel. The helper waits.',send:'Type',ph:'text (Enter = type it and press Enter)'};
+const $=id=>document.getElementById(id),dot=$('dot'),st=$('st'),cv=$('cv'),g=cv.getContext('2d'),log=$('log'),kb=$('kb'),txt=$('txt');
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
-let ended=false;
-async function frames(){while(!ended){try{const r=await fetch(base+'/frame?'+Date.now());
- if(r.status===410){ended=true;break}
- if(r.status===204){dot.className='on';st.textContent=L.live;await new Promise(x=>setTimeout(x,600));continue}
- if(r.ok){const b=await r.blob();const u=URL.createObjectURL(b);const o=img.src;img.src=u;if(o.startsWith('blob:'))URL.revokeObjectURL(o);dot.className='on';st.textContent=L.live+' · '+Math.round(b.size/1024)+' KB'}
- else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
- catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,2000))}
- await new Promise(x=>setTimeout(x,150))}
- dot.className='';st.textContent=L.end}
+const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
+let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
+$('mon').onchange=e=>{mon=e.target.value};
+async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());
+ if(r.status===410){ended=true;return}
+ if(r.status===204){dot.className='on';st.textContent=L.live;await new Promise(x=>setTimeout(x,250));return}
+ if(r.ok){const b=await r.blob();const bmp=await createImageBitmap(b);
+  if(my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
+   meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};dot.className='on';st.textContent=L.live+' · '+Math.round(b.size/1024)+' KB'}
+  bmp.close()}
+ else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1200))}}
+ catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
+async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}dot.className='';st.textContent=L.end}
+lane();setTimeout(lane,350);   // two frames in flight: the helper's agent never waits for the browser, so the picture keeps moving
 async function logs(){while(!ended){try{const r=await fetch(base+'/log');if(r.ok){const a=await r.json();
  log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+e.tool+'</b> '+(e.args||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
-frames();logs();
+logs();
+async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
+function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
+if(CTL){const b=$('ctl');b.style.display='';b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
+ const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?'58px':'0px');$('hint').textContent=on?L.hint:'';send('/takeover',{on})};
+ b.onclick=()=>set(!control);
+ let down=null;
+ cv.addEventListener('pointerdown',e=>{if(!control)return;e.preventDefault();try{cv.setPointerCapture(e.pointerId)}catch(_){}down={p:real(e),t:Date.now(),b:e.button}});
+ cv.addEventListener('pointerup',e=>{if(!control||!down)return;const u=real(e),d=down;down=null;const moved=Math.hypot(u.x-d.p.x,u.y-d.p.y)/meta.sc;
+  if(moved>8)send('/input',{a:'drag',x:d.p.x,y:d.p.y,x2:u.x,y2:u.y,hold:Date.now()-d.t>500});
+  else send('/input',{a:'click',x:u.x,y:u.y,button:d.b===2?'right':'left'})});
+ cv.addEventListener('contextmenu',e=>{if(control)e.preventDefault()});
+ let acc=0,wt=0;cv.addEventListener('wheel',e=>{if(!control)return;e.preventDefault();acc+=Math.sign(e.deltaY)*Math.max(1,Math.round(Math.abs(e.deltaY)/100));clearTimeout(wt);wt=setTimeout(()=>{const p=real(e);send('/input',{a:'scroll',x:p.x,y:p.y,amount:Math.max(-20,Math.min(20,acc))});acc=0},120)},{passive:false});
+ $('send').onclick=()=>{if(txt.value){send('/input',{a:'text',text:txt.value});txt.value=''}};
+ txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();if(txt.value)send('/input',{a:'text',text:txt.value});setTimeout(()=>send('/input',{a:'key',keys:'enter'}),350);txt.value=''}});
+ kb.querySelectorAll('[data-k]').forEach(x=>x.onclick=()=>send('/input',{a:'key',keys:x.dataset.k}));
+ setInterval(()=>{if(control)send('/takeover',{on:true})},60000)}   // the hand-over lasts while this page is in control; the relay lets it lapse a few minutes after the page closes
 </script>`;
 }
 
@@ -580,7 +615,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log|\/input|\/takeover)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -588,14 +623,32 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
-      if (v.busy) { res.writeHead(204); return res.end(); }
-      v.busy = true;
+      if (vw[2] === '/input' || vw[2] === '/takeover') {   // control: needs the secret from the control link
+        if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        const b = JSON.parse((await body(req, 20_000)) || '{}');
+        if (vw[2] === '/takeover') { s.takeover = b.on ? Date.now() : 0; s.events.push({ t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on }); }
+        v.n = (v.n || 0) + 1; const now = Date.now(); if (now - (v.nt || 0) > 1000) { v.nt = now; v.n = 1; } if (v.n > 25) return json(res, 429, { error: 'too fast' });
+        s.takeover = now;   // any input keeps the hand-over alive
+        const num = (x) => Math.round(Number(x)), ok = (...xs) => xs.every((x) => Number.isFinite(x) && Math.abs(x) < 100000);
+        let tool, a2;
+        if (b.a === 'click') { const x = num(b.x), y = num(b.y); if (!ok(x, y)) return json(res, 400, {}); tool = 'click'; a2 = { x, y, raw: true, button: b.button === 'right' ? 'right' : 'left' }; }
+        else if (b.a === 'drag') { const x = num(b.x), y = num(b.y), x2 = num(b.x2), y2 = num(b.y2); if (!ok(x, y, x2, y2)) return json(res, 400, {}); tool = 'drag'; a2 = { x, y, x2, y2, raw: true, hold: !!b.hold }; }
+        else if (b.a === 'scroll') { const x = num(b.x), y = num(b.y), amount = num(b.amount); if (!ok(x, y, amount)) return json(res, 400, {}); tool = 'scroll'; a2 = { x, y, raw: true, amount: Math.max(-20, Math.min(20, amount)) }; }
+        else if (b.a === 'text') { tool = 'type_text'; a2 = { text: String(b.text || '').slice(0, 2000) }; }
+        else if (b.a === 'key') { tool = 'press_key'; a2 = { keys: String(b.keys || '').slice(0, 40) }; }
+        else return json(res, 400, { error: 'unknown input' });
+        try { const d = await call(v.code, tool, a2, 30_000, { human: true }); return json(res, 200, { ok: true, text: d?.text || '' }); }
+        catch (e) { return json(res, 503, { error: e.message }); }
+      }
+      if ((v.inflight || 0) >= 2) { res.writeHead(204); return res.end(); }
+      v.inflight = (v.inflight || 0) + 1;
       try {
-        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...viewParams(s) }, 20_000);
+        const mon = url.searchParams.get('mon'); const extra = /^\d$/.test(mon || '') ? { monitor: Number(mon) } : {};
+        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...extra, ...viewParams(s) }, 20_000, { human: true });
         if (d.same) { res.writeHead(204, { 'x-same': '1' }); return res.end(); }   // unchanged screen: nothing to send
         v.hash = d.h; v.last = d.jpeg;
-        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-quality': `${s.vl ?? 3}` }); return res.end(d.jpeg);
-      } catch (e) { return json(res, 503, { error: e.message }); } finally { v.busy = false; }
+        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-quality': `${s.vl ?? 3}`, 'x-ox': `${d.ox ?? 0}`, 'x-oy': `${d.oy ?? 0}`, 'x-sc': `${d.sc ?? d.scale ?? 1}` }); return res.end(d.jpeg);
+      } catch (e) { return json(res, 503, { error: e.message }); } finally { v.inflight--; }
     }
 
     if (p === '/admin/status') {   // for the `helpermcp` console panel (needs the operator key)
@@ -731,7 +784,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
   try {
     const st = JSON.parse(unseal(fs.readFileSync(STATE_FILE)));
     for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
-    for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp });
+    for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }
 }

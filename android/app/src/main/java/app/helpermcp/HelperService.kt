@@ -280,7 +280,7 @@ class HelperService : AccessibilityService() {
     }
 
     private fun ok(text: String = "ok") = JSONObject().put("text", text)
-    private fun px(a: JSONObject, k: String) = (a.getDouble(k) * scale).toFloat()
+    private fun px(a: JSONObject, k: String) = (a.getDouble(k) * (if (a.optBoolean("raw")) 1f else scale)).toFloat()   // raw: real screen pixels (the live viewer)
     private fun py(a: JSONObject, k: String) = px(a, k)
 
     private fun sysinfo(): JSONObject {
@@ -312,14 +312,14 @@ class HelperService : AccessibilityService() {
     private fun screenshot(a: JSONObject): Shot {
         val maxW = a.optInt("max_width", 900).coerceIn(200, 4000); val q = a.optInt("quality", 70).coerceIn(20, 95)
         val view = a.optBoolean("view")
-        val withOverlay = a.optBoolean("overlay")   // overlay=true: show exactly what the user sees (glow, label, pointer), to check how it looks on this phone
+        val withOverlay = a.optBoolean("overlay") || view   // overlay=true: show exactly what the user sees (glow, label, pointer), to check how it looks on this phone
         if (!withOverlay) fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
         val bmp = try { capture() } finally { if (!withOverlay) fx.captureMode(false) }.let { if (withOverlay) it else fx.removeGlow(it) }
         val sc = if (bmp.width > maxW) bmp.width.toFloat() / maxW else 1f
         val out = if (sc > 1f) Bitmap.createScaledBitmap(bmp, (bmp.width / sc).toInt(), (bmp.height / sc).toInt(), true) else bmp
         val bo = ByteArrayOutputStream(); out.compress(Bitmap.CompressFormat.JPEG, q, bo)
         if (!view) scale = sc   // a live-viewer frame must not change the coordinates the AI works with
-        return Shot(bo.toByteArray(), JSONObject().put("width", out.width).put("height", out.height).put("scale", sc.toDouble()))
+        return Shot(bo.toByteArray(), JSONObject().put("width", out.width).put("height", out.height).put("scale", sc.toDouble()).put("ox", 0).put("oy", 0).put("sc", sc.toDouble()))
     }
 
     private fun gesture(path: Path, dur: Long, hold: Long = 0): Boolean {

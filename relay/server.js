@@ -72,6 +72,28 @@ function recordMiss(s, code, kind, info) {
     s.events.push({ t: Date.now(), type: 'miss', data: { kind, ...info } });
   } catch (e) { console.error('miss log failed:', e.message); }
 }
+// what the label shows: the current stage (its colour, "2/5 title") and the note
+function lookOf(s) {
+  const st = s.plan && s.plan.stages[s.plan.current];
+  const note = [st ? `${s.plan.current + 1}/${s.plan.stages.length} ${st.title}` : '', s.note || ''].filter(Boolean).join(': ');
+  return { color: (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };
+}
+async function pushLook(code, s) {
+  const l = lookOf(s);
+  try { return String((await call(code, 'look', { ...l, force: true })).text || 'ok'); }
+  catch (e) { if (/Unknown tool|not available/i.test(e.message)) return 'noted (this agent is too old to show it: the user can restart the helper to update it)'; throw e; }
+}
+// the AI's screenshots: smaller by default, and an unchanged screen costs a line instead of a picture
+async function aiShot(code, a) {
+  const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error(`No such session "${code}"`);
+  const key = JSON.stringify([a.monitor ?? null, a.region ?? null, a.max_width ?? null]);
+  const args = { max_width: 1366, quality: 60, ...a }; delete args.fresh;
+  if (!a.fresh && s.shotKey === key && s.shotHash) args.prev = s.shotHash;
+  const d = await callJob(code, 'screenshot', args);
+  if (d && (d.same || (args.prev && d.h === args.prev))) return { text: 'The screen is exactly as in your last screenshot (nothing changed). Use fresh:true to get the picture again.' };
+  if (d && d.h) { s.shotHash = d.h; s.shotKey = key; }
+  return d;
+}
 const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
@@ -245,19 +267,32 @@ const tools = [
       let L = []; try { L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n').filter(Boolean).slice(-(a.limit || 20)); } catch { /* none yet */ }
       return { text: L.length ? '[' + L.join(',\n') + ']' : 'no mistakes logged yet' };
     } },
+  { name: 'plan', session: true,
+    description: 'Split the job into stages the user can follow: each stage has a short title and its own colour (#RRGGBB) that the glow and the label take while you are in it. The live viewer lists the stages and highlights the current one. Call it once when you know the steps (you may call it again if the plan changes), then set_look {stage: N} when you move on.',
+    props: { stages: { type: 'array', maxItems: 12, items: { type: 'object', properties: { title: { type: 'string' }, color: { type: 'string', description: '#RRGGBB' } }, required: ['title'] } }, current: { type: 'integer', minimum: 0, description: 'index of the current stage, default 0' } }, required: ['stages'],
+    run: async (code, a) => {
+      const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
+      const hex = (x) => (/^#?[0-9a-f]{6}$/i.test(String(x || '')) ? '#' + String(x).replace('#', '') : '');
+      const stages = (a.stages || []).slice(0, 12).map((x) => ({ title: String(x.title || '').replace(/\s+/g, ' ').slice(0, 60), color: hex(x.color) })).filter((x) => x.title);
+      if (!stages.length) throw new Error('stages must have at least one title');
+      s.plan = { stages, current: Math.max(0, Math.min(stages.length - 1, Number(a.current) || 0)), at: Date.now(), done: [] };
+      s.events.push({ t: Date.now(), type: 'plan', data: { stages: stages.map((x) => x.title) } }); save();
+      return { text: await pushLook(c, s) };
+    } },
   { name: 'set_look', session: true,
-    description: 'Choose how your presence looks to the user (the glow and the label on a PC or a phone). "color" (#RRGGBB) is the glow and label colour while you work: pick one you like, ONCE at the start; it cannot be changed again in this session (no flicker of colours). "note" (up to 90 chars) is a short line shown in the app and on the label, e.g. "Checking the subscription again in 5 min"; update it whenever it helps the user to know what is going on (not more than once a minute). Other systems: only logged.',
-    props: { color: str('#RRGGBB, once per session'), note: str('short status line, you may update it') },
+    description: 'How your presence looks to the user (the glow and the label on a PC or a phone, and the live viewer). "note" (up to 90 chars): a short line of what you are doing right now, e.g. "Checking the subscription again in 5 min"; keep it current (at most once per 30 s). "stage": move to stage N of your plan (its colour and title show). "color" (#RRGGBB): your colour when you have no plan, chosen once per session.',
+    props: { note: str('short status line'), stage: { type: 'integer', minimum: 0, description: 'index of the plan stage you start now' }, color: str('#RRGGBB, once per session (without a plan)') },
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
       const now = Date.now();
-      if (a.note && s.lastNoteAt && now - s.lastNoteAt < 30_000) throw new Error('The note was changed a moment ago: wait, the user needs time to read it (once per 30 s at most).');
-      if (a.note) s.lastNoteAt = now;
-      if (a.color && s.lookColor) a = { ...a, color: '' };   // the colour is fixed after the first time
-      else if (a.color) s.lookColor = String(a.color).slice(0, 9);
-      s.events.push({ t: now, type: 'look', data: { color: s.lookColor || '', note: String(a.note || '').slice(0, 90) } });
-      try { return { text: String((await call(c, 'look', { color: a.color || '', note: String(a.note || '').slice(0, 90) })).text || 'ok') }; }
-      catch (e) { if (/Unknown tool|not available/i.test(e.message)) return { text: 'noted (this agent is too old to show it: the user can restart the helper to update it)' }; throw e; }
+      if (a.note) { if (s.lastNoteAt && now - s.lastNoteAt < 30_000) throw new Error('The note was changed a moment ago: wait, the user needs time to read it (once per 30 s at most).'); s.lastNoteAt = now; s.note = String(a.note).replace(/\s+/g, ' ').slice(0, 90); }
+      if (a.stage !== undefined && s.plan) {
+        const n = Math.max(0, Math.min(s.plan.stages.length - 1, Number(a.stage) || 0));
+        if (n !== s.plan.current) { if (!s.plan.done.includes(s.plan.current) && n > s.plan.current) s.plan.done.push(s.plan.current); s.plan.current = n; s.plan.at = now; }
+      }
+      if (a.color && !s.lookColor && /^#?[0-9a-f]{6}$/i.test(a.color)) s.lookColor = '#' + String(a.color).replace('#', '');   // the colour is fixed after the first time
+      s.events.push({ t: now, type: 'look', data: { note: s.note || '', stage: s.plan ? s.plan.current : null } }); save();
+      return { text: await pushLook(c, s) };
     } },
   { name: 'hold', session: true,
     description: 'Put the session on hold when you must stop for a while (your token or rate limit is running out, a long break, waiting for the user). The phone shows an orange "helper is on hold, back soon" label, keeps its screen awake and the session open; your next action continues it. Unlike pause (which the user presses) you start it yourself. Elsewhere it is only logged.',
@@ -288,10 +323,16 @@ const tools = [
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
+  { name: 'watch', agent: true, description: 'Live look: films the screen for a few seconds and returns one picture with the frames in a grid (time and how much changed on each) plus a short text summary. Use it to see what happens over time: a loading bar, an animation, a window that flickers, whether typing or a click had any effect, an error that shows for a moment.',
+    props: { seconds: { type: 'number', minimum: 1, maximum: 10, description: 'default 3' }, fps: { type: 'number', minimum: 1, maximum: 5, description: 'frames per second, default 3' }, monitor: { type: 'integer', minimum: 0 },
+      region: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, w: { type: 'number' }, h: { type: 'number' } }, description: 'only this part, in the coordinates of your last screenshot' } },
+    ms: (a) => ((a.seconds || 3) + 25) * 1000 },
   { name: 'screenshot', agent: true, description: 'Screenshot of the remote screen (what the user sees): all monitors side by side, or a single one with "monitor" (0-based, see sysinfo). Click/scroll coordinates refer to the last screenshot.',
     props: { monitor: { type: 'integer', minimum: 0, description: 'omit for all monitors' },
-      max_width: { type: 'integer', minimum: 320, maximum: 3840, description: 'downscale to this width (default 1920; use less on slow links)' },
-      quality: { type: 'integer', minimum: 10, maximum: 95, description: 'JPEG quality (default 70)' },
+      region: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, w: { type: 'number' }, h: { type: 'number' } }, description: 'only this part, in the coordinates of your last screenshot: sharp and cheap for reading small text; later clicks use the coordinates of this picture' },
+      max_width: { type: 'integer', minimum: 320, maximum: 3840, description: 'downscale to this width (default 1366)' },
+      quality: { type: 'integer', minimum: 10, maximum: 95, description: 'JPEG quality (default 60)' },
+      fresh: { type: 'boolean', description: 'send the picture even if nothing changed since your last screenshot' },
       overlay: { type: 'boolean', description: 'Android only: keep the helper overlay (glow, label, pointer) in the picture, to see exactly how it looks on this phone' } } },
   { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux) and wait for it. Returns exit code and combined output. Portable node/uv fetched by this bridge are on PATH. For GUI apps or anything long-lived use start_process instead.',
     props: { command: str('Command line'), timeout_s: { type: 'integer', minimum: 1, maximum: 3600, description: 'default 60' }, cwd: str('working directory') }, required: ['command'],
@@ -384,7 +425,10 @@ Workflow for any task:
 9. The session survives internet loss, VPN changes and reboots (the user chose to keep it): it comes back by itself with the same code. If a call says the PC is offline or paused, do not start over: wait_online, then read session_log (it holds the network diagnosis and what the agent already tried) and agent_log, and continue where you stopped. Only the user ending the session in their console ends it.
 10. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
 11. This is the user's real machine: only touch what the task needs, and say what you installed or changed.
-12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done. If you must stop for a while (token or rate limit, a long break) call hold first, so the phone stays awake and the session stays open. On a phone you may also call set_look once at the start (a colour you like) and keep its note line current.`;
+12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done. If you must stop for a while (token or rate limit, a long break) call hold first, so the phone stays awake and the session stays open. On a phone you may also call set_look once at the start (a colour you like) and keep its note line current.
+13. Work in stages: when you know the steps, call plan (titles + a colour per stage) and set_look {stage} as you move on; keep set_look {note} current.
+14. Save tokens and time: do not take a screenshot after every step. Every click, typing and key press reports what changed on the screen; trust it. Take a screenshot when you need to see something new; use region to read small things; an unchanged screen costs one line. Use watch when something happens over time.
+15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -430,6 +474,7 @@ function buildMcp(fixed) {
       if (t.local) return fmt(await t.run(a));
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
       if (t.run) return fmt(await t.run(session, a));
+      if (name === 'screenshot') return fmt(await aiShot(session, a));
       return fmt(await callJob(session, name, a, t.ms?.(a)));
     } catch (e) {
       return { isError: true, content: [{ type: 'text', text: e.message }] };
@@ -501,54 +546,88 @@ function launcherCmd(b) {
   return lines.join('\r\n') + '\r\n';
 }
 
-function viewerPage(s, canControl) {
+function viewerPage(s) {
   const who = s ? `${s.info.user}@${s.info.host}` : '';
   const android = s && /android/i.test(s.info?.os || '') ? 1 : 0;
   const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Remote screen ${esc(who)}</title>
-<style>html,body{margin:0;height:100%;background:#0b0f16;color:#cfd8e6;font:14px system-ui}
-#top{display:flex;align-items:center;gap:10px;padding:8px 14px;background:#111826;border-bottom:1px solid #26324a;flex-wrap:wrap}
-#dot{width:9px;height:9px;border-radius:50%;background:#888}#dot.on{background:#4c8dff;box-shadow:0 0 8px #4c8dff}
-button,select,input{font:inherit;color:#cfd8e6;background:#1a2438;border:1px solid #2c3a57;border-radius:8px;padding:5px 10px}
-button{cursor:pointer}button:hover{background:#22304d}button.on{background:#2e7d32;border-color:#43a047;color:#fff}
-#main{display:flex;height:calc(100% - 41px - var(--kb,0px))}#scr{flex:1;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0}
-#cv{max-width:100%;max-height:100%;box-shadow:0 0 0 1px #26324a;background:#000}#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px #43a047}
-#log{width:300px;overflow:auto;border-left:1px solid #26324a;padding:8px 12px;font:12px ui-monospace,monospace}
-#log div{padding:2px 0;border-bottom:1px solid #1a2233;word-break:break-all}#log b{color:#7fb0ff}#log i{color:#6b7a94;font-style:normal}
-#kb{--h:46px;position:fixed;left:0;right:0;bottom:0;display:none;gap:6px;padding:6px 10px;background:#111826;border-top:1px solid #26324a;align-items:center;flex-wrap:wrap}
-#kb input{flex:1;min-width:140px}
-@media(max-width:800px){#main{flex-direction:column}#log{width:auto;height:25%;border-left:0;border-top:1px solid #26324a}}</style>
-<div id=top><span id=dot></span><b id=st>…</b><span style="color:#6b7a94">${esc(who)}</span>
-<select id=mon title="monitor"><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
-<button id=ctl style="display:none"></button><span id=hint style="color:#6b7a94"></span></div>
-<div id=main><div id=scr><canvas id=cv width=16 height=9></canvas></div><div id=log></div></div>
-<div id=kb><input id=txt autocomplete=off><button id=send></button><button data-k="enter">Enter</button><button data-k="backspace">⌫</button><button data-k="tab">Tab</button><button data-k="esc">Esc</button><button data-k="up">↑</button><button data-k="down">↓</button><button data-k="left">←</button><button data-k="right">→</button>${android ? '<button data-k="back">Back</button><button data-k="home">Home</button><button data-k="recents">Recents</button>' : ''}</div>
+  return `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><title>Remote screen ${esc(who)}</title>
+<style>
+:root{--bg:#020a06;--panel:#07140c;--panel2:#0a1d12;--line:#16482b;--line2:#2bb55a;--g:#38ff7a;--fg:#d6ffe4;--mut:#7fae8f;--warn:#ffd166;--hot:#ff8a1e;--st:#38ff7a;--kb:0px}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,"Cascadia Code","Cascadia Mono",Consolas,"SF Mono",Menlo,monospace}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(56,255,122,.03) 0 1px,transparent 1px 3px);z-index:9}
+button,select,input{font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:.3rem .65rem}
+button{cursor:pointer;transition:border-color .15s,box-shadow .15s}button:hover{border-color:var(--line2);box-shadow:0 0 12px rgba(56,255,122,.15)}
+button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--g);outline-offset:1px}
+#top{height:44px;display:flex;align-items:center;gap:.7rem;padding:0 .9rem;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--panel2),var(--panel))}
+#dot{width:9px;height:9px;border-radius:50%;background:var(--mut);flex:none}#dot.on{background:var(--g);box-shadow:0 0 10px var(--g)}#dot.bad{background:var(--hot);box-shadow:0 0 10px var(--hot)}
+#st{color:var(--g);white-space:nowrap}#who{color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+#ctl{color:#00150a;background:var(--g);border-color:var(--g);font-weight:600}#ctl.on{background:var(--warn);border-color:var(--warn)}
+#main{display:grid;grid-template-columns:minmax(0,1fr) 300px;height:calc(100% - 44px - var(--kb))}
+#scr{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0;padding:14px}
+#frame{position:relative;max-width:100%;max-height:100%;display:flex}
+#frame:before,#frame:after,#frame i:before,#frame i:after{content:"";position:absolute;width:22px;height:22px;border:2px solid var(--st);transition:border-color .6s}
+#frame:before{left:-8px;top:-8px;border-right:0;border-bottom:0}#frame:after{right:-8px;bottom:-8px;border-left:0;border-top:0}
+#frame i:before{right:-8px;top:-8px;border-left:0;border-bottom:0}#frame i:after{left:-8px;bottom:-8px;border-right:0;border-top:0}
+#cv{max-width:100%;max-height:calc(100vh - 44px - var(--kb) - 28px);background:#000;box-shadow:0 0 0 1px var(--line),0 0 40px rgba(0,0,0,.6);display:block}
+#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px var(--warn),0 0 30px rgba(255,209,102,.18)}
+#tag{position:absolute;left:14px;top:12px;color:var(--warn);background:rgba(2,10,6,.85);border:1px solid var(--warn);border-radius:4px;padding:.1rem .5rem;display:none}
+#side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+#side h2{margin:0;padding:.65rem .9rem .35rem;font-size:12px;font-weight:600;color:var(--mut)}
+#note{margin:0 .9rem .6rem;padding:.55rem .7rem;border-left:2px solid var(--st);background:rgba(56,255,122,.04);color:var(--fg);min-height:2.4em;transition:border-color .6s}
+#note:empty:before{content:attr(data-empty);color:var(--mut)}
+#plan{list-style:none;margin:0;padding:0 .9rem .7rem;counter-reset:s}
+#plan li{counter-increment:s;position:relative;padding:.28rem 0 .28rem 2rem;color:var(--mut)}
+#plan li:before{content:counter(s);position:absolute;left:0;top:.3rem;width:1.35rem;height:1.35rem;border:1px solid var(--c,var(--line2));border-radius:50%;display:grid;place-items:center;font-size:11px;color:var(--c,var(--g))}
+#plan li.done{color:var(--mut);text-decoration:line-through;text-decoration-color:rgba(127,174,143,.5)}#plan li.done:before{content:"\\2713"}
+#plan li.cur{color:var(--fg)}#plan li.cur:before{background:var(--c,var(--g));color:#00150a;box-shadow:0 0 12px var(--c,var(--g))}
+#plan:empty{display:none}
+#log{flex:1;overflow:auto;border-top:1px solid var(--line);padding:.5rem .9rem;font-size:12px}
+#log div{padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#log b{color:var(--g);font-weight:500}#log i{color:#3f6b50;font-style:normal}#log div:before{content:"$ ";color:#3f6b50}
+#kb{position:fixed;left:0;right:0;bottom:0;display:none;gap:.35rem;padding:.5rem .7rem;background:var(--panel2);border-top:1px solid var(--warn);align-items:center;flex-wrap:wrap}
+#kb label{color:var(--warn)}#kb input{flex:1;min-width:10rem;background:#010603;border-color:var(--line2)}
+@media(max-width:820px){#main{display:block;height:auto}#scr{height:60vh}#cv{max-height:calc(60vh - 28px)}#side{border-left:0;border-top:1px solid var(--line)}#log{max-height:30vh}#who{display:none}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+<div id=top><span id=dot></span><span id=st>…</span><span id=who>${esc(who)}</span>
+<select id=mon title=screen><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
+<button id=ctl hidden></button></div>
+<div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
+<aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol><div id=log></div></aside></div>
+<div id=kb><label for=txt>$</label><input id=txt autocomplete=off><button id=send></button><button data-k=enter>Enter</button><button data-k=backspace>&#9003;</button><button data-k=tab>Tab</button><button data-k=esc>Esc</button><button data-k=left>&larr;</button><button data-k=up>&uarr;</button><button data-k=down>&darr;</button><button data-k=right>&rarr;</button>${android ? '<button data-k=back>Back</button><button data-k=home>Home</button><button data-k=recents>Recents</button>' : ''}</div>
 <script>
-const ru=(navigator.language||'').startsWith('ru'),L=ru?{off:'Устройство не на связи: ждём, пока оно вернётся',paused:'Пауза на устройстве',live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён',take:'Управлять сам',give:'Вернуть помощнику',hint:'Вы управляете: клик, перетаскивание, колесо. Помощник ждёт.',send:'Ввод',ph:'текст (Enter — ввести и нажать Enter)'}:{off:'The device is offline: waiting for it to come back',paused:'Paused on the device',live:'Live',wait:'Waiting for a frame…',end:'Session ended',take:'Take control',give:'Give back to the helper',hint:'You are in control: click, drag, wheel. The helper waits.',send:'Type',ph:'text (Enter = type it and press Enter)'};
+const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'в эфире',wait:'жду кадр…',end:'сеанс завершён',off:'устройство не на связи',paused:'пауза на устройстве',take:'Управлять самому',give:'Вернуть помощнику',tag:'управляете вы, помощник ждёт',send:'Ввести',ph:'текст: Enter — ввести и нажать Enter',note:'Что делает помощник',noNote:'помощник ещё ничего не написал',plan:'План',over:'вы управляете'}:{live:'live',wait:'waiting for a frame…',end:'session ended',off:'device offline',paused:'paused on the device',take:'Take control',give:'Give back to the helper',tag:'you are driving, the helper waits',send:'Type',ph:'text: Enter types it and presses Enter',note:'What the helper is doing',noNote:'nothing from the helper yet',plan:'Plan',over:'you are driving'};
 const $=id=>document.getElementById(id),dot=$('dot'),st=$('st'),cv=$('cv'),g=cv.getContext('2d'),log=$('log'),kb=$('kb'),txt=$('txt');
+$('hNote').textContent=L.note;$('note').dataset.empty=L.noNote;$('hPlan').textContent=L.plan;
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
 let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
 $('mon').onchange=e=>{mon=e.target.value};
+function status(t,cls){st.textContent=t;dot.className=cls||''}
 async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());
  if(r.status===410){ended=true;return}
- if(r.status===204){dot.className='on';st.textContent=L.live;await new Promise(x=>setTimeout(x,250));return}
+ if(r.status===204){status(L.live,'on');await new Promise(x=>setTimeout(x,250));return}
  if(r.ok){const b=await r.blob();const bmp=await createImageBitmap(b);
   if(my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
-   meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};dot.className='on';st.textContent=L.live+' · '+Math.round(b.size/1024)+' KB'}
+   meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};status(L.live+'  '+Math.round(b.size/1024)+' KB','on')}
   bmp.close()}
- else{let m='';try{m=(await r.json()).error||''}catch(_){}dot.className='';st.textContent=/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait;await new Promise(x=>setTimeout(x,1200))}}
- catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
-async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}dot.className='';st.textContent=L.end}
-lane();setTimeout(lane,350);   // two frames in flight: the helper's agent never waits for the browser, so the picture keeps moving
-async function logs(){while(!ended){try{const r=await fetch(base+'/log');if(r.ok){const a=await r.json();
- log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+e.tool+'</b> '+(e.args||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</div>').join('')}}catch(e){}
+ else{let m='';try{m=(await r.json()).error||''}catch(_){}status(/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait,'bad');await new Promise(x=>setTimeout(x,1200))}}
+ catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
+async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}status(L.end,'')}
+lane();setTimeout(lane,350);   // two frames in flight: the agent never waits for the browser, so the picture keeps moving
+const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+async function info(){while(!ended){try{
+ const r=await fetch(base+'/log');if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
+ const q=await fetch(base+'/state');if(q.ok){const s=await q.json();
+  $('note').textContent=s.note||'';const c=s.color||'#38ff7a';document.documentElement.style.setProperty('--st',c);
+  const p=s.plan;$('hPlan').hidden=!p;$('plan').innerHTML=p?p.stages.map((x,i)=>'<li style="--c:'+esc(x.color||c)+'" class="'+(i===p.current?'cur':(p.done||[]).includes(i)||i<p.current?'done':'')+'">'+esc(x.title)+'</li>').join(''):'';
+  if(!s.online)status(L.off,'bad');else if(s.paused)status(L.paused,'bad')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
-logs();
+info();
 async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
 function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
-if(CTL){const b=$('ctl');b.style.display='';b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
- const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?'58px':'0px');$('hint').textContent=on?L.hint:'';send('/takeover',{on})};
+if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
+ const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?(kb.offsetHeight||52)+'px':'0px');$('tag').style.display=on?'block':'none';$('tag').textContent=L.tag;send('/takeover',{on});if(on)txt.focus()};
  b.onclick=()=>set(!control);
  let down=null;
  cv.addEventListener('pointerdown',e=>{if(!control)return;e.preventDefault();try{cv.setPointerCapture(e.pointerId)}catch(_){}down={p:real(e),t:Date.now(),b:e.button}});
@@ -617,7 +696,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log|\/input|\/takeover)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log|\/input|\/takeover|\/state)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -625,6 +704,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
+      if (vw[2] === '/state') return json(res, 200, { plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
       if (vw[2] === '/input' || vw[2] === '/takeover') {   // control: needs the secret from the control link
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 20_000)) || '{}');

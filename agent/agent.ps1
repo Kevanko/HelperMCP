@@ -32,7 +32,7 @@ Add-Type -Namespace H -Name U__BUILD__ -MemberDefinition @'
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
 '@
 [void][H.U__BUILD__]::SetProcessDPIAware()   # real pixels, not scaled ones
-Add-Type -ReferencedAssemblies Accessibility -TypeDefinition @"
+Add-Type -ReferencedAssemblies Accessibility, System.Drawing -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 namespace V__BUILD__ {
   public static class Caret {   // where the text caret is: classic controls tell GetGUIThreadInfo, browsers and Electron answer the accessibility caret object
@@ -80,6 +80,32 @@ namespace V__BUILD__ {
       }
     }
   }
+  public static class Probe {   // a coarse grey picture of a part of the screen: enough to tell whether anything changed
+    public static byte[] Grab(int x, int y, int w, int h, int gw, int gh, int[] mask) {
+      var r = new byte[gw * gh]; if (w <= 0 || h <= 0) return r;
+      using (var bmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
+        using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(x, y, 0, 0, bmp.Size);
+        var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        var px = new byte[bd.Stride * h]; Marshal.Copy(bd.Scan0, px, 0, px.Length); bmp.UnlockBits(bd);
+        for (int j = 0; j < gh; j++) for (int i = 0; i < gw; i++) {
+          int sx = (int)((i + 0.5) * w / gw), sy = (int)((j + 0.5) * h / gh), ax = x + sx, ay = y + sy; bool skip = false;
+          for (int m = 0; m + 3 < mask.Length; m += 4) if (ax >= mask[m] && ay >= mask[m + 1] && ax < mask[m] + mask[m + 2] && ay < mask[m + 1] + mask[m + 3]) { skip = true; break; }
+          if (skip) continue;
+          int o = sy * bd.Stride + sx * 4; r[j * gw + i] = (byte)((px[o] + 2 * px[o + 1] + px[o + 2]) / 4 | 1);
+        }
+      }
+      return r;
+    }
+    public static byte[] Or(byte[] a, byte[] b) { if (a == null) return b; if (b == null || b.Length != a.Length) return a; var r = new byte[a.Length]; for (int i = 0; i < a.Length; i++) r[i] = (byte)(a[i] | b[i]); return r; }
+    public static byte[] Noise(byte[] a, byte[] b) { var n = new byte[a.Length]; for (int i = 0; i < a.Length && i < b.Length; i++) if (Math.Abs(a[i] - b[i]) > 20) n[i] = 1; return n; }   // cells that change by themselves (a spinner, a video, a clock)
+    public static double DiffN(byte[] a, byte[] b, byte[] noise) { if (a == null || b == null || a.Length != b.Length) return 1; int n = 0, c = 0; for (int i = 0; i < a.Length; i++) { if (a[i] == 0 || b[i] == 0 || (noise != null && noise[i] != 0)) continue; n++; if (Math.Abs(a[i] - b[i]) > 20) c++; } return n == 0 ? 0 : (double)c / n; }
+    public static int CountN(byte[] a, byte[] b, byte[] noise) { if (a == null || b == null || a.Length != b.Length) return 0; int c = 0; for (int i = 0; i < a.Length; i++) { if (a[i] == 0 || b[i] == 0 || (noise != null && noise[i] != 0)) continue; if (Math.Abs(a[i] - b[i]) > 20) c++; } return c; }
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+    public static int[] FgRect() { RECT r; var h = GetForegroundWindow(); if (h == IntPtr.Zero || !GetWindowRect(h, out r)) return null; return new[] { r.L, r.T, r.R - r.L, r.B - r.T }; }
+    public static double Diff(byte[] a, byte[] b) { if (a == null || b == null || a.Length != b.Length) return 1; int n = 0, c = 0; for (int i = 0; i < a.Length; i++) { if (a[i] == 0 || b[i] == 0) continue; n++; if (Math.Abs(a[i] - b[i]) > 20) c++; } return n == 0 ? 0 : (double)c / n; }
+  }
   public static class Unglow {   // the edge glow is a known translucent layer: take it out of a screenshot by arithmetic instead of hiding it (no blinking)
     public static void Run(byte[] px, int w, int h, int cx, int cy, int[] mons, int s, int[] cols) {
       var a8 = new int[s];
@@ -117,6 +143,34 @@ namespace V__BUILD__ {
 "@
 $script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
 $GlowDepth = [int](70 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))
+# ---- did an action change anything? A coarse picture around the target and of the whole screen before and after (the overlay's own label and glow are left out)
+function Probe-Mask { $m = @(); foreach ($scr in [Windows.Forms.Screen]::AllScreens) { $b = $scr.Bounds; $d = $GlowDepth + 2
+        $m += $b.X, $b.Y, $b.Width, $d; $m += $b.X, ($b.Y + $b.Height - $d), $b.Width, $d; $m += $b.X, $b.Y, $d, $b.Height; $m += ($b.X + $b.Width - $d), $b.Y, $d, $b.Height
+        $m += ($b.X + $b.Width / 2 - 420), $b.Y, 840, 100 }   # the label with its clock
+    [int[]]$m }
+function Probe-Take($rect, $extra) {   # $rect = x, y, w, h of the part that matters (null: only the whole screen); twice, so what moves by itself is left out
+    $v = [Windows.Forms.SystemInformation]::VirtualScreen; $mask = [int[]](@(Probe-Mask) + @($extra | Where-Object { $null -ne $_ }))
+    $gl = { if ($rect) { $gw = [int][Math]::Min(320, [Math]::Max(16, $rect[2] / 3)); $gh = [int][Math]::Min(240, [Math]::Max(8, $rect[3] / 3)); [V__BUILD__.Probe]::Grab([int]$rect[0], [int]$rect[1], [int]$rect[2], [int]$rect[3], $gw, $gh, $mask) } else { $null } }
+    $ga = { [V__BUILD__.Probe]::Grab($v.Left, $v.Top, $v.Width, $v.Height, 256, [int](256 * $v.Height / $v.Width), $mask) }
+    $l1 = & $gl; $a1 = & $ga; Start-Sleep -Milliseconds 140; $l2 = & $gl; $a2 = & $ga
+    @{ rect = $rect; loc = $l2; all = $a2; nloc = $(if ($l1) { [V__BUILD__.Probe]::Noise($l1, $l2) } else { $null }); nall = [V__BUILD__.Probe]::Noise($a1, $a2) }
+}
+function Arrow-Mask { $p = [Windows.Forms.Cursor]::Position; @(($p.X - 110), ($p.Y - 110), 260, 260) }   # the AI's arrow where the mouse rests (it slides to the caret while typing)
+function Around($x, $y, $w, $h) { @([int]($x - $w / 2), [int]($y - $h / 2), [int]$w, [int]$h) }
+function Caret-Mask($c) { if (-not $c) { return @() }; $k = $GlowDepth / 70.0   # the blinking caret, and the AI's arrow with its typing dots right under it
+    @(($c[0] - 3), ($c[1] - 2), 8, ($c[2] + 4), ($c[0] - 8), ($c[1] + $c[2]), [int](110 * $k), [int](70 * $k)) }
+function Get-CaretSafe { try { [V__BUILD__.Caret]::Get() } catch { $null } }
+function Caret-Moved($c0, $c1) { ($c0 -and $c1 -and ([Math]::Abs($c0[0] - $c1[0]) + [Math]::Abs($c0[1] - $c1[1])) -gt 2) -or ([bool]$c0 -ne [bool]$c1) }
+function Probe-Report($before, $after, $what, $moved) {   # -> a short line for the AI: what changed, or a loud NO CHANGE
+    $nl = [V__BUILD__.Probe]::Or($before.nloc, $after.nloc); $na = [V__BUILD__.Probe]::Or($before.nall, $after.nall)
+    $cl = if ($before.loc -and $after.loc) { [V__BUILD__.Probe]::CountN($before.loc, $after.loc, $nl) } else { -1 }
+    $ca = [V__BUILD__.Probe]::CountN($before.all, $after.all, $na)
+    $key = if ($cl -ge 0) { $cl } else { $ca }   # the part that matters decides; the rest of the screen may be busy with other things
+    if ($key -lt 3 -and $moved) { return "text cursor moved (nothing else changed where it matters)" }
+    if ($key -lt 3) { return "NO CHANGE: nothing changed where it should after this $what. It probably did not work (wrong window or field focused, a covered or disabled control). Do not continue: look first (screenshot or watch)." }
+    'screen changed: ' + $(if ($cl -ge 0) { "at the target $cl cells, " } else { '' }) + "whole screen $ca cells"
+}
+
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
 namespace K__BUILD__ {
@@ -200,6 +254,10 @@ function Do-Screenshot-Inner($a) {
         if ([int]$a.monitor -lt 0 -or [int]$a.monitor -ge $all.Count) { throw "No monitor $($a.monitor). Monitors: 0..$($all.Count - 1)" }
         $s = $all[[int]$a.monitor].Bounds
     }
+    if ($a.region -and -not $a.view) {   # a part of the screen, in the coordinates of the last screenshot
+        $rx = [int]($a.region.x * $Scale) + $script:OriginX; $ry = [int]($a.region.y * $Scale) + $script:OriginY
+        $s = New-Object Drawing.Rectangle $rx, $ry, ([Math]::Max(16, [int]($a.region.w * $Scale))), ([Math]::Max(16, [int]($a.region.h * $Scale)))
+    }
     $view = [bool]$a.view   # the live viewer's frames must not change the coordinates the AI clicks with
     if (-not $view) { $script:OriginX = $s.Left; $script:OriginY = $s.Top }
     $bmp = New-Object Drawing.Bitmap $s.Width, $s.Height
@@ -231,7 +289,9 @@ function Do-Screenshot-Inner($a) {
     $ms = New-Object IO.MemoryStream
     $out.Save($ms, $enc, $p); $out.Dispose()
     $bytes = $ms.ToArray()
-    $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)).Replace('-', '').ToLower()
+    # the fingerprint ignores the helper's own label, glow and clock: an unchanged screen is recognised as unchanged
+    $fp = try { [V__BUILD__.Probe]::Grab($s.Left, $s.Top, $s.Width, $s.Height, 640, [Math]::Max(8, [int](640 * $s.Height / $s.Width)), [int[]](@(Probe-Mask) + @(([Windows.Forms.Cursor]::Position.X - 90), ([Windows.Forms.Cursor]::Position.Y - 90), 220, 220))) } catch { $bytes }   # and the AI's arrow
+    $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash([byte[]]$fp)).Replace('-', '').ToLower()
     if ($a.prev -and $a.prev -eq $hash) { return @{ same = $true; h = $hash } }   # nothing changed: send nothing
     @{ jpeg = $bytes; mime = 'image/jpeg'; h = $hash; ox = $s.Left; oy = $s.Top; sc = $sc }
 }
@@ -269,6 +329,34 @@ function Glide($x, $y, $dur, $straight) {
 function Target($a, $kx = 'x', $ky = 'y') { if ($a.raw) { return @([int]$a.$kx, [int]$a.$ky) }; @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
 function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
 
+function Do-Watch($a) {
+    $sec = [Math]::Min(10.0, [Math]::Max(1.0, [double]$(if ($a.seconds) { $a.seconds } else { 3 }))); $fps = [Math]::Min(5.0, [Math]::Max(1.0, [double]$(if ($a.fps) { $a.fps } else { 3 })))
+    $s = [Windows.Forms.SystemInformation]::VirtualScreen
+    if ($null -ne $a.monitor) { $s = [Windows.Forms.Screen]::AllScreens[[int]$a.monitor].Bounds }
+    if ($a.region) { $s = New-Object Drawing.Rectangle ([int]($a.region.x * $Scale) + $script:OriginX), ([int]($a.region.y * $Scale) + $script:OriginY), ([Math]::Max(16, [int]($a.region.w * $Scale))), ([Math]::Max(16, [int]($a.region.h * $Scale))) }
+    $n = [Math]::Min(30, [int][Math]::Round($sec * $fps)); $cols = if ($n -le 4) { 2 } elseif ($n -le 9) { 3 } elseif ($n -le 16) { 4 } else { 5 }; $rows = [Math]::Ceiling($n / $cols)
+    $tw = [int][Math]::Min(640, 1600 / $cols); $th = [int]($tw * $s.Height / $s.Width); $hd = 18
+    $sheet = New-Object Drawing.Bitmap ($cols * $tw), ($rows * ($th + $hd)); $gs = [Drawing.Graphics]::FromImage($sheet); $gs.Clear([Drawing.Color]::FromArgb(2, 10, 6))
+    $font = New-Object Drawing.Font 'Consolas', 10; $big = New-Object Drawing.Bitmap $s.Width, $s.Height; $gb = [Drawing.Graphics]::FromImage($big)
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $prev = $null; $changes = @(); $lastChange = -1.0
+    for ($i = 0; $i -lt $n; $i++) {
+        while ($sw.Elapsed.TotalSeconds -lt $i / $fps) { Start-Sleep -Milliseconds 5 }
+        $t = $sw.Elapsed.TotalSeconds; $gb.CopyFromScreen($s.Left, $s.Top, 0, 0, $big.Size)
+        $cur = [V__BUILD__.Probe]::Grab($s.Left, $s.Top, $s.Width, $s.Height, 160, [Math]::Max(10, [int](160 * $s.Height / $s.Width)), [int[]]@())
+        $d = if ($prev) { [V__BUILD__.Probe]::Diff($prev, $cur) } else { 0 }; $prev = $cur; $changes += [Math]::Round($d * 100, 1); if ($d -ge 0.002) { $lastChange = $t }
+        $cx = ($i % $cols) * $tw; $cy = [Math]::Floor($i / $cols) * ($th + $hd)
+        $gs.InterpolationMode = 'HighQualityBilinear'; $gs.DrawImage($big, $cx, $cy + $hd, $tw, $th)
+        $col = if ($i -eq 0) { [Drawing.Color]::FromArgb(127, 174, 143) } elseif ($d -ge 0.002) { [Drawing.Color]::FromArgb(255, 209, 102) } else { [Drawing.Color]::FromArgb(56, 120, 80) }
+        $br = New-Object Drawing.SolidBrush $col; $gs.DrawString(('{0:0.0}s  {1}' -f $t, $(if ($i -eq 0) { 'start' } else { "changed $([Math]::Round($d * 100, 1))%" })), $font, $br, ($cx + 4), ($cy + 2))
+        $pen = New-Object Drawing.Pen $col, $(if ($d -ge 0.002) { 3 } else { 1 }); $gs.DrawRectangle($pen, $cx + 1, $cy + $hd, $tw - 3, $th - 2)
+    }
+    $gb.Dispose(); $big.Dispose(); $gs.Dispose()
+    $enc = [Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'; $p = New-Object Drawing.Imaging.EncoderParameters 1
+    $p.Param[0] = New-Object Drawing.Imaging.EncoderParameter ([Drawing.Imaging.Encoder]::Quality), 62L; $ms = New-Object IO.MemoryStream; $sheet.Save($ms, $enc, $p); $sheet.Dispose()
+    $moving = @($changes | Select-Object -Skip 1 | Where-Object { $_ -ge 0.2 }).Count
+    $sum = if (-not $moving) { "nothing moved during $sec s" } elseif ($lastChange -lt $sec - 2 / $fps) { "changes in $moving of $($n - 1) frames, settled after $([Math]::Round($lastChange, 1)) s" } else { "still changing at the end ($moving of $($n - 1) frames changed)" }
+    @{ jpeg = $ms.ToArray(); mime = 'image/jpeg'; text = "$n frames over $sec s, $sum. Change per frame (%): $($changes -join ', ')" }
+}
 function Do-Trace($a) {   # read along: the pointer goes to the start of the line, then slides under it at reading pace (no click)
     Overlay-Send 'active'; $t1 = Target $a; $t2 = Target $a 'x2' 'y2'
     Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 140
@@ -280,39 +368,48 @@ function Do-Move($a) { Overlay-Send 'active'; $t = Target $a; Glide $t[0] $t[1] 
 
 function Do-Click($a) {
     $t = Target $a; $btn = if ($a.button) { $a.button } else { 'left' }; $down, $up = Btn $btn
-    Overlay-Send 'active'; Glide $t[0] $t[1] $null; Start-Sleep -Milliseconds 50
+    Overlay-Send 'active'; Glide $t[0] $t[1] $null; Start-Sleep -Milliseconds 320   # the comet tail behind the arrow has faded
+    $cc0 = Get-CaretSafe; $pb = Probe-Take (Around $t[0] $t[1] 640 400)
     $n = if ($a.double) { 2 } else { 1 }
     1..$n | ForEach-Object {
         Overlay-Send "click $($t[0]) $($t[1]) $btn"
         [H.U__BUILD__]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 80
         [H.U__BUILD__]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100
     }
-    @{ text = 'ok' }
+    Start-Sleep -Milliseconds 850   # the click ripple is gone and the app has answered
+    $after = Probe-Take (Around $t[0] $t[1] 640 400); @{ text = Probe-Report $pb $after 'click' (Caret-Moved $cc0 (Get-CaretSafe)) }
 }
 
 # Press at (x,y), glide to (x2,y2) with the button held, release (moving windows, selecting, sliders ...).
 function Do-Drag($a) {
     $t1 = Target $a; $t2 = Target $a 'x2' 'y2'; $btn = if ($a.button) { $a.button } else { 'left' }; $down, $up = Btn $btn
     Overlay-Send 'active'; Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 60
+    $pb = Probe-Take (Around $t2[0] $t2[1] 640 400)
     [H.U__BUILD__]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "down $($t1[0]) $($t1[1])"; Start-Sleep -Milliseconds 120
     $d = [Math]::Sqrt([Math]::Pow($t2[0] - $t1[0], 2) + [Math]::Pow($t2[1] - $t1[1], 2))
     Glide $t2[0] $t2[1] ([Math]::Min(1.4, 0.3 + $d * 0.0007)); Start-Sleep -Milliseconds 100
     [H.U__BUILD__]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero); Overlay-Send "up $($t2[0]) $($t2[1])"
-    @{ text = 'ok' }
+    Start-Sleep -Milliseconds 950
+    @{ text = Probe-Report $pb (Probe-Take (Around $t2[0] $t2[1] 640 400)) 'drag' }
 }
 
 function Do-Scroll($a) {
     Overlay-Send 'active'
     if ($null -ne $a.x -and $null -ne $a.y) { $t = Target $a; Glide $t[0] $t[1] $null }
+    $p0 = [Windows.Forms.Cursor]::Position; $pb = Probe-Take (Around $p0.X $p0.Y 800 600)
     $n = if ($null -ne $a.amount) { [int]$a.amount } else { 3 }   # positive = down
     Overlay-Send "scroll $n"
     $one = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * [Math]::Sign($n))), 0)
     1..[Math]::Abs($n) | ForEach-Object { [H.U__BUILD__]::mouse_event(0x0800, 0, 0, $one, [UIntPtr]::Zero); Start-Sleep -Milliseconds 40 }
-    @{ text = 'ok' }
+    Start-Sleep -Milliseconds 780   # the scroll chevrons are gone
+    @{ text = Probe-Report $pb (Probe-Take (Around $p0.X $p0.Y 800 600)) 'scroll' }
 }
 
 function Pin-Caret { try { $c = [V__BUILD__.Caret]::Get(); if ($c) { Overlay-Send "pin $($c[0] + 2) $($c[1] + $c[2])" } } catch { } }   # the arrow sits right under the caret
 function Do-TypeText($a) {
+    $c0 = $null; try { $c0 = [V__BUILD__.Caret]::Get() } catch { }
+    $tr = if ($c0) { @(($c0[0] - 300), ($c0[1] - 40), 1100, ($c0[2] + 80)) } else { [V__BUILD__.Probe]::FgRect() }   # the line being typed, or the window that has the focus
+    $am = Arrow-Mask; $pb = Probe-Take $tr (@(Caret-Mask $c0) + $am)
     Overlay-Send 'typing'; Pin-Caret
     $t = $a.text -replace "`r`n", "`n"
     $step = [Math]::Max(1, [int][Math]::Ceiling($t.Length / 300.0))   # about 26 ms per step: the arrow can follow
@@ -323,8 +420,10 @@ function Do-TypeText($a) {
         [V__BUILD__.Kb]::Type($chunk)
         if ($t.Length -gt 1) { Start-Sleep -Milliseconds 18 }
     }
-    Pin-Caret
-    @{ text = 'ok' }
+    Pin-Caret; Start-Sleep -Milliseconds 350
+    $c1 = $null; try { $c1 = [V__BUILD__.Caret]::Get() } catch { }
+    $after = Probe-Take $tr (@(Caret-Mask $c0) + @(Caret-Mask $c1) + $am)
+    @{ text = Probe-Report $pb $after 'typing' (Caret-Moved $c0 $c1) }
 }
 
 $Vk = @{ ctrl = 0x11; control = 0x11; alt = 0x12; shift = 0x10; win = 0x5B; windows = 0x5B; enter = 0x0D; return = 0x0D
@@ -344,6 +443,7 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
 function Do-TaskDone($a) { $script:Phase = 'done'; Overlay-Send 'state done'; Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' } }
 function Do-PressKey($a) {
+    $kc = $null; try { $kc = [V__BUILD__.Caret]::Get() } catch { }; $kr = [V__BUILD__.Probe]::FgRect(); $am = Arrow-Mask; $pb = Probe-Take $kr (@(Caret-Mask $kc) + $am)
     Overlay-Send 'typing'; Pin-Caret
     $codes = foreach ($k in $a.keys.ToLower().Split('+')) {
         if ($Vk.ContainsKey($k)) { [byte]$Vk[$k] }
@@ -353,7 +453,9 @@ function Do-PressKey($a) {
     $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 0, [UIntPtr]::Zero) }
     [array]::Reverse($codes)
     $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }
-    @{ text = 'ok' }
+    Start-Sleep -Milliseconds 450
+    $kc2 = $null; try { $kc2 = [V__BUILD__.Caret]::Get() } catch { }
+    @{ text = Probe-Report $pb (Probe-Take $kr (@(Caret-Mask $kc) + @(Caret-Mask $kc2) + $am)) "key press ($($a.keys))" (Caret-Moved $kc $kc2) }
 }
 
 # A command mentions uv/uvx/npx/npm/node that is not installed? Fetch the portable one first (as if it had always been there).
@@ -987,7 +1089,7 @@ function Cleanup-Children {
 
 # Light requests (screenshots, sysinfo, file reads) are answered even while a long command runs: the live viewer and the AI's
 # screenshots never freeze behind a 5-minute install or render. Heavy ones wait their turn.
-$LightTools = 'screenshot', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
+$LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
 $script:Deferred = New-Object System.Collections.ArrayList
 $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
 
@@ -997,7 +1099,7 @@ $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::Min
 $AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'
     write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
-$Quiet = @{ trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
+$Quiet = @{ watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
 function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
@@ -1272,7 +1374,7 @@ function Process-Command($cmd) {
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; trace = 'Do-Trace'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name

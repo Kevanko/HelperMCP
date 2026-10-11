@@ -160,6 +160,10 @@ def screenshot(a):
             pb = GdkPixbuf.Pixbuf.new_from_file(path); org = (0, 0)
             if want is not None:
                 x, y, w, h = mons[int(want)]; pb = pb.new_subpixbuf(x, y, w, h); org = (x, y)
+            if a.get("region") and not view:   # a part of the screen, in the coordinates of the last screenshot
+                r = a["region"]; x = max(0, int(r["x"] * SCALE + ORIGIN[0])); y = max(0, int(r["y"] * SCALE + ORIGIN[1]))
+                w = max(16, min(int(r["w"] * SCALE), pb.get_width() - (x - org[0]))); h = max(16, min(int(r["h"] * SCALE), pb.get_height() - (y - org[1])))
+                pb = pb.new_subpixbuf(x - org[0], y - org[1], w, h); org = (x, y)
             w = pb.get_width(); sc = max(1.0, w / cap)
             if sc > 1: pb = pb.scale_simple(cap, int(pb.get_height() / sc), GdkPixbuf.InterpType.BILINEAR)
             if not view: SCALE, ORIGIN = sc, org
@@ -218,6 +222,34 @@ def glide(x, y, dur=None, straight=False):
 def _target(a, kx="x", ky="y"):
     if a.get("raw"): return int(a[kx]), int(a[ky])   # real screen pixels (the live viewer)
     return int(a[kx] * SCALE) + ORIGIN[0], int(a[ky] * SCALE) + ORIGIN[1]
+
+
+def watch(a):
+    """a few seconds of the screen as one picture: frames in a grid; the text says when and how much it changed"""
+    import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
+    sec = min(10.0, max(1.0, float(a.get("seconds") or 3))); fps = min(3.0, max(1.0, float(a.get("fps") or 2)))   # a screen grab here takes a while
+    n = max(2, min(24, int(round(sec * fps)))); cols = 2 if n <= 4 else 3 if n <= 9 else 4; rows = (n + cols - 1) // cols
+    tw, sheet, prev, changes, last, t0 = 400, None, None, [], -1.0, time.monotonic()
+    d = tempfile.mkdtemp()
+    try:
+        for i in range(n):
+            while time.monotonic() - t0 < i / fps: time.sleep(0.01)
+            t = time.monotonic() - t0; pb = GdkPixbuf.Pixbuf.new_from_file(capture_file(d))
+            if a.get("monitor") is not None:
+                x, y, w, h = monitors()[int(a["monitor"])]; pb = pb.new_subpixbuf(x, y, w, h)
+            th = int(tw * pb.get_height() / pb.get_width())
+            if sheet is None: sheet = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, cols * tw, rows * th); sheet.fill(0x020a06ff)
+            pb.scale_simple(tw, th, GdkPixbuf.InterpType.BILINEAR).copy_area(0, 0, tw, th, sheet, (i % cols) * tw, (i // cols) * th)
+            g = pb.scale_simple(64, 36, GdkPixbuf.InterpType.NEAREST).get_pixels()
+            ch = 0.0 if prev is None else sum(1 for k in range(0, min(len(g), len(prev)), 3) if abs(g[k + 1] - prev[k + 1]) > 20) / (len(g) / 3)
+            prev = g; changes.append(round(ch * 100, 1))
+            if ch >= 0.004: last = t
+        _, buf = sheet.save_to_bufferv("jpeg", ["quality"], ["62"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    moving = sum(1 for c_ in changes[1:] if c_ >= 0.4)
+    summ = f"nothing moved during {sec} s" if not moving else (f"changes in {moving} of {n - 1} frames, settled after {last:.1f} s" if last < sec - 2 / fps else f"still changing at the end ({moving} of {n - 1} frames changed)")
+    return {"jpeg": bytes(buf), "mime": "image/jpeg", "text": f"{n} frames over {sec} s (left to right, top to bottom), {summ}. Change per frame (%): {', '.join(map(str, changes))}"}
 
 
 def trace(a):
@@ -353,7 +385,7 @@ def describe(name, a):
             + cut(a.get("command") or a.get("path") or a.get("name") or json.dumps(a, ensure_ascii=False), 90)]
 
 
-QUIET = {"trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
+QUIET = {"watch": ("смотрю, что происходит на экране", "watching the screen"), "trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
          "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP")}
 
 
@@ -1523,7 +1555,7 @@ def hold(a):
     PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
 def task_done(a):
     PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
-TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace)
+TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch)
 META = {"look", "hold", "task_done"}
 
 

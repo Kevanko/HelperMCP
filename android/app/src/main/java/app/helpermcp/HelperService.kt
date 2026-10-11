@@ -194,8 +194,15 @@ class HelperService : AccessibilityService() {
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
+            val t0 = SystemClock.uptimeMillis()
             data = exec(tool, args)
-            if (tool in GUI || tool == "start_process") settle(if (tool == "start_process") 2500L else 1100L)   // the next screenshot must show the result of this action, not the screen before it
+            if (tool in GUI || tool == "start_process") {
+                settle(if (tool == "start_process") 2500L else 1100L)
+                if (tool in CHECKED && data is JSONObject && lastEventAt < t0) {   // nothing on the screen reacted
+                    val d = data as JSONObject
+                    d.put("text", "NO CHANGE: nothing on the screen changed after this action. It probably did not work (wrong field focused, a covered or disabled control). Do not continue: look first (screenshot or watch). " + d.optString("text"))
+                }
+            }   // the next screenshot must show the result of this action, not the screen before it
         } catch (e: Throwable) { error = e.message ?: e.javaClass.simpleName }
         if (!quiet) fx.setBusy(false)
         for (attempt in 0 until 4) {
@@ -218,6 +225,7 @@ class HelperService : AccessibilityService() {
         while (true) { val now = SystemClock.uptimeMillis(); if (now - lastEventAt >= quietMs || now - t0 >= maxMs) break; Thread.sleep(40) }
     }
 
+    private val CHECKED = setOf("click", "type_text", "press_key", "scroll")
     private val GUI = setOf("click", "move", "drag", "scroll", "type_text", "press_key", "actions")
 
     // ------------------------------------------------------------------------------------------ questions
@@ -266,10 +274,11 @@ class HelperService : AccessibilityService() {
         "sysinfo" -> ok(sysinfo().toString(2))
         "screenshot" -> screenshot(a)
         "click" -> click(a)
-        "look" -> { val r = fx.setLook(a.optString("color"), a.optString("note")); if (a.optString("note").isNotBlank()) note = a.optString("note").trim().take(90); ok(r) }
+        "look" -> { val r = fx.setLook(a.optString("color"), a.optString("note"), a.optBoolean("force")); if (a.optString("note").isNotBlank()) note = a.optString("note").trim().take(90); ok(r) }
         "hold" -> { phase = "hold"; opSeen = false; lastOpAt = 0; fx.setState("hold"); ok() }
         "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }
+        "watch" -> watch(a)
         "trace" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); Thread.sleep(140); fx.glideBlocking(px(a, "x2"), py(a, "y2")); ok() }   // read along a line
         "drag" -> { drag(a); ok() }
         "scroll" -> { scroll(a); ok() }
@@ -281,7 +290,8 @@ class HelperService : AccessibilityService() {
     }
 
     private fun ok(text: String = "ok") = JSONObject().put("text", text)
-    private fun px(a: JSONObject, k: String) = (a.getDouble(k) * (if (a.optBoolean("raw")) 1f else scale)).toFloat()   // raw: real screen pixels (the live viewer)
+    @Volatile private var originX = 0; @Volatile private var originY = 0
+    private fun px(a: JSONObject, k: String) = if (a.optBoolean("raw")) a.getDouble(k).toFloat() else (a.getDouble(k) * scale).toFloat() + (if (k.startsWith("x")) originX else originY)   // raw: real screen pixels (the live viewer)
     private fun py(a: JSONObject, k: String) = px(a, k)
 
     private fun sysinfo(): JSONObject {
@@ -315,12 +325,46 @@ class HelperService : AccessibilityService() {
         val view = a.optBoolean("view")
         val withOverlay = a.optBoolean("overlay") || view   // overlay=true: show exactly what the user sees (glow, label, pointer), to check how it looks on this phone
         if (!withOverlay) fx.captureMode(true)   // the overlay (glow, label, pointer) is not part of what the operator sees
-        val bmp = try { capture() } finally { if (!withOverlay) fx.captureMode(false) }.let { if (withOverlay) it else fx.removeGlow(it) }
+        val full = try { capture() } finally { if (!withOverlay) fx.captureMode(false) }.let { if (withOverlay) it else fx.removeGlow(it) }
+        var ox = 0; var oy = 0
+        val bmp = a.optJSONObject("region")?.takeIf { !view }?.let { r ->   // a part of the screen, in the coordinates of the last screenshot
+            val x = (r.optDouble("x") * scale).toInt().coerceIn(0, full.width - 1); val y = (r.optDouble("y") * scale).toInt().coerceIn(0, full.height - 1)
+            val w = (r.optDouble("w") * scale).toInt().coerceIn(16, full.width - x); val h = (r.optDouble("h") * scale).toInt().coerceIn(16, full.height - y)
+            ox = x; oy = y; Bitmap.createBitmap(full, x, y, w, h)
+        } ?: full
         val sc = if (bmp.width > maxW) bmp.width.toFloat() / maxW else 1f
         val out = if (sc > 1f) Bitmap.createScaledBitmap(bmp, (bmp.width / sc).toInt(), (bmp.height / sc).toInt(), true) else bmp
         val bo = ByteArrayOutputStream(); out.compress(Bitmap.CompressFormat.JPEG, q, bo)
-        if (!view) scale = sc   // a live-viewer frame must not change the coordinates the AI works with
-        return Shot(bo.toByteArray(), JSONObject().put("width", out.width).put("height", out.height).put("scale", sc.toDouble()).put("ox", 0).put("oy", 0).put("sc", sc.toDouble()))
+        if (!view) { scale = sc; originX = ox; originY = oy }   // a live-viewer frame must not change the coordinates the AI works with
+        val jpg = bo.toByteArray(); val h = java.security.MessageDigest.getInstance("MD5").digest(jpg).joinToString("") { "%02x".format(it) }
+        return Shot(jpg, JSONObject().put("width", out.width).put("height", out.height).put("scale", sc.toDouble()).put("ox", ox).put("oy", oy).put("sc", sc.toDouble()).put("h", h))
+    }
+
+    /** a few seconds of the screen as one picture: frames in a grid, each with its time and how much changed */
+    private fun watch(a: JSONObject): Shot {
+        val sec = a.optDouble("seconds", 3.0).coerceIn(1.0, 10.0); val fps = a.optDouble("fps", 2.5).coerceIn(1.0, 3.0)   // Android allows about 3 screenshots a second
+        val n = (sec * fps).toInt().coerceIn(2, 24); val cols = if (n <= 4) 2 else if (n <= 9) 3 else 4; val rows = (n + cols - 1) / cols
+        val tw = 360; val hd = 34; var th = 0; var sheet: Bitmap? = null; var cv: android.graphics.Canvas? = null
+        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply { textSize = 22f; typeface = android.graphics.Typeface.MONOSPACE }
+        var prev: IntArray? = null; val changes = ArrayList<Double>(); var lastChange = -1.0; val t0 = SystemClock.uptimeMillis()
+        for (i in 0 until n) {
+            while (SystemClock.uptimeMillis() - t0 < (i * 1000 / fps).toLong()) Thread.sleep(10)
+            val t = (SystemClock.uptimeMillis() - t0) / 1000.0
+            val shot = try { capture() } catch (_: Throwable) { continue }
+            if (sheet == null) { th = tw * shot.height / shot.width; sheet = Bitmap.createBitmap(cols * tw, rows * (th + hd), Bitmap.Config.ARGB_8888); cv = android.graphics.Canvas(sheet!!); cv!!.drawColor(0xFF020A06.toInt()) }
+            val small = Bitmap.createScaledBitmap(shot, tw, th, true); val g = IntArray(64 * 64)
+            Bitmap.createScaledBitmap(shot, 64, 64, true).getPixels(g, 0, 64, 0, 0, 64, 64)
+            val d = prev?.let { pv -> var c = 0; for (k in g.indices) { val x = g[k]; val y = pv[k]; if (kotlin.math.abs((x shr 8 and 255) - (y shr 8 and 255)) > 20) c++ }; c.toDouble() / g.size } ?: 0.0
+            prev = g; changes.add(Math.round(d * 1000) / 10.0); if (d >= 0.004) lastChange = t
+            val cx = (i % cols) * tw; val cy = (i / cols) * (th + hd)
+            cv!!.drawBitmap(small, cx.toFloat(), (cy + hd).toFloat(), null)
+            p.color = if (i == 0) 0xFF7FAE8F.toInt() else if (d >= 0.004) 0xFFFFD166.toInt() else 0xFF387850.toInt()
+            cv!!.drawText("%.1fs %s".format(t, if (i == 0) "start" else "changed %.1f%%".format(d * 100)), cx + 6f, cy + 25f, p)
+        }
+        val bo = ByteArrayOutputStream(); (sheet ?: throw RuntimeException("no frames")).compress(Bitmap.CompressFormat.JPEG, 62, bo)
+        val moving = changes.drop(1).count { it >= 0.4 }
+        val sum = if (moving == 0) "nothing moved during $sec s" else if (lastChange < sec - 1.0 / fps * 2) "changes in $moving of ${changes.size - 1} frames, settled after %.1f s".format(lastChange) else "still changing at the end ($moving of ${changes.size - 1} frames changed)"
+        return Shot(bo.toByteArray(), JSONObject().put("text", "${changes.size} frames over $sec s, $sum. Change per frame (%): ${changes.joinToString(", ")}"))
     }
 
     private fun gesture(path: Path, dur: Long, hold: Long = 0): Boolean {

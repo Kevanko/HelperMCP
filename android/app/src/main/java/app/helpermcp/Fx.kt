@@ -202,10 +202,10 @@ fun captureMode(on: Boolean) {
     private fun colorOf() = when (state) { "ok" -> okColor; "done" -> GREEN; else -> ORANGE }
 
     /** returns what was applied; the colour only the first time in a session */
-    fun setLook(color: String, note: String): String {
+    fun setLook(color: String, note: String, force: Boolean = false): String {
         val out = StringBuilder()
         if (color.isNotBlank()) {
-            if (lookLocked) out.append("colour is already fixed for this session (not changed). ")
+            if (lookLocked && !force) out.append("colour is already fixed for this session (not changed). ")
             else try {
                 val hsv = FloatArray(3); Color.colorToHSV(Color.parseColor(if (color.startsWith("#")) color else "#$color"), hsv)
                 hsv[1] = max(hsv[1], 0.55f); hsv[2] = max(hsv[2], 0.85f)   // always bright and saturated enough to be seen on any screen

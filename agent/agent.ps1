@@ -32,6 +32,73 @@ Add-Type -Namespace H -Name U__BUILD__ -MemberDefinition @'
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
 '@
 [void][H.U__BUILD__]::SetProcessDPIAware()   # real pixels, not scaled ones
+Add-Type -ReferencedAssemblies Accessibility -TypeDefinition @"
+using System; using System.Runtime.InteropServices;
+namespace V__BUILD__ {
+  public static class Caret {   // where the text caret is: classic controls tell GetGUIThreadInfo, browsers and Electron answer the accessibility caret object
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int L, T, R, B; }
+    [StructLayout(LayoutKind.Sequential)] struct GTI { public int cbSize; public int flags; public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret; public RECT rc; }
+    [StructLayout(LayoutKind.Sequential)] struct PT { public int X, Y; }
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GTI g);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr h, ref PT p);
+    [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(IntPtr h, uint id, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out object o);
+    public static int[] Get() {   // x, y, height of the caret on the screen, or null
+      IntPtr fg = GetForegroundWindow(); if (fg == IntPtr.Zero) return null;
+      uint pid; uint tid = GetWindowThreadProcessId(fg, out pid);
+      var g = new GTI(); g.cbSize = Marshal.SizeOf(typeof(GTI)); IntPtr target = fg;
+      if (GetGUIThreadInfo(tid, ref g)) {
+        if (g.hwndCaret != IntPtr.Zero && g.rc.B > g.rc.T) { var p = new PT { X = g.rc.L, Y = g.rc.T }; ClientToScreen(g.hwndCaret, ref p); return new[] { p.X, p.Y, g.rc.B - g.rc.T }; }
+        if (g.hwndFocus != IntPtr.Zero) target = g.hwndFocus;
+      }
+      try {
+        Guid iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71"); object o;
+        if (AccessibleObjectFromWindow(target, 0xFFFFFFF8, ref iid, out o) == 0 && o != null) {
+          int l, t, w, h; ((Accessibility.IAccessible)o).accLocation(out l, out t, out w, out h, 0);
+          if (h > 0 && (l != 0 || t != 0)) return new[] { l, t, h };
+        }
+      } catch { }
+      return null;
+    }
+  }
+  public static class Unglow {   // the edge glow is a known translucent layer: take it out of a screenshot by arithmetic instead of hiding it (no blinking)
+    public static void Run(byte[] px, int w, int h, int cx, int cy, int[] mons, int s, int[] cols) {
+      var a8 = new int[s];
+      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; double a = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); a8[d] = (int)(255 * a); }
+      Func<int, int, int> depth = (sx, sy) => {
+        for (int m = 0; m + 3 < mons.Length; m += 4) {
+          int mx = mons[m], my = mons[m + 1], mw = mons[m + 2], mh = mons[m + 3];
+          if (sx < mx || sy < my || sx >= mx + mw || sy >= my + mh) continue;
+          return Math.Min(Math.Min(sx - mx, sy - my), Math.Min(mx + mw - 1 - sx, my + mh - 1 - sy));
+        }
+        return int.MaxValue;
+      };
+      int best = 0; long bestErr = long.MaxValue;   // which colour is really on the screen: the right one never takes a channel below zero
+      for (int k = 0; k + 2 < cols.Length; k += 3) {
+        long err = 0;
+        for (int y = 0; y < h; y += 3) for (int x = 0; x < w; x += 3) {
+          int d = depth(cx + x, cy + y); if (d >= s / 3) continue;
+          int a = a8[d], i = (y * w + x) * 4;
+          int e0 = px[i] - cols[k + 2] * a / 255, e1 = px[i + 1] - cols[k + 1] * a / 255, e2 = px[i + 2] - cols[k] * a / 255;
+          if (e0 < 0) err -= e0; if (e1 < 0) err -= e1; if (e2 < 0) err -= e2;
+        }
+        if (err < bestErr) { bestErr = err; best = k; }
+      }
+      int R = cols[best], G = cols[best + 1], B = cols[best + 2];
+      for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        int d = depth(cx + x, cy + y); if (d >= s) continue;
+        int a = a8[d]; if (a >= 250) continue; int i = (y * w + x) * 4; int k = 255 - a;
+        px[i] = (byte)Math.Max(0, Math.Min(255, (px[i] - B * a / 255) * 255 / k));
+        px[i + 1] = (byte)Math.Max(0, Math.Min(255, (px[i + 1] - G * a / 255) * 255 / k));
+        px[i + 2] = (byte)Math.Max(0, Math.Min(255, (px[i + 2] - R * a / 255) * 255 / k));
+      }
+    }
+  }
+}
+"@
+$script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
+$GlowDepth = [int](70 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
 namespace K__BUILD__ {
@@ -107,11 +174,7 @@ function Clip($s) { if ($s.Length -gt $MaxOut) { $s.Substring(0, $MaxOut) + "`n.
 $Scale = 1.0
 $script:OriginX = [Windows.Forms.SystemInformation]::VirtualScreen.Left; $script:OriginY = [Windows.Forms.SystemInformation]::VirtualScreen.Top   # real px of the screenshot's top-left
 
-function Do-Screenshot($a) {
-    if ($a.view) { return (Do-Screenshot-Inner $a) }   # the live viewer sees the overlay too: no flicker on the friend's screen
-    Overlay-Send 'cap'; Start-Sleep -Milliseconds 180   # the glow, label and pointer are not part of what the operator sees
-    try { Do-Screenshot-Inner $a } finally { Overlay-Send 'uncap' }
-}
+function Do-Screenshot($a) { Do-Screenshot-Inner $a }   # the overlay is never hidden (no blinking); the AI's pictures have the glow taken out by arithmetic
 function Do-Screenshot-Inner($a) {
     $s = [Windows.Forms.SystemInformation]::VirtualScreen   # all monitors, or just one with "monitor"
     if ($null -ne $a.monitor) {
@@ -125,6 +188,15 @@ function Do-Screenshot-Inner($a) {
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
+    if (-not $view -and $script:OverlayProc -and -not $script:OverlayProc.HasExited) {
+        try {
+            $rect = New-Object Drawing.Rectangle 0, 0, $s.Width, $s.Height; $bd = $bmp.LockBits($rect, 'ReadWrite', 'Format32bppArgb')
+            $buf = New-Object byte[] ($bd.Stride * $s.Height); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $buf, 0, $buf.Length)
+            $ms_ = @(); foreach ($scr in [Windows.Forms.Screen]::AllScreens) { $ms_ += $scr.Bounds.X, $scr.Bounds.Y, $scr.Bounds.Width, $scr.Bounds.Height }
+            [V__BUILD__.Unglow]::Run($buf, $s.Width, $s.Height, $s.Left, $s.Top, [int[]]$ms_, $GlowDepth, [int[]]($script:OkRGB + @(255, 138, 30, 61, 220, 132)))
+            [Runtime.InteropServices.Marshal]::Copy($buf, 0, $bd.Scan0, $buf.Length); $bmp.UnlockBits($bd)
+        } catch { try { $bmp.UnlockBits($bd) } catch { } }
+    }
     $cap = if ($a.max_width) { [int]$a.max_width } elseif ($view) { 1280 } else { 1920 }
     $qual = if ($a.quality) { [long]$a.quality } elseif ($view) { 65L } else { 70L }
     $w = [Math]::Min($cap, $s.Width)
@@ -162,12 +234,12 @@ function Ease($p) {
     for ($i = 0; $i -lt 18; $i++) { $t = ($lo + $hi) / 2; if ((3 * [Math]::Pow(1 - $t, 2) * $t * 0.45 + 3 * (1 - $t) * $t * $t * 0.15 + $t * $t * $t) -lt $p) { $lo = $t } else { $hi = $t } }
     $t = ($lo + $hi) / 2; 3 * (1 - $t) * $t * $t + $t * $t * $t
 }
-function Glide($x, $y, $dur) {
+function Glide($x, $y, $dur, $straight) {
     $p0 = [Windows.Forms.Cursor]::Position; $cx = $p0.X; $cy = $p0.Y; $dx = $x - $cx; $dy = $y - $cy
     $dist = [Math]::Sqrt($dx * $dx + $dy * $dy); if ($dist -lt 2) { return }
     if (-not $dur) { $dur = [Math]::Min(1.3, 0.34 + $dist * 0.0006) }
     $nx = -$dy / $dist; $ny = $dx / $dist; if ($ny -gt 0) { $nx = -$nx; $ny = -$ny }   # the arc bulges upwards
-    $bend = [Math]::Min(90.0, $dist * 0.12); $qx = ($cx + $x) / 2 + $nx * $bend; $qy = ($cy + $y) / 2 + $ny * $bend
+    $bend = if ($straight) { 0.0 } else { [Math]::Min(90.0, $dist * 0.12) }; $qx = ($cx + $x) / 2 + $nx * $bend; $qy = ($cy + $y) / 2 + $ny * $bend
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
         $q = $sw.Elapsed.TotalSeconds / $dur; if ($q -ge 1.0) { break }
@@ -179,6 +251,13 @@ function Glide($x, $y, $dur) {
 function Target($a, $kx = 'x', $ky = 'y') { if ($a.raw) { return @([int]$a.$kx, [int]$a.$ky) }; @(([int]($a.$kx * $Scale) + $script:OriginX), ([int]($a.$ky * $Scale) + $script:OriginY)) }
 function Btn($name) { switch ($name) { 'right' { 8, 16 } 'middle' { 32, 64 } default { 2, 4 } } }
 
+function Do-Trace($a) {   # read along: the pointer goes to the start of the line, then slides under it at reading pace (no click)
+    Overlay-Send 'active'; $t1 = Target $a; $t2 = Target $a 'x2' 'y2'
+    Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 140
+    $d = [Math]::Sqrt([Math]::Pow($t2[0] - $t1[0], 2) + [Math]::Pow($t2[1] - $t1[1], 2))
+    Glide $t2[0] $t2[1] ([Math]::Min(4.0, [Math]::Max(0.5, $d / 520.0))) $true
+    @{ text = 'ok' }
+}
 function Do-Move($a) { Overlay-Send 'active'; $t = Target $a; Glide $t[0] $t[1] $null; @{ text = 'ok' } }
 
 function Do-Click($a) {
@@ -214,19 +293,21 @@ function Do-Scroll($a) {
     @{ text = 'ok' }
 }
 
+function Pin-Caret { try { $c = [V__BUILD__.Caret]::Get(); if ($c) { Overlay-Send "pin $($c[0] + 2) $($c[1] + $c[2])" } } catch { } }   # the arrow sits right under the caret
 function Do-TypeText($a) {
-    Overlay-Send 'typing'
+    Overlay-Send 'typing'; Pin-Caret
     $t = $a.text -replace "`r`n", "`n"
-    $lines = @($t.Split("`n") | Select-Object -First 30 | ForEach-Object { $_.Length })
-    Overlay-Send ('type ' + ([Math]::Min($t.Length, 300) * 0.026).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) + ' ' + ($lines -join ','))
     $step = [Math]::Max(1, [int][Math]::Ceiling($t.Length / 300.0))   # about 26 ms per step: the arrow can follow
+    $n = 0
     for ($i = 0; $i -lt $t.Length; $i += $step) {
+        Pin-Caret
         $chunk = $t.Substring($i, [Math]::Min($step, $t.Length - $i))
         # SendKeys treats + ^ % ~ ( ) { } [ ] specially: wrap each in braces
         $esc = [regex]::Replace($chunk, '[+^%~(){}\[\]]', '{$0}') -replace "`n", '{ENTER}'
         [Windows.Forms.SendKeys]::SendWait($esc)
         if ($t.Length -gt 1) { Start-Sleep -Milliseconds 18 }
     }
+    Pin-Caret
     @{ text = 'ok' }
 }
 
@@ -234,8 +315,20 @@ $Vk = @{ ctrl = 0x11; control = 0x11; alt = 0x12; shift = 0x10; win = 0x5B; wind
     esc = 0x1B; escape = 0x1B; tab = 0x09; space = 0x20; backspace = 0x08; delete = 0x2E; del = 0x2E; home = 0x24; end = 0x23
     pageup = 0x21; pagedown = 0x22; left = 0x25; up = 0x26; right = 0x27; down = 0x28 }
 1..12 | ForEach-Object { $Vk["f$_"] = 0x6F + $_ }
+function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it) and a short note in the label
+    $out = @()
+    if ($a.color -and "$($a.color)" -match '^#?([0-9a-fA-F]{6})$') {
+        $hx = $Matches[1]; $rgb = @([Convert]::ToInt32($hx.Substring(0, 2), 16), [Convert]::ToInt32($hx.Substring(2, 2), 16), [Convert]::ToInt32($hx.Substring(4, 2), 16))
+        $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
+        $script:OkRGB = $rgb; Overlay-Send "color $($rgb[0]) $($rgb[1]) $($rgb[2])"; $out += 'colour set'
+    }
+    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send "note $nt"; Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown' }
+    @{ text = $(if ($out) { $out -join ', ' } else { 'nothing to change' }) }
+}
+function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
+function Do-TaskDone($a) { $script:Phase = 'done'; Overlay-Send 'state done'; Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' } }
 function Do-PressKey($a) {
-    Overlay-Send 'typing'
+    Overlay-Send 'typing'; Pin-Caret
     $codes = foreach ($k in $a.keys.ToLower().Split('+')) {
         if ($Vk.ContainsKey($k)) { [byte]$Vk[$k] }
         elseif ($k.Length -eq 1) { [byte][char]$k.ToUpper() }
@@ -525,12 +618,14 @@ namespace O {
 [O.Pump]::Start()
 Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr LoadCursorFromFile(string f); [DllImport("user32.dll")] public static extern bool SetSystemCursor(IntPtr h, uint id); [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint a, uint b, IntPtr c, uint d);'
 $label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $pausedLabel = $env:HM_PAUSED; $ppid = [int]$env:HM_PPID
+$script:dpos = $null; $script:blendT = -1.0; $holdLabel = $env:HM_HOLD; $doneLabel = $env:HM_DONE; $awayLabel = $env:HM_AWAY; $script:note = ''; $script:pin = $null
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
 $script:state = 'ok'
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
-$BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255
+$BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255; $GREEN = C 61 220 132; $script:okC = $BLUE
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
-function Cur() { if ($script:state -eq 'lost' -or $script:state -eq 'wait' -or $script:state -eq 'paused') { $ORANGE } else { $BLUE } }
+function Warn() { $script:state -in 'lost', 'wait', 'paused', 'hold', 'away' }   # orange states: something is not running right now
+function Cur() { if (Warn) { $ORANGE } elseif ($script:state -eq 'done') { $GREEN } else { $script:okC } }
 
 function New-Win($x, $y, $w, $h) {
     $win = New-Object Windows.Window
@@ -559,15 +654,18 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $pill.Background = New-Object Windows.Media.SolidColorBrush (C 15 23 36 224); $pill.BorderThickness = New-Object Windows.Thickness 1.5
     $sp = New-Object Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
     $dot = New-Object Windows.Shapes.Ellipse; $dot.Width = 9; $dot.Height = 9; $dot.VerticalAlignment = 'Center'
-    $tb = New-Object Windows.Controls.TextBlock; $tb.Foreground = [Windows.Media.Brushes]::White; $tb.FontSize = 14
+    $tb = New-Object Windows.Controls.TextBlock; $tb.Foreground = [Windows.Media.Brushes]::White; $tb.FontSize = 14; $tb.MaxWidth = 560; $tb.TextTrimming = 'CharacterEllipsis'
     $tb.FontWeight = 'SemiBold'; $tb.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'; $tb.Margin = New-Object Windows.Thickness 9, 0, 0, 0
-    [void]$sp.Children.Add($dot); [void]$sp.Children.Add($tb); $pill.Child = $sp; [void]$g.Children.Add($pill)
+    $tc = New-Object Windows.Controls.TextBlock; $tc.Foreground = New-Object Windows.Media.SolidColorBrush (C 159 176 200); $tc.FontSize = 13; $tc.FontFamily = New-Object Windows.Media.FontFamily 'Segoe UI'
+    [Windows.Documents.Typography]::SetNumeralAlignment($tc, 'Tabular'); $tc.Margin = New-Object Windows.Thickness 12, 1, 0, 0   # the clock does not jump with every second
+    [void]$sp.Children.Add($dot); [void]$sp.Children.Add($tb); [void]$sp.Children.Add($tc); $pill.Child = $sp; [void]$g.Children.Add($pill)
     $win.Content = $g
     $pshadow = New-Object Windows.Media.Effects.DropShadowEffect; $pshadow.ShadowDepth = 0; $pshadow.BlurRadius = 26; $pshadow.Opacity = 0; $pshadow.Color = $BLUE; $pill.Effect = $pshadow
-    $m = @{ win = $win; shadow = $pshadow; img = $img; pill = $pill; dot = $dot; tb = $tb; w = $b.Width; h = $b.Height; cache = @{} }
+    $m = @{ win = $win; shadow = $pshadow; img = $img; pill = $pill; dot = $dot; tb = $tb; tc = $tc; w = $b.Width; h = $b.Height; cache = @{} }
     $win.Show(); Click-Through $win; $mons += $m
 }
-function Label-Text { if ($script:state -eq 'lost') { $lostLabel } elseif ($script:state -eq 'wait') { $waitLabel } elseif ($script:state -eq 'paused') { $pausedLabel } else { $s = [int]$script:clockT.Elapsed.TotalSeconds; '{0}   {1:00}:{2:00}:{3:00}' -f $label, [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } }
+function Label-Text { switch ($script:state) { 'lost' { $lostLabel } 'wait' { $waitLabel } 'paused' { $pausedLabel } 'hold' { $holdLabel } 'done' { $doneLabel } 'away' { $awayLabel } default { if ($script:note) { $script:note } else { $label } } } }
+function Clock-Text { if ($script:state -in 'ok', 'away') { $s = [int]$script:clockT.Elapsed.TotalSeconds; if ($s -ge 3600) { '{0}:{1:00}:{2:00}' -f [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } else { '{0:00}:{1:00}' -f [Math]::Floor($s / 60), ($s % 60) } } else { '' } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 $script:busy = $false; $script:capHide = $false
 $script:busyOff = New-Object Windows.Threading.DispatcherTimer; $script:busyOff.Interval = [TimeSpan]::FromMilliseconds(2500); $script:busyOff.Add_Tick({ $script:busyOff.Stop(); Set-Busy $false })
@@ -579,7 +677,7 @@ function Set-Busy($b) {   # working: the label's halo breathes; waiting for a co
     }
 }
 function Apply-State {
-    $c = Cur; $key = $script:state
+    $c = Cur; $key = "$($c.R),$($c.G),$($c.B)"   # the glow is cached per colour
     foreach ($m in $mons) {
         if (-not $m.cache.ContainsKey($key)) {
             $px = [O.Glow]::Make($m.w, $m.h, [int](70 * $dpi), $c.R, $c.G, $c.B)
@@ -588,8 +686,8 @@ function Apply-State {
         }
         $m.img.Source = $m.cache[$key]
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
-        $m.tb.Text = Label-Text
-        if ($script:state -eq 'lost' -or $script:state -eq 'wait' -or $script:state -eq 'paused') {   # the orange dot pulses while the link is down or nobody has connected yet
+        $m.tb.Text = Label-Text; $m.tc.Text = Clock-Text; $m.tc.Visibility = $(if ($m.tc.Text) { 'Visible' } else { 'Collapsed' })
+        if (Warn) {   # the orange dot pulses while the link is down or nobody has connected yet
             $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
             $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
             $m.dot.BeginAnimation([Windows.UIElement]::OpacityProperty, $an)
@@ -700,8 +798,8 @@ function Apply-Cursors {
         $dir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item $dir -ItemType Directory -Force)
         $t0 = [Diagnostics.Stopwatch]::StartNew(); $got = @{}
         if ($env:HM_RELAY) {
-            foreach ($k in @($CurIds.Keys)) {
-                if ($t0.Elapsed.TotalSeconds -gt 8) { break }
+            foreach ($k in @('pointer') + @($CurIds.Keys | Where-Object { $_ -ne 'pointer' })) {
+                if ($t0.Elapsed.TotalSeconds -gt 20) { break }
                 $ext = if ($k -eq 'busy' -or $k -eq 'working') { 'ani' } else { 'cur' }
                 try { $rq = [Net.WebRequest]::Create("$($env:HM_RELAY)/cursor/$k.$ext"); $rq.Timeout = 3000; $rs = $rq.GetResponse(); $f = Join-Path $dir "$k.$ext"; $fs = [IO.File]::Create($f); $rs.GetResponseStream().CopyTo($fs); $fs.Close(); $rs.Close(); $got[$k] = $f } catch { }
             }
@@ -739,7 +837,10 @@ function Type-Offset($now) {   # where the arrow stands while text is typed: it 
 function On-Line($line) {
     $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
     if (-not $f -or -not $f[0]) { return }
-    if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { $script:state = $f[1]; Apply-State }; return }
+    if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; $script:state = $f[1]; Apply-State }; return }
+    if ($f[0] -eq 'color' -and $f.Count -ge 4) { $script:okC = C ([int]$f[1]) ([int]$f[2]) ([int]$f[3]); Apply-State; foreach ($m in $mons) { if ($script:busy) { $m.shadow.Color = (Cur) } }; return }
+    if ($f[0] -eq 'note') { $script:note = $line.Trim().Substring(4).Trim(); Apply-State; return }
+    if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
     if ($f[0] -eq 'uncap') { $script:capHide = $false; foreach ($m in $mons) { $m.win.Opacity = 1 }; $rwin.Opacity = 1; return }
     if ($f[0] -eq 'busy') { $script:busyOff.Stop(); Set-Busy $true; return }
@@ -763,7 +864,7 @@ $timer.Add_Tick({
     while ([O.Pump]::Q.TryDequeue([ref]$line)) { On-Line $line }
     if ([O.Pump]::Eof) { [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown(); return }
     $sec = [int]$script:clockT.Elapsed.TotalSeconds
-    if ($sec -ne $script:lastSec) { $script:lastSec = $sec; $t = Label-Text; foreach ($m in $mons) { $m.tb.Text = $t } }   # the session clock in the label
+    if ($sec -ne $script:lastSec) { $script:lastSec = $sec; $t = Clock-Text; foreach ($m in $mons) { $m.tc.Text = $t } }   # the session clock in the label
     $now = $clock.Elapsed.TotalSeconds; $p = [Windows.Forms.Cursor]::Position; $c = Cur
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
     $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
@@ -780,7 +881,13 @@ $timer.Add_Tick({
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
     else {
         if (-not $script:cursorShown) { $cwin.Show(); $script:cursorShown = $true }
-        $to = Type-Offset $now; [void][O.W]::SetWindowPos($cwinH, [IntPtr]::Zero, [int]($p.X + $to[0] - $HX * $dpi), [int]($p.Y + $to[1] - $HY * $dpi), 0, 0, 0x15);   # a direct window move: much smoother than setting Left/Top through WPF
+        $pinned = $script:pin -and ($now - $script:pin.t) -lt 1.5
+        $q = if ($pinned) { @($script:pin.x, $script:pin.y) } else { @($p.X, $p.Y) }   # while typing: at the text caret
+        if ($pinned) { $script:blendT = $now + 0.6 }
+        if (-not $script:dpos) { $script:dpos = @([double]$q[0], [double]$q[1]) }
+        $kk = if ($pinned -or $now -lt $script:blendT) { 0.14 } else { 1.0 }   # glides from letter to letter instead of jumping
+        $script:dpos[0] += ($q[0] - $script:dpos[0]) * $kk; $script:dpos[1] += ($q[1] - $script:dpos[1]) * $kk
+        [void][O.W]::SetWindowPos($cwinH, [IntPtr]::Zero, [int]($script:dpos[0] - $HX * $dpi), [int]($script:dpos[1] - $HY * $dpi), 0, 0, 0x15);   # a direct window move: much smoother than setting Left/Top through WPF
          $cwin.Opacity = $(if ($script:capHide) { 0 } else { [Math]::Min(1.0, $script:opacity) })
         $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
@@ -849,6 +956,7 @@ function Start-Overlay {
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true
         $psi.EnvironmentVariables['HM_RELAY'] = $RELAY; $psi.EnvironmentVariables['HM_LABEL'] = (T 'Удалённое управление' 'Remote control'); $psi.EnvironmentVariables['HM_PPID'] = [string]$PID
         $psi.EnvironmentVariables['HM_LOST'] = (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'); $psi.EnvironmentVariables['HM_WAIT'] = (T 'Ожидание помощника…' 'Waiting for the helper…'); $psi.EnvironmentVariables['HM_PAUSED'] = (T 'Пауза' 'Paused')
+        $psi.EnvironmentVariables['HM_HOLD'] = (T 'Помощник на паузе, вернётся' 'The helper is on hold, back soon'); $psi.EnvironmentVariables['HM_DONE'] = (T 'Готово: помощник закончил' 'Done: the helper has finished'); $psi.EnvironmentVariables['HM_AWAY'] = (T 'Помощник давно ничего не делает' 'The helper has been quiet for a while')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
         $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
     } catch { }   # a missing overlay must never block the help session
@@ -873,7 +981,7 @@ $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::Min
 $AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'
     write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
-$Quiet = @{ agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
+$Quiet = @{ trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
 function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
@@ -906,7 +1014,11 @@ function Describe-Action($name, $a) {   # -> array of short sentences
     @($pre + (Cut $tail 90))
 }
 function Say-Step($name, $a) {
-    if ($Quiet.ContainsKey($name)) { Write-Host ('  . ' + (T $Quiet[$name][0] $Quiet[$name][1])) -ForegroundColor DarkGray; return }
+    if ($Quiet.ContainsKey($name)) {
+        if ($script:LastQuiet -eq $name) { return }   # "looking at the screen" once, not after every picture
+        $script:LastQuiet = $name; Write-Host ('  . ' + (T $Quiet[$name][0] $Quiet[$name][1])) -ForegroundColor DarkGray; return
+    }
+    $script:LastQuiet = $null
     $d = @(Describe-Action $name $a)
     if ($d.Count -eq 1) { Write-Host '  -> ' -ForegroundColor Cyan -NoNewline; Write-Host $d[0] }
     else { Write-Host ('  -> ' + (T 'действия:' 'actions:')) -ForegroundColor Cyan; $i = 0; foreach ($x in $d) { $i++; Write-Host "       $i. $x" } }
@@ -1021,8 +1133,11 @@ function Do-AgentLog($a) {
 function Orange($text) { if ($script:VT) { "$([char]27)[38;5;208m$text$([char]27)[0m" } else { $text } }
 function Write-Orange($text) { if ($script:VT) { [Console]::WriteLine((Orange $text)) } else { Write-Host $text -ForegroundColor DarkYellow } }
 function Status-Text {
-    $st = if ($script:Net -eq 'lost') { 'lost' } elseif ([K__BUILD__.Keys]::Paused) { 'paused' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }
+    $st = if ($script:Net -eq 'lost') { 'lost' } elseif ([K__BUILD__.Keys]::Paused) { 'paused' } elseif ($script:OperatorSeen) { $script:Phase } else { 'wait' }
     switch ($st) {
+        'hold' { @('wait', ('|| ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back'))) }
+        'done' { @('ok', ([char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work'))) }
+        'away' { @('wait', ([char]0x25CC + ' ' + (T 'Помощник давно ничего не делает' 'The helper has been quiet for a while'))) }
         'paused' { @('wait', ("||" + ' ' + (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'))) }
         'ok' { @('ok', ([char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected'))) }
         'lost' { @('lost', ([char]0x25CC + ' ' + (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…'))) }
@@ -1122,10 +1237,18 @@ function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
 }
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
-    if (-not $script:OperatorSeen) { $script:OperatorSeen = $true; Overlay-Send 'state ok'; Show-Status; Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
-    Say-Step $name $a
+    $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
+    $meta = $name -in 'look', 'hold', 'task_done'
+    if (-not $viewFrame -and -not $meta) {
+        $script:LastOp = [DateTime]::UtcNow
+        if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
+            $first = -not $script:OperatorSeen; $script:OperatorSeen = $true; $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status
+            if ($first) { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
+        }
+    }
+    if (-not $viewFrame -and -not $meta) { Say-Step $name $a }
     $res = @{ id = $cmd.id }
-    $quietCall = $Quiet.ContainsKey($name); if (-not $quietCall) { Overlay-Send 'busy' }
+    $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame; if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name)) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
@@ -1133,13 +1256,13 @@ function Process-Command($cmd) {
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; trace = 'Do-Trace'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
     } catch { $res.ok = $false; $res.error = $_.Exception.Message }
     if (-not $quietCall) { Overlay-Send 'idle' }
-    if (-not $Quiet.ContainsKey($name)) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
+    if (-not $quietCall) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
         try { Post-Result $res $script:Token; break }
         catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
@@ -1166,7 +1289,7 @@ function Net-State($st) {
     if ($script:Net -eq $st) { return }
     $script:Net = $st
     if ($st -eq 'lost') { Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Связь потеряна, переподключение…' 'Connection lost, reconnecting…')) } else { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Связь восстановлена' 'Connection restored')) -ForegroundColor Green }
-    Overlay-Send ("state " + $(if ($st -eq 'lost') { 'lost' } elseif ($script:OperatorSeen) { 'ok' } else { 'wait' }))   # the overlay turns orange while the link is down or nobody has connected yet
+    Overlay-Send ("state " + $(if ($st -eq 'lost') { 'lost' } elseif ($script:OperatorSeen) { $script:Phase } else { 'wait' }))   # the overlay turns orange while the link is down or nobody has connected yet
     Show-Status
 }
 
@@ -1241,6 +1364,7 @@ function Start-Helper {
                 }
                 if ($fails) { Outage-Over }
                 $fails = 0; $delay = 1.0; Net-State 'ok'
+                if ($script:OperatorSeen -and $script:Phase -eq 'ok' -and ([DateTime]::UtcNow - $script:LastOp).TotalMinutes -ge 5) { $script:Phase = 'away'; Overlay-Send 'state away'; Show-Status }
                 if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
                 $cmd = $resp.Content | ConvertFrom-Json
             }

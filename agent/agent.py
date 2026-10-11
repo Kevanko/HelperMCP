@@ -196,7 +196,7 @@ def _ease(p):
     return 3 * (1 - t) ** 2 * t * y1 + 3 * (1 - t) * t * t * y2 + t ** 3
 
 
-def glide(x, y, dur=None):
+def glide(x, y, dur=None, straight=False):
     """Move the real pointer like a hand would: a slightly curved path, slow start, fast middle, soft landing; paced by the clock (not by sleeps),
     about 120 steps/s. The overlay arrow follows it and turns its tip into the direction of movement."""
     X = xlib(); cx, cy = pointer_pos(); dx, dy = x - cx, y - cy; dist = math.hypot(dx, dy)
@@ -204,7 +204,7 @@ def glide(x, y, dur=None):
     dur = dur or min(1.3, 0.34 + dist * 0.0006)
     nx, ny = -dy / dist, dx / dist
     if ny > 0: nx, ny = -nx, -ny                      # the arc bulges upwards
-    bend = min(90.0, dist * 0.12); qx, qy = (cx + x) / 2 + nx * bend, (cy + y) / 2 + ny * bend
+    bend = 0.0 if straight else min(90.0, dist * 0.12); qx, qy = (cx + x) / 2 + nx * bend, (cy + y) / 2 + ny * bend
     t0 = time.monotonic(); last = None
     while True:
         p = (time.monotonic() - t0) / dur
@@ -218,6 +218,12 @@ def glide(x, y, dur=None):
 def _target(a, kx="x", ky="y"):
     if a.get("raw"): return int(a[kx]), int(a[ky])   # real screen pixels (the live viewer)
     return int(a[kx] * SCALE) + ORIGIN[0], int(a[ky] * SCALE) + ORIGIN[1]
+
+
+def trace(a):
+    """read along: to the start of the line, then slide under it at reading pace (no click)"""
+    xlib(); overlay_send("active"); x1, y1 = _target(a); x2, y2 = _target(a, "x2", "y2")
+    glide(x1, y1); time.sleep(0.14); glide(x2, y2, min(4.0, max(0.5, math.hypot(x2 - x1, y2 - y1) / 520.0)), True); return {"text": "ok"}
 
 
 def move(a):
@@ -347,12 +353,16 @@ def describe(name, a):
             + cut(a.get("command") or a.get("path") or a.get("name") or json.dumps(a, ensure_ascii=False), 90)]
 
 
-QUIET = {"agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
+QUIET = {"trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
          "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP")}
 
 
+LASTQ = [None]
 def line_for(name, a):
-    if name in QUIET: return c("2", "  · " + QUIET[name][0 if RU else 1])
+    if name in QUIET:
+        if LASTQ[0] == name: return None   # "looking at the screen" once, not after every picture
+        LASTQ[0] = name; return c("2", "  · " + QUIET[name][0 if RU else 1])
+    LASTQ[0] = None
     d = describe(name, a)
     return c("36", "  → ") + (d[0] if len(d) == 1 else (c("1", "действия:" if RU else "actions:") + "".join(f"\n      {i}. {x}" for i, x in enumerate(d, 1))))
 
@@ -698,7 +708,6 @@ def actions(a):
 def type_text(a):
     """Type any Unicode: park each character's keysym on a spare keycode, press it, restore the keymap (what xdotool does)."""
     X = xlib(); x11, d = X["x"], X["d"]; overlay_send("typing")
-    lines = [len(t_) for t_ in a["text"].split("\n")]; overlay_send("type %.2f %s" % (len(a["text"]) * 0.024, ",".join(map(str, lines[:30]))))
     lo, hi, per = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
     x11.XDisplayKeycodes(d, ctypes.byref(lo), ctypes.byref(hi))
     m = x11.XGetKeyboardMapping(d, lo.value, hi.value - lo.value + 1, ctypes.byref(per))
@@ -972,7 +981,13 @@ from gi.repository import Gtk, Gdk, GLib
 label, ppid, lost_label = sys.argv[1], int(sys.argv[2]), (sys.argv[3] if len(sys.argv) > 3 else "Connection lost")
 wait_label = sys.argv[4] if len(sys.argv) > 4 else "Waiting for the helper…"
 paused_label = sys.argv[5] if len(sys.argv) > 5 else "Paused"
-BLUE, ORANGE, VIOLET = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0)
+hold_label = sys.argv[6] if len(sys.argv) > 6 else "The helper is on hold"
+done_label = sys.argv[7] if len(sys.argv) > 7 else "Done"
+away_label = sys.argv[8] if len(sys.argv) > 8 else "The helper has been quiet for a while"
+note = ""
+BLUE, ORANGE, VIOLET, GREEN = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0), (61 / 255, 220 / 255, 132 / 255)
+OKC = BLUE   # the AI may pick its own colour (set_look)
+WARN = ("lost", "wait", "paused", "hold", "away")
 disp = Gdk.Display.get_default()
 scr = disp.get_default_screen()
 if not scr.is_composited() or scr.get_rgba_visual() is None:
@@ -980,7 +995,7 @@ if not scr.is_composited() or scr.get_rgba_visual() is None:
 state = "ok"                         # ok | lost (connection to the relay) | wait (nobody has connected with the code yet)
 S_DEPTH = 70                         # glow depth in px
 
-def col(): return ORANGE if state in ("lost", "wait", "paused") else BLUE
+def col(): return ORANGE if state in WARN else GREEN if state == "done" else OKC
 
 def new_window(w, h, x, y):
     # A managed NOTIFICATION window, not an override-redirect POPUP: GNOME Shell does not let clicks through an
@@ -1023,7 +1038,7 @@ glows, pills, strips = [], [], []
 tmp = cairo.Context(cairo.ImageSurface(cairo.FORMAT_ARGB32, 10, 10))
 tmp.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); tmp.set_font_size(15)
 T0 = time.monotonic()
-PILL_W = int(max(tmp.text_extents(label + "   00:00:00").x_advance, tmp.text_extents(lost_label).x_advance, tmp.text_extents(wait_label).x_advance)) + 58
+PILL_W = int(max(560, tmp.text_extents(label + "   00:00:00").x_advance, tmp.text_extents(lost_label).x_advance, tmp.text_extents(wait_label).x_advance)) + 58
 
 def make_monitor(mon):
     g = mon.get_geometry()
@@ -1031,8 +1046,9 @@ def make_monitor(mon):
     w = new_window(W, H, g.x, g.y)
     cache = {}
     def surf():
-        if state not in cache: cache[state] = build_glow(W, H, col())
-        return cache[state][0]
+        k = col()
+        if k not in cache: cache[k] = build_glow(W, H, k)
+        return cache[k][0]
     def draw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
     w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
@@ -1058,7 +1074,9 @@ def make_monitor(mon):
     pw = new_window(PILL_W + 2 * PM, 36 + 2 * PM, g.x + (g.width - PILL_W) // 2 - PM, g.y + 12 - PM)
     def pdraw(_, cr):
         cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_rgba(0, 0, 0, 0); cr.paint(); cr.set_operator(cairo.OPERATOR_OVER); cr.translate(PM, PM)
-        r_, g_, b_ = col(); lost = state in ("lost", "wait", "paused"); text = lost_label if state == "lost" else wait_label if state == "wait" else paused_label if state == "paused" else label + "   %02d:%02d:%02d" % ((int(time.monotonic() - T0) // 3600,) + divmod(int(time.monotonic() - T0) % 3600, 60))
+        r_, g_, b_ = col(); lost = state in WARN; el = int(time.monotonic() - T0)
+        clock = ("%d:%02d:%02d" % (el // 3600, el % 3600 // 60, el % 60)) if el >= 3600 else ("%02d:%02d" % (el // 60, el % 60))
+        text = {"lost": lost_label, "wait": wait_label, "paused": paused_label, "hold": hold_label, "done": done_label, "away": away_label}.get(state) or ((note[:70] or label) + "   " + clock)
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(time.monotonic() * 5)) if lost else 1.0
         cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD); cr.set_font_size(15)
         ext = cr.text_extents(text); ph, rr, pad = 34, 17, 18
@@ -1359,7 +1377,16 @@ def on_line(line):
     global last_active, pressed_t, dragging, scroll_dir, scroll_t, typing_t, rip, pre_until, type_anim
     f = line.split(); now = time.monotonic()
     if not f: return
-    if f[0] == "state" and len(f) > 1: set_state(f[1]); return
+    if f[0] == "state" and len(f) > 1:
+        global T0
+        if f[1] == "ok" and state in ("done", "wait"): T0 = time.monotonic()   # a new piece of work starts the clock again
+        set_state(f[1]); return
+    if f[0] == "color" and len(f) >= 4:
+        global OKC
+        OKC = (int(f[1]) / 255, int(f[2]) / 255, int(f[3]) / 255); [w.queue_draw() for w in glows + pills]; return
+    if f[0] == "note":
+        global note
+        note = line.strip()[4:].strip(); [w.queue_draw() for w in pills]; return
     if f[0] in ("busy", "idle"):
         global busy_fx, busy_off
         if busy_off: GLib.source_remove(busy_off); busy_off = 0
@@ -1413,7 +1440,7 @@ def halo_tick():
     global halo_lvl
     tgt = 1.0 if busy_fx else 0.0; halo_lvl += (tgt - halo_lvl) * (0.3 if tgt else 0.07)
     if halo_lvl < 0.01 and not busy_fx: halo_lvl = 0.0
-    if halo_lvl > 0 or state in ("lost", "wait", "paused"): [w.queue_draw() for w in pills]
+    if halo_lvl > 0 or state in WARN: [w.queue_draw() for w in pills]
     return True
 GLib.timeout_add(60, halo_tick)   # orange label pulses
 GLib.timeout_add(1500, watchdog)
@@ -1435,7 +1462,7 @@ def overlay_start():
     global OVERLAY_PROC
     if os.environ.get("HELPER_NO_OVERLAY") or not GUI["type"]: return
     try:
-        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost"), t("overlay_wait"), t("overlay_paused")],
+        OVERLAY_PROC = subprocess.Popen([sys.executable, "-c", OVERLAY, t("overlay"), str(os.getpid()), t("lost"), t("overlay_wait"), t("overlay_paused"), ("Помощник на паузе, вернётся" if RU else "The helper is on hold, back soon"), ("Готово: помощник закончил" if RU else "Done: the helper has finished"), ("Помощник давно ничего не делает" if RU else "The helper has been quiet for a while")],
                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ, HM_RELAY=RELAY))
     except Exception: pass
 
@@ -1480,6 +1507,26 @@ TOOLS = dict(agent_log=agent_log, actions=actions, move=move, drag=drag, fetch_f
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
 
+PHASE = {"p": "ok", "last": time.time()}
+def look(a):
+    out = []
+    import re as _re
+    m = _re.match(r"^#?([0-9a-fA-F]{6})$", str(a.get("color") or ""))
+    if m:
+        rgb = [int(m.group(1)[i:i + 2], 16) for i in (0, 2, 4)]; mx = max(rgb)
+        if mx < 200: rgb = [min(255, int(v * 200 / max(1, mx))) for v in rgb]   # always bright enough to be seen
+        overlay_send("color %d %d %d" % tuple(rgb)); out.append("colour set")
+    if a.get("note"):
+        n = " ".join(str(a["note"]).split())[:90]; overlay_send("note " + n); print(c("36", "  ✎ " + n), flush=True); out.append("note shown")
+    return {"text": ", ".join(out) or "nothing to change"}
+def hold(a):
+    PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
+def task_done(a):
+    PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
+TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace)
+META = {"look", "hold", "task_done"}
+
+
 GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
 GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 
@@ -1487,9 +1534,15 @@ GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 def handle(cmd, mode, token):
     """One tool call, in its own thread: a slow install or render never blocks screenshots, the live viewer or other calls."""
     name, args = cmd["tool"], cmd["args"]
-    if not OP["seen"]: OP["seen"] = True; overlay_send("state ok"); show_status(); print(c("32", "  ● " + t("st_ok")), flush=True)
-    print(line_for(name, args), flush=True)
-    quiet_ = name in QUIET
+    view = name == "screenshot" and bool((args or {}).get("view"))   # the operator's live viewer: no console line, no state change
+    if not view and name not in META:
+        PHASE["last"] = time.time()
+        if not OP["seen"] or PHASE["p"] != "ok":
+            first = not OP["seen"]; OP["seen"] = True; PHASE["p"] = "ok"; overlay_send("state ok"); show_status()
+            if first: print(c("32", "  ● " + t("st_ok")), flush=True)
+        ln = line_for(name, args)
+        if ln: print(ln, flush=True)
+    quiet_ = name in QUIET or name in META or view
     if not quiet_: overlay_send("busy")
     res = {"id": cmd["id"]}
     try:
@@ -1503,7 +1556,7 @@ def handle(cmd, mode, token):
     except Exception as e:  # report every failure to the operator
         res.update(ok=False, error=f"{type(e).__name__}: {e}")
     if not quiet_: overlay_send("idle")
-    if name not in QUIET: print((c("32", "    ✔ " + ("готово" if RU else "done")) if res.get("ok") else c("31", "    ✘ " + cut(res.get("error"), 120))), flush=True)
+    if not quiet_: print((c("32", "    ✔ " + ("готово" if RU else "done")) if res.get("ok") else c("31", "    ✘ " + cut(res.get("error"), 120))), flush=True)
     for attempt in range(5):   # a lost result would leave the operator waiting for a call that already finished
         try: post_result(res, TOKEN or token); break
         except urllib.error.HTTPError as e:
@@ -1522,8 +1575,13 @@ def net_state(st):
     if NET["s"] == st: return
     NET["s"] = st
     print(c(ORANGE, "  ◌ " + t("st_lost")) if st == "lost" else c("32", "  ● " + ("Связь восстановлена" if RU else "Connection restored")), flush=True)
-    overlay_send("state " + ("lost" if st == "lost" else ("paused" if PAUSED.is_set() else ("ok" if OP["seen"] else "wait"))))   # the overlay turns orange while the link is down or nobody has connected yet
+    overlay_send("state " + ("lost" if st == "lost" else ("paused" if PAUSED.is_set() else (PHASE["p"] if OP["seen"] else "wait"))))   # the overlay turns orange while the link is down or nobody has connected yet
     show_status()
+
+
+def away_check():   # five minutes without a call from the helper: say so on the label
+    if OP["seen"] and PHASE["p"] == "ok" and time.time() - PHASE["last"] > 300 and NET["s"] == "ok":
+        PHASE["p"] = "away"; overlay_send("state away")
 
 
 def register(mode, resume=None, resume_token=None, note=""):
@@ -1604,7 +1662,7 @@ def main():
                 time.sleep(min(delay, 10.0) * (0.8 + 0.4 * random.random())); delay *= 1.7
                 continue
             if fails: outage_over()
-            fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
+            fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok"); away_check()
             if status != 200 or not cmd: continue
             if cmd["tool"] == "bye": print("session closed"); FINAL.set(); return
             pool.submit(handle, cmd, mode, token)

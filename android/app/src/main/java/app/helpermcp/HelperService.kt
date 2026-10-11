@@ -270,6 +270,7 @@ class HelperService : AccessibilityService() {
         "hold" -> { phase = "hold"; opSeen = false; lastOpAt = 0; fx.setState("hold"); ok() }
         "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }
+        "trace" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); Thread.sleep(140); fx.glideBlocking(px(a, "x2"), py(a, "y2")); ok() }   // read along a line
         "drag" -> { drag(a); ok() }
         "scroll" -> { scroll(a); ok() }
         "type_text" -> { typeText(a.getString("text")); ok() }

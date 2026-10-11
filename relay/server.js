@@ -77,7 +77,7 @@ const viewers = new Map();  // unguessable token -> { code, exp }: lets the oper
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
 // files copied from a remote PC to the operator: unguessable link, kept 24 h
-const CURSOR_DIR = process.env.CURSOR_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'cursor') : path.join(__dirname, 'cursor'));
+const CURSOR_DIR = process.env.CURSOR_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'cursor') : path.join(here, 'cursor'));
 const APK_FILE = process.env.APK_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'apk', 'helpermcp.apk') : path.join(here, '..', 'android', 'helpermcp.apk'));   // the Android app, built from android/ (see README)
 const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
 const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
@@ -246,7 +246,7 @@ const tools = [
       return { text: L.length ? '[' + L.join(',\n') + ']' : 'no mistakes logged yet' };
     } },
   { name: 'set_look', session: true,
-    description: 'Android phone: choose how your presence looks to the user. "color" (#RRGGBB) is the glow and label colour while you work: pick one you like, ONCE at the start; it cannot be changed again in this session (no flicker of colours). "note" (up to 90 chars) is a short line shown in the app and on the label, e.g. "Checking the subscription again in 5 min"; update it whenever it helps the user to know what is going on (not more than once a minute). Other systems: only logged.',
+    description: 'Choose how your presence looks to the user (the glow and the label on a PC or a phone). "color" (#RRGGBB) is the glow and label colour while you work: pick one you like, ONCE at the start; it cannot be changed again in this session (no flicker of colours). "note" (up to 90 chars) is a short line shown in the app and on the label, e.g. "Checking the subscription again in 5 min"; update it whenever it helps the user to know what is going on (not more than once a minute). Other systems: only logged.',
     props: { color: str('#RRGGBB, once per session'), note: str('short status line, you may update it') },
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
@@ -256,8 +256,8 @@ const tools = [
       if (a.color && s.lookColor) a = { ...a, color: '' };   // the colour is fixed after the first time
       else if (a.color) s.lookColor = String(a.color).slice(0, 9);
       s.events.push({ t: now, type: 'look', data: { color: s.lookColor || '', note: String(a.note || '').slice(0, 90) } });
-      if (/android/i.test(s.info?.os || '')) return { text: String((await call(c, 'look', { color: a.color || '', note: String(a.note || '').slice(0, 90) })).text || 'ok') };
-      return { text: 'noted (only phones show it)' };
+      try { return { text: String((await call(c, 'look', { color: a.color || '', note: String(a.note || '').slice(0, 90) })).text || 'ok') }; }
+      catch (e) { if (/Unknown tool|not available/i.test(e.message)) return { text: 'noted (this agent is too old to show it: the user can restart the helper to update it)' }; throw e; }
     } },
   { name: 'hold', session: true,
     description: 'Put the session on hold when you must stop for a while (your token or rate limit is running out, a long break, waiting for the user). The phone shows an orange "helper is on hold, back soon" label, keeps its screen awake and the session open; your next action continues it. Unlike pause (which the user presses) you start it yourself. Elsewhere it is only logged.',
@@ -265,7 +265,7 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
       s.events.push({ t: Date.now(), type: 'hold', data: { reason: String(a.reason || '').slice(0, 200), back_in_minutes: a.back_in_minutes || null } });
-      if (/android/i.test(s.info?.os || '')) await call(c, 'hold', {});
+      await call(c, 'hold', {}).catch((e) => { if (!/Unknown tool|not available/i.test(e.message)) throw e; });
       return { text: 'on hold: the session stays open and the screen awake; your next action continues' };
     } },
   { name: 'task_done', session: true,
@@ -274,7 +274,7 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
       s.events.push({ t: Date.now(), type: 'done', data: { summary: String(a.summary || '').slice(0, 200) } });
-      if (/android/i.test(s.info?.os || '')) await call(c, 'task_done', {});
+      await call(c, 'task_done', {}).catch((e) => { if (!/Unknown tool|not available/i.test(e.message)) throw e; });
       return { text: 'marked as finished' };
     } },
   { name: 'wait_online', session: true,
@@ -308,6 +308,8 @@ const tools = [
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
   { name: 'click', agent: true, description: 'Move the mouse to (x,y) in screenshot coordinates and click.',
     props: { x: num('x'), y: num('y'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
+  { name: 'trace', agent: true, description: 'Read along: the pointer goes to (x,y) and slides slowly under a line of text to (x2,y2), no click, like a person following text with the cursor. Use it whenever you read something on the screen or point the user at an important detail, so they see what you are looking at.',
+    props: { x: { type: 'number' }, y: { type: 'number' }, x2: { type: 'number' }, y2: { type: 'number' } }, required: ['x', 'y', 'x2', 'y2'] },
   { name: 'move', agent: true, description: 'Glide the mouse pointer to (x,y) in screenshot coordinates without clicking (hover, open menus that open on hover).',
     props: { x: num('x'), y: num('y') }, required: ['x', 'y'] },
   { name: 'drag', agent: true, description: 'Drag with the mouse: press at (x,y), glide to (x2,y2) with the button held, release. Coordinates are screenshot pixels.',
@@ -371,13 +373,13 @@ const fmt = (d) => {
 // fixed = session code for /s/<code>/mcp (tools then have no "session" argument and child tools appear as <server>__<tool>)
 const INSTRUCTIONS = `You are connected to a REMOTE computer (a friend's PC or server) through HelperMCP. Work on it as if it were your own machine.
 Workflow for any task:
-1. Look first: sysinfo, then screenshot (what the user sees). Use open_viewer so the operator can watch live.
+1. Look first: sysinfo, then screenshot (what the user sees). Right after connecting call open_viewer and give the operator the Control link at once; if you can run commands on the operator's own machine, open it in their browser (Windows: start "" "<link>"; macOS: open; Linux: xdg-open). Then set_look: a colour you like (once) and a short note of what you are doing; keep the note current.
 2. Need an application or MCP server (Blender, Unity, Substance, a browser, ...)? First call recipe (no name = list; "blender" and the generic "any-app" exist). Check whether it is installed (run: Get-Command / where / which / winget list / registry / apt), install it if missing (winget install -e --id ..., apt/flatpak; an installer that needs administrator rights shows a UAC prompt the user must accept: tell them), then continue.
 3. GUI apps and anything long-lived: start_process (detached, keeps running). Do not use run for them.
 4. MCP servers: mcp_start (command npx / uvx / python / an exe). Portable Node and uv are fetched automatically when missing. command="playwright" opens a real visible browser with sound. Then mcp_call (or <server>__<tool> on /s/<code>/mcp). Prefer a dedicated MCP server over clicking the GUI.
 5. Operations that take longer than ~45 s return "Still running (job X)": call wait_job with that id. Raise timeout_s on mcp_start / mcp_call / run for installs and renders.
 6. The network may be slow: take screenshots only when needed (monitor=N crops to one screen), avoid huge command output.
-7. The user watches the screen: make your work visible. Do windowing with the mouse (drag a title bar to move a window, drag an edge or corner to resize, click the minimise / maximise / close buttons, click taskbar icons to open or hide an app) instead of keyboard shortcuts or commands when a mouse action exists. When you read or check something, use move to glide the pointer to the text you are reading first (like a person following a line with the cursor). Skip this for background work (files, commands, MCP calls).
+7. The user watches the screen: make your work visible. Do windowing with the mouse (drag a title bar to move a window, drag an edge or corner to resize, click the minimise / maximise / close buttons, click taskbar icons to open or hide an app) instead of keyboard shortcuts or commands when a mouse action exists. When you read something on the screen, use trace under the line you are reading (x,y = start of the text, x2,y2 = its end, a few px below the baseline), and move to point at important details before you act on them: the user sees what you are looking at. Skip this for background work (files, commands, MCP calls).
 8. Talk to the user while you work. At the start say whether the connection worked (list_sessions, sysinfo) and that the friend can end the session at any time with Esc. Before a group of actions say in one short line what you are going to do, afterwards whether it worked. Bundle small GUI steps (move + click, click + type, drag, scroll) into ONE actions call so the friend confirms once instead of per step. If any call comes back "ended", "denied", "Agent left" or "No such session": stop, do not retry, tell the operator.
 9. The session survives internet loss, VPN changes and reboots (the user chose to keep it): it comes back by itself with the same code. If a call says the PC is offline or paused, do not start over: wait_online, then read session_log (it holds the network diagnosis and what the agent already tried) and agent_log, and continue where you stopped. Only the user ending the session in their console ends it.
 10. Android phones (os "Android ..."): only screenshot, click (a tap; button=right is a long press), drag (a swipe; hold=true for drag and drop), scroll, type_text (into the focused field: tap it first), press_key (home, back, recents, notifications, quick_settings, enter, backspace, volume_up, volume_down, power, lock, screenshot), start_process (command = app name, package or link), actions and sysinfo exist. There is no shell, no files and no MCP bridge. Coordinates are screenshot pixels; the friend can end the session by tapping the label at the top of the screen.
@@ -522,7 +524,7 @@ button{cursor:pointer}button:hover{background:#22304d}button.on{background:#2e7d
 <div id=main><div id=scr><canvas id=cv width=16 height=9></canvas></div><div id=log></div></div>
 <div id=kb><input id=txt autocomplete=off><button id=send></button><button data-k="enter">Enter</button><button data-k="backspace">⌫</button><button data-k="tab">Tab</button><button data-k="esc">Esc</button><button data-k="up">↑</button><button data-k="down">↓</button><button data-k="left">←</button><button data-k="right">→</button>${android ? '<button data-k="back">Back</button><button data-k="home">Home</button><button data-k="recents">Recents</button>' : ''}</div>
 <script>
-const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён',take:'Управлять сам',give:'Вернуть помощнику',hint:'Вы управляете: клик, перетаскивание, колесо. Помощник ждёт.',send:'Ввод',ph:'текст (Enter — ввести и нажать Enter)'}:{live:'Live',wait:'Waiting for a frame…',end:'Session ended',take:'Take control',give:'Give back to the helper',hint:'You are in control: click, drag, wheel. The helper waits.',send:'Type',ph:'text (Enter = type it and press Enter)'};
+const ru=(navigator.language||'').startsWith('ru'),L=ru?{off:'Устройство не на связи: ждём, пока оно вернётся',paused:'Пауза на устройстве',live:'Идёт сеанс',wait:'Ожидание кадра…',end:'Сеанс завершён',take:'Управлять сам',give:'Вернуть помощнику',hint:'Вы управляете: клик, перетаскивание, колесо. Помощник ждёт.',send:'Ввод',ph:'текст (Enter — ввести и нажать Enter)'}:{off:'The device is offline: waiting for it to come back',paused:'Paused on the device',live:'Live',wait:'Waiting for a frame…',end:'Session ended',take:'Take control',give:'Give back to the helper',hint:'You are in control: click, drag, wheel. The helper waits.',send:'Type',ph:'text (Enter = type it and press Enter)'};
 const $=id=>document.getElementById(id),dot=$('dot'),st=$('st'),cv=$('cv'),g=cv.getContext('2d'),log=$('log'),kb=$('kb'),txt=$('txt');
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
@@ -535,7 +537,7 @@ async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_
   if(my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
    meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};dot.className='on';st.textContent=L.live+' · '+Math.round(b.size/1024)+' KB'}
   bmp.close()}
- else{dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1200))}}
+ else{let m='';try{m=(await r.json()).error||''}catch(_){}dot.className='';st.textContent=/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait;await new Promise(x=>setTimeout(x,1200))}}
  catch(e){dot.className='';st.textContent=L.wait;await new Promise(x=>setTimeout(x,1500))}}
 async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}dot.className='';st.textContent=L.end}
 lane();setTimeout(lane,350);   // two frames in flight: the helper's agent never waits for the browser, so the picture keeps moving

@@ -62,6 +62,24 @@ namespace V__BUILD__ {
       return null;
     }
   }
+  public static class Kb {   // typing as real Unicode key strokes: down and up in one call (no auto-repeat doubles under load), any keyboard layout
+    [StructLayout(LayoutKind.Sequential)] struct KI { public ushort vk, scan; public uint flags, time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Sequential)] struct MI { public int dx, dy; public uint data, flags, time; public IntPtr extra; }
+    [StructLayout(LayoutKind.Explicit)] struct U { [FieldOffset(0)] public MI m; [FieldOffset(0)] public KI k; }
+    [StructLayout(LayoutKind.Sequential)] struct IN { public uint type; public U u; }
+    [DllImport("user32.dll")] static extern uint SendInput(uint n, IN[] i, int size);
+    static IN K(ushort vk, ushort scan, uint flags) { var x = new IN(); x.type = 1; x.u.k = new KI { vk = vk, scan = scan, flags = flags }; return x; }
+    public static void Type(string s) {
+      foreach (char c in s) {
+        IN[] ev;
+        if (c == (char)10) ev = new[] { K(0x0D, 0, 0), K(0x0D, 0, 2) };
+        else if (c == (char)9) ev = new[] { K(0x09, 0, 0), K(0x09, 0, 2) };
+        else if (c == (char)13) continue;
+        else ev = new[] { K(0, c, 4), K(0, c, 4 | 2) };
+        SendInput((uint)ev.Length, ev, Marshal.SizeOf(typeof(IN)));
+      }
+    }
+  }
   public static class Unglow {   // the edge glow is a known translucent layer: take it out of a screenshot by arithmetic instead of hiding it (no blinking)
     public static void Run(byte[] px, int w, int h, int cx, int cy, int[] mons, int s, int[] cols) {
       var a8 = new int[s];
@@ -302,9 +320,7 @@ function Do-TypeText($a) {
     for ($i = 0; $i -lt $t.Length; $i += $step) {
         Pin-Caret
         $chunk = $t.Substring($i, [Math]::Min($step, $t.Length - $i))
-        # SendKeys treats + ^ % ~ ( ) { } [ ] specially: wrap each in braces
-        $esc = [regex]::Replace($chunk, '[+^%~(){}\[\]]', '{$0}') -replace "`n", '{ENTER}'
-        [Windows.Forms.SendKeys]::SendWait($esc)
+        [V__BUILD__.Kb]::Type($chunk)
         if ($t.Length -gt 1) { Start-Sleep -Milliseconds 18 }
     }
     Pin-Caret

@@ -61,7 +61,7 @@ class HelperService : AccessibilityService() {
     override fun onServiceConnected() {
         Crash.install(this)
         inst = this; fx = Fx(this); phase = if (running) phase else "ready" }
-    override fun onAccessibilityEvent(e: AccessibilityEvent?) { if (e?.packageName?.toString() != packageName) lastEventAt = SystemClock.uptimeMillis() }   // our own label is not a screen change
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) { if (e == null) return; if (e.packageName?.toString() != packageName || e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || rootInActiveWindow?.packageName?.toString() == packageName) lastEventAt = SystemClock.uptimeMillis() }   // our own label is not a screen change
     override fun onInterrupt() { }
     override fun onDestroy() { endSession(); inst = null; phase = "off"; super.onDestroy() }
 
@@ -279,6 +279,7 @@ class HelperService : AccessibilityService() {
         "task_done" -> { phase = "done"; opSeen = false; lastOpAt = 0; fx.resetClock(); fx.setState("done"); ok() }
         "move" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); ok() }
         "watch" -> watch(a)
+        "focus_window" -> { val p = a.optString("process", a.optString("title", "")); if (p.isBlank()) ok("on a phone the app in front is: " + (rootInActiveWindow?.packageName ?: "?")) else { launch(p); ok("brought to the front: $p") } }
         "trace" -> { fx.active(); fx.glideBlocking(px(a, "x"), py(a, "y")); Thread.sleep(140); fx.glideBlocking(px(a, "x2"), py(a, "y2")); ok() }   // read along a line
         "drag" -> { drag(a); ok() }
         "scroll" -> { scroll(a); ok() }

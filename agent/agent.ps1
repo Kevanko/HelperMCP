@@ -357,6 +357,16 @@ function Do-Watch($a) {
     $sum = if (-not $moving) { "nothing moved during $sec s" } elseif ($lastChange -lt $sec - 2 / $fps) { "changes in $moving of $($n - 1) frames, settled after $([Math]::Round($lastChange, 1)) s" } else { "still changing at the end ($moving of $($n - 1) frames changed)" }
     @{ jpeg = $ms.ToArray(); mime = 'image/jpeg'; text = "$n frames over $sec s, $sum. Change per frame (%): $($changes -join ', ')" }
 }
+function Do-FocusWindow($a) {
+    $wins = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | Select-Object Id, ProcessName, MainWindowTitle, MainWindowHandle)
+    if (-not $a.title -and -not $a.process) { return @{ text = 'open windows: ' + (($wins | ForEach-Object { "$($_.ProcessName): $($_.MainWindowTitle)" }) -join ' | ') } }
+    $w = $wins | Where-Object { ($a.process -and $_.ProcessName -like "*$($a.process)*") -or ($a.title -and $_.MainWindowTitle -like "*$($a.title)*") } | Select-Object -First 1
+    if (-not $w) { throw "No such window. Open windows: $((($wins | ForEach-Object { "$($_.ProcessName): $($_.MainWindowTitle)" }) -join ' | '))" }
+    $sh = New-Object -ComObject WScript.Shell; [void]$sh.AppActivate([int]$w.Id); Start-Sleep -Milliseconds 250
+    $ok = [H.U__BUILD__]::GetForegroundWindow() -eq [IntPtr]$w.MainWindowHandle
+    if ($ok) { $script:AiFg = [IntPtr]$w.MainWindowHandle; $script:AiAt = [DateTime]::UtcNow; if (-not $script:AiPos) { $script:AiPos = [Windows.Forms.Cursor]::Position } }
+    @{ text = $(if ($ok) { "focused: $($w.ProcessName): $($w.MainWindowTitle)" } else { "asked Windows to bring '$($w.MainWindowTitle)' to the front, but another window still has the focus: click its title bar instead" }) }
+}
 function Do-Trace($a) {   # read along: the pointer goes to the start of the line, then slides under it at reading pace (no click)
     Overlay-Send 'active'; $t1 = Target $a; $t2 = Target $a 'x2' 'y2'
     Glide $t1[0] $t1[1] $null; Start-Sleep -Milliseconds 140
@@ -1374,7 +1384,7 @@ function Process-Command($cmd) {
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name

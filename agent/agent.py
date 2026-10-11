@@ -252,6 +252,23 @@ def watch(a):
     return {"jpeg": bytes(buf), "mime": "image/jpeg", "text": f"{n} frames over {sec} s (left to right, top to bottom), {summ}. Change per frame (%): {', '.join(map(str, changes))}"}
 
 
+def focus_window(a):
+    """bring a window to the front by title or process name through the window manager (wmctrl), without clicking"""
+    if not shutil.which("wmctrl"): raise RuntimeError("wmctrl is not installed here: click the window's title bar instead (or run: sudo apt install wmctrl)")
+    rows = subprocess.run(["wmctrl", "-lp"], capture_output=True, text=True).stdout.splitlines()
+    if not a.get("title") and not a.get("process"): return {"text": "open windows: " + " | ".join(r.split(None, 4)[-1] for r in rows if len(r.split(None, 4)) == 5)}
+    want = (a.get("title") or "").lower()
+    for r in rows:
+        p = r.split(None, 4)
+        if len(p) < 5: continue
+        name = ""
+        try: name = open(f"/proc/{p[2]}/comm").read().strip()
+        except Exception: pass
+        if (want and want in p[4].lower()) or (a.get("process") and a["process"].lower() in name.lower()):
+            subprocess.run(["wmctrl", "-ia", p[0]]); time.sleep(0.25); return {"text": "focused: " + p[4]}
+    raise RuntimeError("No such window. Open windows: " + " | ".join(r.split(None, 4)[-1] for r in rows if len(r.split(None, 4)) == 5))
+
+
 def trace(a):
     """read along: to the start of the line, then slide under it at reading pace (no click)"""
     xlib(); overlay_send("active"); x1, y1 = _target(a); x2, y2 = _target(a, "x2", "y2")
@@ -1555,7 +1572,7 @@ def hold(a):
     PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
 def task_done(a):
     PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
-TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch)
+TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window)
 META = {"look", "hold", "task_done"}
 
 

@@ -94,6 +94,11 @@ async function aiShot(code, a) {
   if (d && d.h) { s.shotHash = d.h; s.shotKey = key; }
   return d;
 }
+function makeViewer(c) {
+  const token = crypto.randomBytes(18).toString('hex'), ctl = crypto.randomBytes(12).toString('hex');
+  viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
+  return { watch: `${lastBase}/v/${token}`, control: `${lastBase}/v/${token}#c=${ctl}` };
+}
 const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
@@ -349,6 +354,8 @@ const tools = [
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
   { name: 'click', agent: true, description: 'Move the mouse to (x,y) in screenshot coordinates and click.',
     props: { x: num('x'), y: num('y'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
+  { name: 'focus_window', agent: true, description: 'Bring a window to the front by a part of its title or by its process name, through the system (no clicking). Use it before typing or pressing keys whenever the right window may not have the focus: safer than clicking on the window. Without arguments it lists the open windows.',
+    props: { title: str('part of the window title, any case'), process: str('process name, e.g. notepad, chrome, telegram') } },
   { name: 'trace', agent: true, description: 'Read along: the pointer goes to (x,y) and slides slowly under a line of text to (x2,y2), no click, like a person following text with the cursor. Use it whenever you read something on the screen or point the user at an important detail, so they see what you are looking at.',
     props: { x: { type: 'number' }, y: { type: 'number' }, x2: { type: 'number' }, y2: { type: 'number' } }, required: ['x', 'y', 'x2', 'y2'] },
   { name: 'move', agent: true, description: 'Glide the mouse pointer to (x,y) in screenshot coordinates without clicking (hover, open menus that open on hover).',
@@ -392,10 +399,8 @@ const tools = [
     run: async (code) => {
       const c = code.toUpperCase();
       if (!sessions.has(c)) throw new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`);
-      const token = crypto.randomBytes(18).toString('hex');
-      const ctl = crypto.randomBytes(12).toString('hex');
-      viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
-      return { text: `Watch (view only, safe to share): ${lastBase}/v/${token}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${lastBase}/v/${token}#c=${ctl}` };
+      const l = makeViewer(c);
+      return { text: `Watch (view only, safe to share): ${l.watch}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${l.control}` };
     } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
     run: async (code) => { await call(code, 'bye').catch(() => {}); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },
@@ -414,7 +419,7 @@ const fmt = (d) => {
 // fixed = session code for /s/<code>/mcp (tools then have no "session" argument and child tools appear as <server>__<tool>)
 const INSTRUCTIONS = `You are connected to a REMOTE computer (a friend's PC or server) through HelperMCP. Work on it as if it were your own machine.
 Workflow for any task:
-1. Look first: sysinfo, then screenshot (what the user sees). Right after connecting call open_viewer and give the operator the Control link at once; if you can run commands on the operator's own machine, open it in their browser (Windows: start "" "<link>"; macOS: open; Linux: xdg-open). Then set_look: a colour you like (once) and a short note of what you are doing; keep the note current.
+1. Look first: sysinfo, then screenshot (what the user sees). RULE: the moment you start working on a session, open the live view for the operator (the first answer of a session carries its link; open_viewer gives a new one) and give the operator the Control link at once; if you can run commands on the operator's own machine, open it in their browser (Windows: start "" "<link>"; macOS: open; Linux: xdg-open). Then set_look: a colour you like (once) and a short note of what you are doing; keep the note current.
 2. Need an application or MCP server (Blender, Unity, Substance, a browser, ...)? First call recipe (no name = list; "blender" and the generic "any-app" exist). Check whether it is installed (run: Get-Command / where / which / winget list / registry / apt), install it if missing (winget install -e --id ..., apt/flatpak; an installer that needs administrator rights shows a UAC prompt the user must accept: tell them), then continue.
 3. GUI apps and anything long-lived: start_process (detached, keeps running). Do not use run for them.
 4. MCP servers: mcp_start (command npx / uvx / python / an exe). Portable Node and uv are fetched automatically when missing. command="playwright" opens a real visible browser with sound. Then mcp_call (or <server>__<tool> on /s/<code>/mcp). Prefer a dedicated MCP server over clicking the GUI.
@@ -428,7 +433,8 @@ Workflow for any task:
 12. If you tapped or opened the wrong thing and had to redo it, call report_miss (what you wanted, what happened, what worked). A tap result starting with MISS means nothing tappable was under the finger: read the hint and tap the suggested spot. When the job is finished call task_done. If you must stop for a while (token or rate limit, a long break) call hold first, so the phone stays awake and the session stays open. On a phone you may also call set_look once at the start (a colour you like) and keep its note line current.
 13. Work in stages: when you know the steps, call plan (titles + a colour per stage) and set_look {stage} as you move on; keep set_look {note} current.
 14. Save tokens and time: do not take a screenshot after every step. Every click, typing and key press reports what changed on the screen; trust it. Take a screenshot when you need to see something new; use region to read small things; an unchanged screen costs one line. Use watch when something happens over time.
-15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.`;
+15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.
+16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -473,9 +479,13 @@ function buildMcp(fixed) {
       if (!t) throw new Error(`Unknown tool ${name}`);
       if (t.local) return fmt(await t.run(a));
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
-      if (t.run) return fmt(await t.run(session, a));
-      if (name === 'screenshot') return fmt(await aiShot(session, a));
-      return fmt(await callJob(session, name, a, t.ms?.(a)));
+      const out = fmt(t.run ? await t.run(session, a) : name === 'screenshot' ? await aiShot(session, a) : await callJob(session, name, a, t.ms?.(a)));
+      const sx = sessions.get(String(session).toUpperCase());
+      if (sx && !sx.viewerShown && name !== 'open_viewer' && name !== 'end_session') {   // the first answer carries the live view: the operator gets it right away
+        sx.viewerShown = true; const l = makeViewer(String(session).toUpperCase());
+        out.content.push({ type: 'text', text: `LIVE VIEW of this session for the operator: open it in their browser now if you can run commands on their machine (Windows: start "" "${l.control}"; macOS: open; Linux: xdg-open), otherwise give them this link at once: ${l.control}` });
+      }
+      return out;
     } catch (e) {
       return { isError: true, content: [{ type: 'text', text: e.message }] };
     }
@@ -814,7 +824,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         const ct = req.headers['content-type'] || '';
         if (ct.startsWith('image/')) {   // screenshots arrive as raw JPEG: no base64 inflation
           const buf = await bodyBuf(req, 25_000_000);
-          let meta = {}; try { meta = JSON.parse(decodeURIComponent(req.headers['x-result-meta'] || '{}')); } catch { /* optional */ }
+          let meta = {}; try { meta = JSON.parse(decodeURIComponent((req.headers['x-result-meta'] || '{}').replace(/\+/g, '%20'))); } catch { /* optional */ }
           r = { id: req.headers['x-result-id'], ok: true, data: { ...meta, jpeg: buf, mime: ct } };
         } else r = JSON.parse(await body(req, 25_000_000));
         const pend = s.pending.get(r.id);

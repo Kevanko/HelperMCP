@@ -80,6 +80,11 @@ function connectText() {
     `  ${url}/`,
     '',
     M(t('Ключ оператора даёт полный доступ ко всем подключённым устройствам. Не публикуйте его.', 'The operator key gives full access to every connected device. Keep it secret.')),
+    '',
+    G(t('Проще всего: скопируйте текст ниже и отправьте своей нейросети (Codex, Claude Code, Cursor…), она подключится сама:', 'Easiest: copy the text below and send it to your AI (Codex, Claude Code, Cursor…), it connects itself:')),
+    '',
+    t(`Подключи себе MCP-сервер удалённой помощи HelperMCP. Тип: streamable HTTP. Имя: helper. URL: ${url}/mcp. Заголовок: Authorization: Bearer ${KEY}. Если ты Codex — допиши в ~/.codex/config.toml (на Windows %USERPROFILE%\\.codex\\config.toml) раздел [mcp_servers.helper] с url = "${url}/mcp" и http_headers = { "Authorization" = "Bearer ${KEY}" }. Если ты Claude Code — выполни: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Другой клиент — добавь сервер в его настройки MCP так же. Не публикуй ключ. Потом скажи мне, что нужно перезапустить сессию (если требуется), и проверь подключение инструментом list_sessions. Когда я дам код с экрана друга, работай по инструкциям сервера и сразу открой мне живой просмотр.`,
+      `Connect the HelperMCP remote-help MCP server to yourself. Type: streamable HTTP. Name: helper. URL: ${url}/mcp. Header: Authorization: Bearer ${KEY}. If you are Codex, append to ~/.codex/config.toml (on Windows %USERPROFILE%\\.codex\\config.toml) a [mcp_servers.helper] table with url = "${url}/mcp" and http_headers = { "Authorization" = "Bearer ${KEY}" }. If you are Claude Code, run: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Any other client: add the server to its MCP settings the same way. Never publish the key. Then tell me if the session has to be restarted, and check the connection with the list_sessions tool. When I give you a code from a friend's screen, follow the server's instructions and open the live view for me right away.`),
   ].join('\n');
 }
 

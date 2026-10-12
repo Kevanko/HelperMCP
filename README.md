@@ -27,7 +27,7 @@ Needs a Linux server with a domain pointing at it (ports 80/443 free). It instal
 
 Already have nginx/certbot? Skip Caddy: set `TLS_CERT`/`TLS_KEY` in `.env` (the relay serves TLS itself and reloads renewed certificates), or put the relay behind your proxy and set `PUBLIC_URL`. See `.env.example`.
 
-At the end it prints how to connect your AI: the `claude mcp add …` command for Claude Code, two one-liners for Codex (`~/.codex/config.toml`, Linux/macOS and Windows) and the plain URL + header for any other MCP client. `helpermcp connect` prints them again.
+At the end it prints how to connect your AI: the `claude mcp add …` command for Claude Code, two one-liners for Codex (`~/.codex/config.toml`, Linux/macOS and Windows) and the plain URL + header for any other MCP client. The last block is a ready prompt: paste it into your AI and it adds the server itself. `helpermcp connect` prints all of it again.
 
 ## 2. Friend's side
 

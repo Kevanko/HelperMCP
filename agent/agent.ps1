@@ -1,6 +1,9 @@
 # HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
 #   [Net.ServicePointManager]::SecurityProtocol=3072; irm RELAY/h | iex
 $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session
+# Windows PowerShell 5.1 started from PowerShell 7 inherits a module path pointing at 7's modules and then fails to load even
+# built-in ones (ConvertTo-SecureString, ...): use 5.1's own module folders.
+if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'PowerShell[\\/]7') { $env:PSModulePath = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'), (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'), (Join-Path $PSHOME 'Modules')) -join ';' }
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }

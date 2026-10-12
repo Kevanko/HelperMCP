@@ -1,0 +1,5 @@
+renders/
+snapshots/
+.hyperframes/
+node_modules/
+.thumbnails/

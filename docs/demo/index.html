@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1280, height=720">
+    <title>HelperMCP demo</title>
+    <script src="vendor/gsap.min.js"></script>
+    <style>
+      body { margin: 0; background: #020a06; color: #d6ffe4; font-family: "JetBrains Mono", monospace; }
+      #root { position: relative; width: 100%; height: 100%; overflow: hidden; background: #020a06; }
+      #bg-glow { position: absolute; left: 50%; top: 45%; width: 1100px; height: 700px; margin: -350px 0 0 -550px; border-radius: 50%; background: radial-gradient(closest-side, rgba(56, 255, 122, 0.16), rgba(56, 255, 122, 0) 70%); }
+      #bg-grid { position: absolute; inset: 0; background-image: linear-gradient(rgba(56, 255, 122, 0.07) 1px, transparent 1px), linear-gradient(90deg, rgba(56, 255, 122, 0.07) 1px, transparent 1px); background-size: 64px 64px; }
+      #scan { position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(56, 255, 122, 0.045) 0 1px, transparent 1px 3px); }
+      .scene { position: absolute; inset: 0; }
+    </style>
+  </head>
+  <body>
+    <div data-hf-id="hf-0bb2" id="root" data-composition-id="main" data-start="0" data-width="1280" data-height="720" data-duration="14">
+      <div data-hf-id="hf-pgi3" id="bg-glow" class="clip glow" data-start="0" data-duration="14" data-track-index="0"></div>
+      <div data-hf-id="hf-ysfn" id="bg-grid" class="clip grid" data-start="0" data-duration="14" data-track-index="0"></div>
+
+      <div data-hf-id="hf-t1do" id="s1-terminal" class="scene" data-composition-id="s1-terminal" data-composition-src="compositions/s1-terminal.html" data-start="0" data-duration="3.2" data-track-index="1" data-width="1280" data-height="720"></div>
+      <div data-hf-id="hf-h2m3" id="s2-chat" class="scene" data-composition-id="s2-chat" data-composition-src="compositions/s2-chat.html" data-start="3.2" data-duration="2.2" data-track-index="1" data-width="1280" data-height="720"></div>
+      <div data-hf-id="hf-okkz" id="s3-agent" class="scene" data-composition-id="s3-agent" data-composition-src="compositions/s3-agent.html" data-start="5.4" data-duration="2.6" data-track-index="1" data-width="1280" data-height="720"></div>
+      <div data-hf-id="hf-picm" id="s4-remote" class="scene" data-composition-id="s4-remote" data-composition-src="compositions/s4-remote.html" data-start="8" data-duration="4.4" data-track-index="1" data-width="1280" data-height="720"></div>
+      <div data-hf-id="hf-36c4" id="s5-end" class="scene" data-composition-id="s5-end" data-composition-src="compositions/s5-end.html" data-start="12.4" data-duration="1.6" data-track-index="1" data-width="1280" data-height="720"></div>
+
+      <div data-hf-id="hf-414p" id="scan" class="clip" data-start="0" data-duration="14" data-track-index="9"></div>
+    </div>
+    <script>
+      const tl = gsap.timeline({ paused: true });
+            // the background stays still: in a GIF a moving full-frame background would cost every frame
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

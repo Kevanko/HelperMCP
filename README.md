@@ -1,17 +1,46 @@
+<div align="center">
+
 # HelperMCP
 
-Remote help for friends' computers, driven by any AI that speaks MCP (Claude, Cursor, Codex, your own agent).
+**Remote help for a friend's computer or phone, done by your AI.**
+Your friend runs one line. You give your AI the code. It does the rest, while your friend watches.
 
-A friend opens a link and pastes **one line**; you give your AI the code on their screen; the AI then works on their PC as if it were its own: looks at the screen, runs programs, reads and edits files and configs, and can use **any other MCP server on their PC** (browser, filesystem, …) through the same bridge. Nothing is installed on their side.
+[![MCP](https://img.shields.io/badge/MCP-streamable%20HTTP-38ff7a?labelColor=020a06)](#3-connect-your-ai-once)
+[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-38ff7a?labelColor=020a06)](#2-friends-side)
+[![Linux](https://img.shields.io/badge/Linux-X11-38ff7a?labelColor=020a06)](#2-friends-side)
+[![Android](https://img.shields.io/badge/Android-11%2B-38ff7a?labelColor=020a06)](#android-phone)
+[![Self-hosted](https://img.shields.io/badge/relay-self--hosted-38ff7a?labelColor=020a06)](#1-install-the-relay-on-your-server-one-command)
+
+<img src="docs/demo.gif" alt="A friend runs one line and gets a code, sends it to you, you ask your AI, and it installs Blender on the friend's PC while a plan ticks off" width="900">
 
 *Русская версия ниже / Russian version below.*
 
+</div>
+
+## How it works
+
+| | Who | What |
+|---|---|---|
+| **1** | your friend | opens your link and runs **one line** (Windows / Linux) or the app (Android), gets a session code |
+| **2** | you | tell your AI: *"help my friend, code 7FBV-HUVJ: …"* |
+| **3** | your AI | works on their machine over MCP: looks at the screen, clicks, types, runs programs, edits files, uses other MCP servers there; you get a live view to watch or take over |
+
+## What makes it pleasant
+
+- **One line, nothing installed on a PC.** The agent runs from memory and leaves with the window. Android uses a small app.
+- **Your friend always sees what happens.** A glowing edge, a label with the current step and a clock, the AI's own pointer; **Esc** opens pause / continue / end.
+- **A plan with stages.** The AI splits the job into steps with their own colours; the label and the live view show where it is.
+- **It checks itself.** Every click, typing and key press reports what changed on the screen, or a loud *NO CHANGE*, so the AI stops instead of typing into the wrong window. `watch` films a few seconds when something moves.
+- **A live view you can drive.** A view link to watch, a control link to click, type and take over from the AI, then hand back.
+- **Survives real life.** Internet loss, VPN switches and reboots keep the session and the code; outages are diagnosed and logged.
+- **Your server, your data.** The relay is self-hosted, the state is encrypted, files and sessions are deleted at the end.
+
 ```
- friend's PC                relay (your server)               you
+ friend's PC / phone        relay (your server)               you
 ┌────────────┐  HTTPS   ┌──────────────────────┐   MCP    ┌─────────────┐
 │ agent      │ ───────► │ /a/*  agent API      │ ◄─────── │ any AI with │
-│ (PS / py)  │ long-poll│ /mcp, /s/<code>/mcp  │          │ MCP client  │
-│  └ child MCP servers (Playwright, …)         │          └─────────────┘
+│ (PS / py / │ long-poll│ /mcp, /s/<code>/mcp  │          │ MCP client  │
+│  Android)  │          │ /v/…  live view      │          └─────────────┘
 └────────────┘          └──────────────────────┘
 ```
 
@@ -160,6 +189,11 @@ MIT
 ---
 
 # HelperMCP (по-русски)
+
+<p align="center"><img src="docs/demo.gif" alt="Демо: друг запускает одну строку, присылает код, ты просишь ИИ, и он ставит Blender на ПК друга" width="900"></p>
+
+**Как это работает:** друг запускает **одну строку** (Windows / Linux) или приложение (Android) и получает код → ты пишешь своей ИИ «помоги другу, код 7FBV-HUVJ: …» → ИИ работает на его устройстве через MCP, а ты смотришь живой просмотр и можешь перехватить управление.
+Демо-ролик собран в `docs/demo` (HyperFrames): `npx hyperframes preview` в этой папке, чтобы поправить, `npx hyperframes render`, чтобы пересобрать.
 
 Удалённая помощь друзьям через любую ИИ с поддержкой MCP (Claude, Cursor, Codex, свой агент). Друг открывает ссылку и вставляет **одну строку**, ты даёшь ИИ код с его экрана, и она работает на его ПК как на своём: смотрит экран, запускает программы, правит файлы и конфиги игр и может пользоваться **любыми другими MCP-серверами на его ПК** (браузер и т.д.) через тот же мост. Ничего устанавливать не нужно.
 

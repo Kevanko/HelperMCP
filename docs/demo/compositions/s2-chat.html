@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="UTF-8"></head>
+  <body>
+    <template>
+      <style>
+        #root { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: "JetBrains Mono", monospace; color: #d6ffe4; }
+        #s2-cap { position: absolute; left: 64px; top: 46px; font-size: 22px; color: #7fae8f; }
+        #s2-cap b { color: #38ff7a; font-weight: 700; }
+        #s2-chat { width: 820px; border: 2px solid #16482b; border-radius: 14px; background: #07140c; overflow: hidden; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6); }
+        #s2-head { display: flex; align-items: center; gap: 16px; padding: 16px 24px; border-bottom: 2px solid #16482b; background: #0a1d12; font-size: 22px; }
+        #s2-ava { width: 44px; height: 44px; border-radius: 50%; background: #2bb55a; color: #00150a; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 22px; }
+        #s2-head small { display: block; color: #7fae8f; font-size: 18px; }
+        #s2-list { padding: 26px 26px 30px; display: flex; flex-direction: column; gap: 16px; }
+        .s2-msg { max-width: 600px; padding: 14px 20px; border-radius: 16px; font-size: 24px; line-height: 1.4; }
+        .s2-in { align-self: flex-start; background: #0f2a1a; border: 2px solid #16482b; border-bottom-left-radius: 4px; }
+        .s2-out { align-self: flex-end; background: #38ff7a; color: #00150a; border-bottom-right-radius: 4px; font-weight: 700; }
+        .s2-code { color: #38ff7a; font-weight: 700; letter-spacing: 2px; }
+      </style>
+      <div data-hf-id="hf-7hn4" id="root" data-composition-id="s2-chat" data-width="1280" data-height="720">
+        <div data-hf-id="hf-jckm" id="s2-cap">2. they send you <b data-hf-id="hf-o8ip">the code</b></div>
+        <div data-hf-id="hf-wmh5" id="s2-chat">
+          <div data-hf-id="hf-f9ll" id="s2-head"><div data-hf-id="hf-e9e2" id="s2-ava">A</div><div data-hf-id="hf-srem">Anna<small data-hf-id="hf-josf">online</small></div></div>
+          <div data-hf-id="hf-ktir" id="s2-list">
+            <div data-hf-id="hf-a137" class="s2-msg s2-in" id="s2-m1">Blender won't install, can you help?</div>
+            <div data-hf-id="hf-ajw7" class="s2-msg s2-in" id="s2-m2">here's the code: <span data-hf-id="hf-mvq7" class="s2-code">7FBV-HUVJ</span></div>
+            <div data-hf-id="hf-doz7" class="s2-msg s2-out" id="s2-m3">on it, my AI will do it</div>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function () {
+          const tl = gsap.timeline({ paused: true });
+          tl.fromTo("#s2-cap", { opacity: 0, x: -24 }, { opacity: 1, x: 0, duration: 0.35, ease: "power3.out" }, 0);
+          tl.fromTo("#s2-chat", { opacity: 0, y: 30 }, { opacity: 1, y: 0, duration: 0.35, ease: "expo.out" }, 0);
+          tl.fromTo("#s2-m1", { opacity: 0, y: 20, scale: 0.9 }, { opacity: 1, y: 0, scale: 1, duration: 0.35, ease: "back.out(1.8)" }, 0.25);
+          tl.fromTo("#s2-m2", { opacity: 0, y: 20, scale: 0.9 }, { opacity: 1, y: 0, scale: 1, duration: 0.35, ease: "back.out(1.8)" }, 0.7);
+          tl.fromTo("#s2-m3", { opacity: 0, x: 30 }, { opacity: 1, x: 0, duration: 0.35, ease: "power3.out" }, 1.25);
+          tl.to("#root", { opacity: 0, duration: 0.2, ease: "power2.in" }, 2.0);
+          window.__timelines["s2-chat"] = tl;
+        })();
+      </script>
+    </template>
+  </body>
+</html>

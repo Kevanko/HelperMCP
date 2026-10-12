@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="UTF-8"></head>
+  <body>
+    <template>
+      <style>
+        #root { position: absolute; inset: 0; font-family: "JetBrains Mono", monospace; color: #d6ffe4; }
+        #s4-desk { position: absolute; inset: 0; background: radial-gradient(ellipse at 30% 30%, #12301f 0%, #06120b 55%, #030a06 100%); }
+        #s4-cap { position: absolute; left: 64px; top: 92px; font-size: 22px; color: #7fae8f; }
+        #s4-cap b { color: #38ff7a; font-weight: 700; }
+        .s4-glow { position: absolute; inset: 0; pointer-events: none; }
+        #s4-g1 { box-shadow: inset 0 0 0 3px rgba(56, 255, 122, 0.9), inset 0 0 70px rgba(56, 255, 122, 0.55); }
+        #s4-g2 { box-shadow: inset 0 0 0 3px rgba(76, 141, 255, 0.95), inset 0 0 70px rgba(76, 141, 255, 0.55); }
+        #s4-g3 { box-shadow: inset 0 0 0 3px rgba(179, 136, 255, 0.95), inset 0 0 70px rgba(179, 136, 255, 0.55); }
+        #s4-pillwrap { position: absolute; left: 0; right: 0; top: 18px; display: flex; justify-content: center; }
+        #s4-pill { display: flex; align-items: center; gap: 14px; padding: 9px 22px; border-radius: 24px; background: rgba(4, 14, 9, 0.92); border: 2px solid #4c8dff; font-size: 21px; font-weight: 700; }
+        #s4-dot { width: 12px; height: 12px; border-radius: 50%; background: #4c8dff; display: block; }
+        #s4-clock { color: #9fb0c8; font-weight: 400; }
+        #s4-plan { position: absolute; right: 44px; top: 150px; width: 330px; padding: 18px 20px; border: 2px solid #16482b; border-radius: 12px; background: rgba(7, 20, 12, 0.94); }
+        #s4-plan h4 { margin: 0 0 12px; font-size: 18px; color: #7fae8f; font-weight: 400; }
+        .s4-row { display: flex; align-items: center; gap: 12px; font-size: 20px; padding: 6px 0; color: #9fbfab; }
+        .s4-n { width: 28px; height: 28px; border-radius: 50%; border: 2px solid currentColor; display: flex; align-items: center; justify-content: center; font-size: 15px; flex: none; }
+        .s4-chk { width: 28px; height: 28px; border-radius: 50%; background: #38ff7a; color: #00150a; display: flex; align-items: center; justify-content: center; font-size: 17px; font-weight: 700; flex: none; position: absolute; left: 0; top: 0; }
+        .s4-mark { position: relative; width: 28px; height: 28px; flex: none; }
+        #s4-term { position: absolute; left: 90px; top: 190px; width: 780px; height: 340px; border: 2px solid #16482b; border-radius: 12px; background: #050f09; overflow: hidden; box-shadow: 0 30px 70px rgba(0, 0, 0, 0.65); }
+        #s4-tbar { height: 42px; display: flex; align-items: center; padding: 0 18px; border-bottom: 2px solid #16482b; background: #0a1d12; font-size: 18px; color: #7fae8f; }
+        #s4-tbody { padding: 20px 24px; font-size: 22px; line-height: 1.6; }
+        .s4-ps { color: #7fae8f; }
+        #s4-cmd { color: #38ff7a; }
+        #s4-bar { margin-top: 18px; width: 700px; height: 18px; border: 2px solid #2bb55a; border-radius: 9px; overflow: hidden; }
+        #s4-fill { width: 100%; height: 100%; background: #38ff7a; transform-origin: left center; }
+        #s4-pct { margin-top: 8px; color: #b7d8c2; font-size: 20px; }
+        #s4-done { margin-top: 6px; color: #38ff7a; font-weight: 700; }
+        #s4-task { position: absolute; left: 0; right: 0; bottom: 0; height: 56px; display: flex; align-items: center; justify-content: center; gap: 26px; background: rgba(3, 10, 6, 0.92); border-top: 2px solid #16482b; }
+        .s4-ico { width: 34px; height: 34px; border-radius: 8px; background: #16482b; display: block; }
+        #s4-ico-term { background: #0a1d12; border: 2px solid #38ff7a; color: #38ff7a; font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+        #s4-ripple { position: absolute; left: 610px; top: 662px; width: 60px; height: 60px; border-radius: 50%; border: 3px solid #4c8dff; }
+        #s4-cursor { position: absolute; left: 0; top: 0; width: 34px; height: 46px; }
+      </style>
+      <div data-hf-id="hf-of4e" id="root" data-composition-id="s4-remote" data-width="1280" data-height="720">
+        <div data-hf-id="hf-dflq" id="s4-desk"></div>
+        <div data-hf-id="hf-wfbn" id="s4-cap">4. the AI works on <b data-hf-id="hf-4th6">Anna's PC</b></div>
+        <div data-hf-id="hf-bvwn" id="s4-term">
+          <div data-hf-id="hf-rpoq" id="s4-tbar">Terminal</div>
+          <div data-hf-id="hf-cf2j" id="s4-tbody">
+            <div data-hf-id="hf-yeow"><span data-hf-id="hf-zjrj" class="s4-ps">PS&gt; </span><span data-hf-id="hf-k6og" id="s4-cmd"></span></div>
+            <div data-hf-id="hf-6v7k" id="s4-bar"><div data-hf-id="hf-e9fe" id="s4-fill"></div></div>
+            <div data-hf-id="hf-2vn6" id="s4-pct">downloading Blender 4.2</div>
+            <div data-hf-id="hf-xhpm" id="s4-done">Successfully installed Blender 4.2</div>
+          </div>
+        </div>
+        <div data-hf-id="hf-jn5c" id="s4-plan">
+          <h4 data-hf-id="hf-6qna">plan</h4>
+          <div data-hf-id="hf-dwdi" class="s4-row" id="s4-r1"><div data-hf-id="hf-sd1h" class="s4-mark"><div data-hf-id="hf-9rvd" class="s4-n" data-layout-allow-overlap="" data-layout-allow-occlusion="">1</div><div data-hf-id="hf-8tfx" class="s4-chk" id="s4-c1" data-layout-allow-overlap="" data-layout-allow-occlusion="">✓</div></div>open a terminal</div>
+          <div data-hf-id="hf-k41h" class="s4-row" id="s4-r2"><div data-hf-id="hf-dffd" class="s4-mark"><div data-hf-id="hf-aysg" class="s4-n" data-layout-allow-overlap="" data-layout-allow-occlusion="">2</div><div data-hf-id="hf-zgvg" class="s4-chk" id="s4-c2" data-layout-allow-overlap="" data-layout-allow-occlusion="">✓</div></div>install Blender</div>
+          <div data-hf-id="hf-dpok" class="s4-row" id="s4-r3"><div data-hf-id="hf-emcg" class="s4-mark"><div data-hf-id="hf-akhf" class="s4-n" data-layout-allow-overlap="" data-layout-allow-occlusion="">3</div><div data-hf-id="hf-q2tr" class="s4-chk" id="s4-c3" data-layout-allow-overlap="" data-layout-allow-occlusion="">✓</div></div>check it runs</div>
+        </div>
+        <div data-hf-id="hf-9d56" id="s4-task"><i data-hf-id="hf-j5kh" class="s4-ico"></i><i data-hf-id="hf-3qp1" class="s4-ico"></i><div data-hf-id="hf-482m" class="s4-ico" id="s4-ico-term">&gt;_</div><i data-hf-id="hf-4xm4" class="s4-ico"></i><i data-hf-id="hf-4jb3" class="s4-ico"></i></div>
+        <div data-hf-id="hf-0bqn" id="s4-ripple"></div>
+        <svg data-hf-id="hf-r37e" id="s4-cursor" viewBox="0 0 22 30"><path data-hf-id="hf-ya3j" d="M1 1 L1 23 L6.5 18 L10 26.5 L13.5 25 L10 17 L17 17 Z" fill="#ffffff" stroke="#4c8dff" stroke-width="1.6" stroke-linejoin="round" /></svg>
+        <div data-hf-id="hf-zgoj" class="s4-glow" id="s4-g1"></div>
+        <div data-hf-id="hf-ol6w" class="s4-glow" id="s4-g2"></div>
+        <div data-hf-id="hf-pcup" class="s4-glow" id="s4-g3"></div>
+        <div data-hf-id="hf-t9cw" id="s4-pillwrap"><div data-hf-id="hf-0z8c" id="s4-pill"><i data-hf-id="hf-bz6y" id="s4-dot"></i><span data-hf-id="hf-v5a6" id="s4-label">1/3 open a terminal</span><span data-hf-id="hf-ysnk" id="s4-clock">00:08</span></div></div>
+      </div>
+      <script>
+        (function () {
+          const tl = gsap.timeline({ paused: true });
+          const $ = (s) => document.querySelector(s);
+          // the desktop and the glow arrive
+          tl.fromTo("#s4-desk", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power1.out" }, 0);
+          tl.fromTo("#s4-cap", { opacity: 0, x: -24 }, { opacity: 1, x: 0, duration: 0.35, ease: "power3.out" }, 0.1);
+          tl.fromTo("#s4-g1", { opacity: 0 }, { opacity: 1, duration: 0.5, ease: "sine.out" }, 0.1);
+          tl.fromTo("#s4-g2", { opacity: 0 }, { opacity: 0, duration: 0.01 }, 0);
+          tl.fromTo("#s4-g3", { opacity: 0 }, { opacity: 0, duration: 0.01 }, 0);
+          tl.fromTo("#s4-pill", { opacity: 0, y: -20 }, { opacity: 1, y: 0, duration: 0.4, ease: "back.out(2)" }, 0.2);
+          tl.fromTo("#s4-plan", { opacity: 0, x: 40 }, { opacity: 1, x: 0, duration: 0.4, ease: "expo.out" }, 0.3);
+          tl.fromTo(["#s4-c1", "#s4-c2", "#s4-c3"], { scale: 0, opacity: 0 }, { scale: 0, opacity: 0, duration: 0.01 }, 0);
+          tl.fromTo("#s4-term", { opacity: 0, scale: 0.7 }, { opacity: 0, scale: 0.7, duration: 0.01 }, 0);
+          tl.fromTo("#s4-ripple", { opacity: 0, scale: 0.2 }, { opacity: 0, scale: 0.2, duration: 0.01 }, 0);
+          // the session clock
+          ["00:08", "00:09", "00:10", "00:11", "00:12"].forEach((c, i) => tl.set("#s4-clock", { textContent: c }, i));
+          // the AI pointer glides to the terminal icon and clicks
+          tl.fromTo("#s4-cursor", { x: 960, y: 330 }, { x: 628, y: 676, duration: 0.75, ease: "power3.inOut" }, 0.3);
+          tl.to("#s4-cursor", { scale: 0.85, duration: 0.08, ease: "power2.in", yoyo: true, repeat: 1 }, 1.05);
+          tl.to("#s4-ripple", { opacity: 1, scale: 1.6, duration: 0.45, ease: "power2.out" }, 1.08);
+          tl.to("#s4-ripple", { opacity: 0, duration: 0.2, ease: "power1.in" }, 1.53);
+          // the terminal opens: stage 1 done, stage 2 starts (its colour)
+          tl.to("#s4-term", { opacity: 1, scale: 1, duration: 0.35, ease: "back.out(1.6)" }, 1.15);
+          tl.to("#s4-c1", { scale: 1, opacity: 1, duration: 0.3, ease: "back.out(3)" }, 1.25);
+          tl.to("#s4-g1", { opacity: 0, duration: 0.4, ease: "sine.inOut" }, 1.3);
+          tl.to("#s4-g2", { opacity: 1, duration: 0.4, ease: "sine.inOut" }, 1.3);
+          tl.set("#s4-label", { textContent: "2/3 install Blender" }, 1.3);
+          tl.to("#s4-cursor", { x: 260, y: 300, duration: 0.5, ease: "power2.inOut" }, 1.35);
+          const cmd = "winget install BlenderFoundation.Blender";
+          const el = $("#s4-cmd");
+          for (let i = 1; i <= cmd.length; i++) tl.set(el, { textContent: cmd.slice(0, i) }, 1.45 + i * 0.022);
+          tl.fromTo("#s4-bar", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 2.4);
+          tl.fromTo("#s4-fill", { scaleX: 0 }, { scaleX: 1, duration: 0.9, ease: "power1.inOut" }, 2.45);
+          tl.fromTo("#s4-pct", { opacity: 0 }, { opacity: 1, duration: 0.2 }, 2.45);
+          tl.fromTo("#s4-done", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.25, ease: "power2.out" }, 3.4);
+          // stage 2 done, stage 3 (its colour), then everything is done
+          tl.to("#s4-c2", { scale: 1, opacity: 1, duration: 0.3, ease: "back.out(3)" }, 3.45);
+          tl.to("#s4-g2", { opacity: 0, duration: 0.3, ease: "sine.inOut" }, 3.45);
+          tl.to("#s4-g3", { opacity: 1, duration: 0.3, ease: "sine.inOut" }, 3.45);
+          tl.set("#s4-label", { textContent: "3/3 check it runs" }, 3.45);
+          tl.to("#s4-c3", { scale: 1, opacity: 1, duration: 0.3, ease: "back.out(3)" }, 3.85);
+          tl.to("#s4-g3", { opacity: 0, duration: 0.3, ease: "sine.inOut" }, 3.85);
+          tl.to("#s4-g1", { opacity: 1, duration: 0.3, ease: "sine.inOut" }, 3.85);
+          tl.set("#s4-label", { textContent: "done: Blender is installed" }, 3.9);
+          tl.to("#s4-pill", { borderColor: "#38ff7a", duration: 0.2 }, 3.9);
+          tl.to("#s4-dot", { backgroundColor: "#38ff7a", duration: 0.2 }, 3.9);
+          tl.to("#root", { opacity: 0, duration: 0.2, ease: "power2.in" }, 4.2);
+          window.__timelines["s4-remote"] = tl;
+        })();
+      </script>
+    </template>
+  </body>
+</html>

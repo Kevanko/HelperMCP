@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="UTF-8"></head>
+  <body>
+    <template>
+      <style>
+        #root { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-family: "JetBrains Mono", monospace; color: #d6ffe4; }
+        #s3-cap { position: absolute; left: 64px; top: 46px; font-size: 22px; color: #7fae8f; }
+        #s3-cap b { color: #38ff7a; font-weight: 700; }
+        #s3-app { width: 960px; border: 2px solid #16482b; border-radius: 14px; background: #07140c; overflow: hidden; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.6); }
+        #s3-head { padding: 16px 24px; border-bottom: 2px solid #16482b; background: #0a1d12; font-size: 20px; color: #7fae8f; display: flex; justify-content: space-between; }
+        #s3-head b { color: #38ff7a; }
+        #s3-log { padding: 22px 28px 6px; min-height: 160px; font-size: 22px; line-height: 1.7; }
+        .s3-l { color: #b7d8c2; }
+        .s3-l b { color: #38ff7a; font-weight: 700; }
+        #s3-box { margin: 10px 24px 24px; display: flex; align-items: center; gap: 16px; padding: 16px 18px; border: 2px solid #2bb55a; border-radius: 12px; background: #010603; }
+        #s3-prompt { flex: 1; font-size: 25px; color: #d6ffe4; min-height: 34px; }
+        #s3-caret { display: inline-block; width: 3px; height: 28px; background: #38ff7a; vertical-align: -5px; margin-left: 2px; }
+        #s3-send { width: 52px; height: 52px; border-radius: 10px; background: #38ff7a; color: #00150a; font-weight: 700; font-size: 28px; display: flex; align-items: center; justify-content: center; }
+      </style>
+      <div data-hf-id="hf-n3cq" id="root" data-composition-id="s3-agent" data-width="1280" data-height="720">
+        <div data-hf-id="hf-v5ov" id="s3-cap">3. you ask <b data-hf-id="hf-kdl8">your AI</b></div>
+        <div data-hf-id="hf-6g55" id="s3-app">
+          <div data-hf-id="hf-ktpi" id="s3-head"><span data-hf-id="hf-c4o1">your AI agent</span><span data-hf-id="hf-cs8a">MCP <b data-hf-id="hf-b1ot">helper</b> connected</span></div>
+          <div data-hf-id="hf-fwh2" id="s3-log">
+            <div data-hf-id="hf-yewj" class="s3-l" id="s3-l1">calling <b data-hf-id="hf-3wpy">sysinfo</b> on 7FBV-HUVJ</div>
+            <div data-hf-id="hf-7opf" class="s3-l" id="s3-l2"><b data-hf-id="hf-05tc">connected</b>: Anna-PC, Windows 11</div>
+            <div data-hf-id="hf-53up" class="s3-l" id="s3-l3">live view opened for you</div>
+          </div>
+          <div data-hf-id="hf-3a3v" id="s3-box"><div data-hf-id="hf-p5gi" id="s3-prompt"><span data-hf-id="hf-wxg8" id="s3-text"></span><span data-hf-id="hf-9xu2" id="s3-caret"></span></div><div data-hf-id="hf-ijpt" id="s3-send">↑</div></div>
+        </div>
+      </div>
+      <script>
+        (function () {
+          const tl = gsap.timeline({ paused: true });
+          const p = "help my friend, code 7FBV-HUVJ: install Blender";
+          tl.fromTo("#s3-cap", { opacity: 0, x: -24 }, { opacity: 1, x: 0, duration: 0.35, ease: "power3.out" }, 0);
+          tl.fromTo("#s3-app", { opacity: 0, scale: 0.96 }, { opacity: 1, scale: 1, duration: 0.35, ease: "expo.out" }, 0);
+          const el = document.querySelector("#s3-text");
+          for (let i = 1; i <= p.length; i++) tl.set(el, { textContent: p.slice(0, i) }, 0.2 + i * 0.024);
+          tl.fromTo("#s3-caret", { opacity: 1 }, { opacity: 0, duration: 0.25, ease: "steps(1)", yoyo: true, repeat: 7 }, 0.2);
+          tl.fromTo("#s3-send", { scale: 1 }, { scale: 0.86, duration: 0.08, ease: "power2.in", yoyo: true, repeat: 1 }, 1.45);
+          tl.set(el, { textContent: "" }, 1.6);
+          tl.fromTo("#s3-l1", { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.2, ease: "power2.out" }, 1.65);
+          tl.fromTo("#s3-l2", { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.2, ease: "power2.out" }, 1.9);
+          tl.fromTo("#s3-l3", { opacity: 0, y: 10 }, { opacity: 1, y: 0, duration: 0.2, ease: "power2.out" }, 2.1);
+          tl.to("#root", { opacity: 0, duration: 0.15, ease: "power2.in" }, 2.45);
+          window.__timelines["s3-agent"] = tl;
+        })();
+      </script>
+    </template>
+  </body>
+</html>

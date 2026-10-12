@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+  <head><meta charset="UTF-8"></head>
+  <body>
+    <template>
+      <style>
+        #root { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; font-family: "JetBrains Mono", monospace; color: #d6ffe4; }
+        #s5-word { display: flex; font-size: 110px; font-weight: 700; color: #38ff7a; text-shadow: 0 0 34px rgba(56, 255, 122, 0.45); letter-spacing: -2px; }
+        #s5-word span { display: block; }
+        #s5-tag { font-size: 30px; color: #d6ffe4; }
+        #s5-sub { font-size: 22px; color: #7fae8f; }
+      </style>
+      <div data-hf-id="hf-e2vg" id="root" data-composition-id="s5-end" data-width="1280" data-height="720">
+        <div data-hf-id="hf-dr2y" id="s5-word"><span data-hf-id="hf-j7ez">H</span><span data-hf-id="hf-xwr0">e</span><span data-hf-id="hf-ubzr">l</span><span data-hf-id="hf-sqrn">p</span><span data-hf-id="hf-pn38">e</span><span data-hf-id="hf-ry5l">r</span><span data-hf-id="hf-i0hw">M</span><span data-hf-id="hf-lzk6">C</span><span data-hf-id="hf-g0yr">P</span></div>
+        <div data-hf-id="hf-93pb" id="s5-tag">One line for your friend. Your AI does the rest.</div>
+        <div data-hf-id="hf-dbud" id="s5-sub">Windows, Linux and Android, over MCP</div>
+      </div>
+      <script>
+        (function () {
+          const tl = gsap.timeline({ paused: true });
+          tl.fromTo("#s5-word span", { opacity: 0, y: 40 }, { opacity: 1, y: 0, duration: 0.35, ease: "back.out(2)", stagger: 0.035 }, 0);
+          tl.fromTo("#s5-tag", { opacity: 0, y: 14 }, { opacity: 1, y: 0, duration: 0.35, ease: "power3.out" }, 0.4);
+          tl.fromTo("#s5-sub", { opacity: 0 }, { opacity: 1, duration: 0.3, ease: "power1.out" }, 0.65);
+          tl.to("#root", { opacity: 0, duration: 0.2, ease: "power2.in" }, 1.4);
+          window.__timelines["s5-end"] = tl;
+        })();
+      </script>
+    </template>
+  </body>
+</html>

@@ -38,7 +38,9 @@ let agent = startAgent();
 const code = (await waitFor(async () => (await sessions())[0]?.code, 'registration'));
 assert.equal((await sessions())[0].kept, true, 'the session is marked as kept');
 assert.match((await call('run', { session: code, command: 'echo one' })).text, /one/);
-const saved = JSON.parse(fs.readFileSync(path.join(SDIR, 'session.json'), 'utf8').replace(/^﻿/, '')); assert.equal(saved.code, code);
+const sfile = path.join(SDIR, 'session.json');
+await waitFor(async () => fs.existsSync(sfile) || (fs.existsSync(path.join(SDIR, 'agent.log')) && /cannot save/.test(fs.readFileSync(path.join(SDIR, 'agent.log'), 'utf8')) && assert.fail('the agent could not save the session: ' + fs.readFileSync(path.join(SDIR, 'agent.log'), 'utf8'))), 'the saved session file', 20000);
+const saved = JSON.parse(fs.readFileSync(sfile, 'utf8').replace(/^﻿/, '')); assert.equal(saved.code, code);
 if (PS) saved.token = spawnSync('powershell', ['-NoProfile', '-Command', `$d = Get-Content '${path.join(SDIR, 'session.json')}' -Raw -Encoding UTF8 | ConvertFrom-Json; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $d.token)))`]).stdout.toString().trim();   // DPAPI-encrypted on Windows console.log('kept session saved ok');
 
 // the PC dies (reboot / power): the session must stay, with the same code, offline

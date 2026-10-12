@@ -1,7 +1,9 @@
 // Console panel for the relay. Runs inside the container (the `helpermcp` command starts it):
 //   status   one screen: address, settings, state, sessions, queue
 //   panel    the same, refreshed every 2 s (Ctrl+C to leave)
-//   connect  the commands that connect an AI client, and the link for friends
+//   connect  the commands that connect an AI client, and the link for friends (`connect claude|codex|codex-win|other|prompt`: just one)
+//   link     the link for friends
+//   help     every `helpermcp` command
 import https from 'node:https';
 import http from 'node:http';
 
@@ -60,16 +62,47 @@ function render(st) {
   return L.join('\n');
 }
 
+const url = PUBLIC || `http${TLS ? 's' : ''}://<server>:${PORT}`;
+// `helpermcp connect <target>` prints just this line, without colours, so it is easy to copy
+const ONE = {
+  claude: () => `claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}"`,
+  codex: () => `mkdir -p ~/.codex && printf '\\n[mcp_servers.helper]\\nurl = "${url}/mcp"\\nhttp_headers = { "Authorization" = "Bearer ${KEY}" }\\n' >> ~/.codex/config.toml`,
+  'codex-win': () => `New-Item -ItemType Directory -Force "$env:USERPROFILE\\.codex" | Out-Null; Add-Content "$env:USERPROFILE\\.codex\\config.toml" "\`n[mcp_servers.helper]\`nurl = \`"${url}/mcp\`"\`nhttp_headers = { \`"Authorization\`" = \`"Bearer ${KEY}\`" }"`,
+  other: () => `URL:    ${url}/mcp\nHeader: Authorization: Bearer ${KEY}`,
+  prompt: () => aiPrompt(),
+};
+
+function helpText() {
+  const row = (c, r, e) => '  ' + G(pad('helpermcp ' + c, 32)) + t(r, e);
+  return [
+    G('HelperMCP'),
+    row('', 'состояние сервера и сессий', 'server and session status'),
+    row('panel', 'то же, вживую (Ctrl+C — выход)', 'the same, live (Ctrl+C to leave)'),
+    row('link', 'ссылка для друга', 'the link for a friend'),
+    row('connect', 'все способы подключить ИИ', 'every way to connect your AI'),
+    row('connect claude', 'команда для Claude Code', 'the Claude Code command'),
+    row('connect codex', 'команда для Codex (Linux / macOS)', 'the Codex command (Linux / macOS)'),
+    row('connect codex-win', 'команда для Codex (Windows)', 'the Codex command (Windows)'),
+    row('connect other', 'URL и заголовок для любого клиента', 'URL and header for any client'),
+    row('connect prompt', 'текст, чтобы ИИ подключился сам', 'a prompt so your AI connects itself'),
+    row('domain <name>', 'задать домен, HTTPS включится сам', 'set a domain, HTTPS turns on by itself'),
+    row('config', 'сменить домен / IP / порт по шагам', 'change domain / IP / port step by step'),
+    row('key', 'новый ключ (старый перестанет работать)', 'new key (the old one stops working)'),
+    row('update', 'обновить до последней версии', 'update to the latest version'),
+    row('logs', 'журнал сервера', 'server log'),
+    row('restart', 'перезапустить (также stop / start)', 'restart (also stop / start)'),
+  ].join('\n');
+}
+
 function connectText() {
-  const url = PUBLIC || `http${TLS ? 's' : ''}://<server>:${PORT}`;
   return [
     G(t('Подключить ИИ (Claude Code), один раз:', 'Connect your AI (Claude Code), once:')),
-    `  claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}"`,
+    '  ' + ONE.claude(),
     '',
     G(t('Codex, один раз (Linux / macOS):', 'Codex, once (Linux / macOS):')),
-    `  mkdir -p ~/.codex && printf '\\n[mcp_servers.helper]\\nurl = "${url}/mcp"\\nhttp_headers = { "Authorization" = "Bearer ${KEY}" }\\n' >> ~/.codex/config.toml`,
+    '  ' + ONE.codex(),
     G(t('Codex, один раз (Windows PowerShell):', 'Codex, once (Windows PowerShell):')),
-    `  New-Item -ItemType Directory -Force "$env:USERPROFILE\\.codex" | Out-Null; Add-Content "$env:USERPROFILE\\.codex\\config.toml" "\`n[mcp_servers.helper]\`nurl = \`"${url}/mcp\`"\`nhttp_headers = { \`"Authorization\`" = \`"Bearer ${KEY}\`" }"`,
+    '  ' + ONE['codex-win'](),
     M(t('…или просто скажите Codex: «добавь MCP-сервер helper: streamable HTTP, URL ' + url + '/mcp, заголовок Authorization: Bearer <ключ>»', '…or just tell Codex: "add the MCP server helper: streamable HTTP, URL ' + url + '/mcp, header Authorization: Bearer <key>"')),
     '',
     G(t('Любой другой клиент MCP (streamable HTTP):', 'Any other MCP client (streamable HTTP):')),
@@ -83,13 +116,24 @@ function connectText() {
     '',
     G(t('Проще всего: скопируйте текст ниже и отправьте своей нейросети (Codex, Claude Code, Cursor…), она подключится сама:', 'Easiest: copy the text below and send it to your AI (Codex, Claude Code, Cursor…), it connects itself:')),
     '',
-    t(`Подключи себе MCP-сервер удалённой помощи HelperMCP. Тип: streamable HTTP. Имя: helper. URL: ${url}/mcp. Заголовок: Authorization: Bearer ${KEY}. Если ты Codex — допиши в ~/.codex/config.toml (на Windows %USERPROFILE%\\.codex\\config.toml) раздел [mcp_servers.helper] с url = "${url}/mcp" и http_headers = { "Authorization" = "Bearer ${KEY}" }. Если ты Claude Code — выполни: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Другой клиент — добавь сервер в его настройки MCP так же. Не публикуй ключ. Потом скажи мне, что нужно перезапустить сессию (если требуется), и проверь подключение инструментом list_sessions. Когда я дам код с экрана друга, работай по инструкциям сервера и сразу открой мне живой просмотр.`,
-      `Connect the HelperMCP remote-help MCP server to yourself. Type: streamable HTTP. Name: helper. URL: ${url}/mcp. Header: Authorization: Bearer ${KEY}. If you are Codex, append to ~/.codex/config.toml (on Windows %USERPROFILE%\\.codex\\config.toml) a [mcp_servers.helper] table with url = "${url}/mcp" and http_headers = { "Authorization" = "Bearer ${KEY}" }. If you are Claude Code, run: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Any other client: add the server to its MCP settings the same way. Never publish the key. Then tell me if the session has to be restarted, and check the connection with the list_sessions tool. When I give you a code from a friend's screen, follow the server's instructions and open the live view for me right away.`),
+    aiPrompt(),
   ].join('\n');
 }
 
+function aiPrompt() {
+  return t(
+    `Подключи себе MCP-сервер удалённой помощи HelperMCP. Тип: streamable HTTP. Имя: helper. URL: ${url}/mcp. Заголовок: Authorization: Bearer ${KEY}. Если ты Codex — допиши в ~/.codex/config.toml (на Windows %USERPROFILE%\\.codex\\config.toml) раздел [mcp_servers.helper] с url = "${url}/mcp" и http_headers = { "Authorization" = "Bearer ${KEY}" }. Если ты Claude Code — выполни: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Другой клиент — добавь сервер в его настройки MCP так же. Не публикуй ключ. Потом скажи мне, что нужно перезапустить сессию (если требуется), и проверь подключение инструментом list_sessions. Когда я дам код с экрана друга, работай по инструкциям сервера и сразу открой мне живой просмотр.`,
+      `Connect the HelperMCP remote-help MCP server to yourself. Type: streamable HTTP. Name: helper. URL: ${url}/mcp. Header: Authorization: Bearer ${KEY}. If you are Codex, append to ~/.codex/config.toml (on Windows %USERPROFILE%\\.codex\\config.toml) a [mcp_servers.helper] table with url = "${url}/mcp" and http_headers = { "Authorization" = "Bearer ${KEY}" }. If you are Claude Code, run: claude mcp add --transport http helper ${url}/mcp --header "Authorization: Bearer ${KEY}". Any other client: add the server to its MCP settings the same way. Never publish the key. Then tell me if the session has to be restarted, and check the connection with the list_sessions tool. When I give you a code from a friend's screen, follow the server's instructions and open the live view for me right away.`);
+}
+
 const cmd = process.argv[2] || 'status';
-if (cmd === 'connect') { console.log(connectText()); process.exit(0); }
+if (cmd === 'help') { console.log(helpText()); process.exit(0); }
+if (cmd === 'link') { console.log(url + '/'); process.exit(0); }
+if (cmd === 'connect') {
+  const one = ONE[process.argv[3]];
+  if (process.argv[3] && !one) { console.error(t('варианты: ', 'options: ') + Object.keys(ONE).join(', ')); process.exit(1); }
+  console.log(one ? one() : connectText()); process.exit(0);
+}
 if (!KEY) { console.error(R('OPERATOR_KEY is not set')); process.exit(1); }
 const draw = async (clear) => {
   try { const st = await get('/admin/status'); if (st.error) throw new Error(st.error); process.stdout.write((clear ? '\x1b[2J\x1b[H' : '') + render(st) + '\n'); }

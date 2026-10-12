@@ -3,7 +3,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh | sudo bash
 # It asks for a domain (Enter = none: the server's IP is used) and prints the command that connects your AI plus the link for friends.
 # Non-interactive:  ... | sudo bash -s -- --domain help.example.com    or    --ip 1.2.3.4 --port 8444 --yes
-# Afterwards use the `helpermcp` command: status, panel, connect, config, key, update, logs, restart.
+# Afterwards: `helpermcp help` lists everything (link, connect claude|codex|..., domain, config, key, update, logs).
 set -euo pipefail
 
 REPO="${HM_REPO:-Kevanko/HelperMCP}"
@@ -97,18 +97,21 @@ done
 BIN="${HM_BIN:-/usr/local/bin/helpermcp}"
 cat > "$BIN" <<CLI
 #!/usr/bin/env bash
-# HelperMCP console: helpermcp [status|panel|connect|config|key|update|logs|restart|stop|start]
+# HelperMCP console: helpermcp help
 DIR="$DIR"
 cd "\$DIR" || exit 1
 tty=-T; [ -t 1 ] && tty=""
 case "\${1:-status}" in
-  status|panel|connect) exec docker compose exec \$tty -e HM_LANG="\${LC_ALL:-\${LANG:-}}" helpermcp node relay/cli.mjs "\${1:-status}" ;;
+  status|panel|connect|link|help|-h|--help) [ "\${1:-}" = -h ] || [ "\${1:-}" = --help ] && set -- help
+    exec docker compose exec \$tty -e HM_LANG="\${LC_ALL:-\${LANG:-}}" helpermcp node relay/cli.mjs "\${@:-status}" ;;
+  domain) [ -n "\${2:-}" ] || { echo "usage: helpermcp domain help.example.com   (to drop the domain: helpermcp config)"; exit 1; }
+    exec bash "\$DIR/install.sh" --reconfigure --yes --domain "\$2" ;;
   config) exec bash "\$DIR/install.sh" --reconfigure ;;
   update) exec bash "\$DIR/install.sh" --yes ;;
   key) sed -i "s/^OPERATOR_KEY=.*/OPERATOR_KEY=\$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \\n')/" .env && docker compose up -d && exec docker compose exec \$tty helpermcp node relay/cli.mjs connect ;;
   logs) exec docker compose logs -f --tail 100 helpermcp ;;
   restart|stop|start) exec docker compose "\$1" helpermcp ;;
-  *) echo "usage: helpermcp [status|panel|connect|config|key|update|logs|restart|stop|start]"; exit 1 ;;
+  *) echo "unknown command, see: helpermcp help"; exit 1 ;;
 esac
 CLI
 chmod 755 "$BIN"
@@ -117,5 +120,5 @@ echo
 echo "${G}================ HelperMCP ================${Z}"
 docker compose exec -T -e HM_LANG="${LC_ALL:-${LANG:-}}" helpermcp node relay/cli.mjs connect || true
 echo
-say "${M}Дальше:${Z} helpermcp panel (живая панель), helpermcp config (сменить домен / IP / порт), helpermcp key (новый ключ), helpermcp update." "${M}Next:${Z} helpermcp panel (live panel), helpermcp config (change domain / IP / port), helpermcp key (new key), helpermcp update."
+say "${M}Панель:${Z} ${G}helpermcp${Z}   ${M}все команды:${Z} ${G}helpermcp help${Z}   ${M}ссылка для друга:${Z} ${G}helpermcp link${Z}   ${M}домен:${Z} ${G}helpermcp domain help.example.com${Z}"     "${M}Panel:${Z} ${G}helpermcp${Z}   ${M}all commands:${Z} ${G}helpermcp help${Z}   ${M}friend link:${Z} ${G}helpermcp link${Z}   ${M}domain:${Z} ${G}helpermcp domain help.example.com${Z}"
 echo "${G}===========================================${Z}"

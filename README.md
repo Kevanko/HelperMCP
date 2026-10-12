@@ -2,228 +2,153 @@
 
 # HelperMCP
 
-**Remote help for a friend's computer or phone, done by your AI.**
-Your friend runs one line. You give your AI the code. It does the rest, while your friend watches.
+**Your AI fixes a friend's computer or phone, while they watch.**
 
-[![MCP](https://img.shields.io/badge/MCP-streamable%20HTTP-38ff7a?labelColor=020a06)](#3-connect-your-ai-once)
-[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-38ff7a?labelColor=020a06)](#2-friends-side)
-[![Linux](https://img.shields.io/badge/Linux-X11-38ff7a?labelColor=020a06)](#2-friends-side)
-[![Android](https://img.shields.io/badge/Android-11%2B-38ff7a?labelColor=020a06)](#android-phone)
-[![Self-hosted](https://img.shields.io/badge/relay-self--hosted-38ff7a?labelColor=020a06)](#1-install-the-relay-on-your-server-one-command)
+[![MCP](https://img.shields.io/badge/MCP-streamable%20HTTP-38ff7a?labelColor=020a06)](#quick-start)
+[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-38ff7a?labelColor=020a06)](#what-your-friend-sees)
+[![Linux](https://img.shields.io/badge/Linux-X11-38ff7a?labelColor=020a06)](#what-your-friend-sees)
+[![Android](https://img.shields.io/badge/Android-11%2B-38ff7a?labelColor=020a06)](#android)
+[![Self-hosted](https://img.shields.io/badge/server-self--hosted-38ff7a?labelColor=020a06)](#quick-start)
 
-<img src="docs/demo.gif" alt="A friend runs one line and gets a code, sends it to you, you ask your AI, and it installs Blender on the friend's PC while a plan ticks off" width="900">
+<img src="docs/demo.gif" alt="A friend runs one line and gets a code, sends it to you, you ask your AI, and it installs Blender on the friend's PC" width="900">
 
-*Русская версия ниже / Russian version below.*
+[Русская версия ниже](#по-русски)
 
 </div>
 
-## How it works
+Your friend runs one line and gets a code. You give the code to your AI (Claude Code, Codex, Cursor, anything with MCP). It sees their screen, clicks, types, installs and fixes things. You watch live and can take over at any moment.
 
-| | Who | What |
-|---|---|---|
-| **1** | your friend | opens your link and runs **one line** (Windows / Linux) or the app (Android), gets a session code |
-| **2** | you | tell your AI: *"help my friend, code 7FBV-HUVJ: …"* |
-| **3** | your AI | works on their machine over MCP: looks at the screen, clicks, types, runs programs, edits files, uses other MCP servers there; you get a live view to watch or take over |
+## Quick start
 
-## What makes it pleasant
-
-- **One line, nothing installed on a PC.** The agent runs from memory and leaves with the window. Android uses a small app.
-- **Your friend always sees what happens.** A glowing edge, a label with the current step and a clock, the AI's own pointer; **Esc** opens pause / continue / end.
-- **A plan with stages.** The AI splits the job into steps with their own colours; the label and the live view show where it is.
-- **It checks itself.** Every click, typing and key press reports what changed on the screen, or a loud *NO CHANGE*, so the AI stops instead of typing into the wrong window. `watch` films a few seconds when something moves.
-- **A live view you can drive.** A view link to watch, a control link to click, type and take over from the AI, then hand back.
-- **Survives real life.** Internet loss, VPN switches and reboots keep the session and the code; outages are diagnosed and logged.
-- **Your server, your data.** The relay is self-hosted, the state is encrypted, files and sessions are deleted at the end.
-
-```
- friend's PC / phone        relay (your server)               you
-┌────────────┐  HTTPS   ┌──────────────────────┐   MCP    ┌─────────────┐
-│ agent      │ ───────► │ /a/*  agent API      │ ◄─────── │ any AI with │
-│ (PS / py / │ long-poll│ /mcp, /s/<code>/mcp  │          │ MCP client  │
-│  Android)  │          │ /v/…  live view      │          └─────────────┘
-└────────────┘          └──────────────────────┘
-```
-
-The agent only makes outbound HTTPS requests, so no port forwarding or public IP is needed on the friend's side.
-
-## 1. Install the relay on your server (one command)
+**1. Install the server** (any Linux server, Docker is installed if missing):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh | sudo bash -s -- --domain help.example.com
+curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh | sudo bash
 ```
 
-Needs a Linux server with a domain pointing at it (ports 80/443 free). It installs Docker if missing, starts the relay with automatic HTTPS (Caddy) and prints everything you need: the friend link, the MCP URL and your operator key. Without `--domain` it serves plain HTTP on `http://<ip>:8444` (testing only). Re-run the same command to update.
+It asks for a domain. Have one? Type it and HTTPS sets itself up. No domain? Press Enter and it runs on the server's IP. At the end it prints everything you need.
 
-Already have nginx/certbot? Skip Caddy: set `TLS_CERT`/`TLS_KEY` in `.env` (the relay serves TLS itself and reloads renewed certificates), or put the relay behind your proxy and set `PUBLIC_URL`. See `.env.example`.
+**2. Connect your AI** (once):
 
-At the end it prints how to connect your AI: the `claude mcp add …` command for Claude Code, two one-liners for Codex (`~/.codex/config.toml`, Linux/macOS and Windows) and the plain URL + header for any other MCP client. The last block is a ready prompt: paste it into your AI and it adds the server itself. `helpermcp connect` prints all of it again.
-
-## 2. Friend's side
-
-Send the friend your relay link (`https://help.example.com/`): it shows the line for their system.
-
-| OS | One line |
-|----|----------|
-| Windows 10/11 (PowerShell) | `[Net.ServicePointManager]::SecurityProtocol=3072; irm https://help.example.com/h \| iex` |
-| Ubuntu / Linux / macOS | `python3 <(curl -fsSL https://help.example.com/p)` |
-
-The script runs in memory (Windows) or from a pipe (Linux), asks for a mode and prints a code like `K7M2-QX9P`. Closing the window or Ctrl+C ends access.
-
-* **Friend's console:** a pinned header with the session code (already copied to the clipboard, nothing to select or Ctrl+C), `Esc` to end the session at any moment, a soft chime on connect and when a question is waiting, and a plain-language log of every step (`-> click (500, 400)`, then `done` or the error).
-* **Small steps are asked together:** the `actions` tool takes a short list (move, click, drag, scroll, type, key, wait) that the friend confirms once; a move right before a click on the same spot shows as one step.
-* **Ask mode (default):** for every command, file write, click, keystroke and MCP-server start/call the friend gets a chime, a flashing window and a yellow question, and answers with ONE key: `Y` (or Enter) yes, `A` always for that kind of action (mouse / keyboard / commands / files / MCP) until the session ends, `N` no, `Esc` ends the session at once. After the answer the window focus and the pointer are put back where the AI left them, so a click and the typing that follows land in the same place. Screenshots, file reads and directory listings need no confirmation.
-* **Full mode:** no prompts.
-* Everything the AI does is printed in the friend's console.
-* While a helper is connected, **every screen gets a soft glowing edge and a "Remote control" label on top** (like Codex). It ignores the mouse, stays on top, and disappears when the window is closed, even if the agent is killed.
-* **The AI's mouse is visible.** The pointer glides to its targets (eased, speed by distance) instead of jumping, and a big cursor with a soft glow and a comet tail follows it. Clicks send a ripple, the cursor squeezes on press; drags show a ring around the pointer; scrolling shows chevrons, typing shows pulsing dots. The **real mouse pointer is replaced for the whole connection** (every app, taskbar included) by a soft rounded arrow, or by your own cursor pack: drop `pointer.cur`, `link.cur`, `beam.cur` (and optionally `help`, `precision`, `unavailable`, `vert`, `horz`, `move`, `dgn1`, `dgn2`, `working.ani`, `busy.ani`) into `data/cursor/` on the relay and agents fetch them at start. The old pointer comes back when the session ends (Windows: system cursors via `SetSystemCursor`; Linux/GNOME: a temporary Xcursor theme in `~/.icons` selected through gsettings). While the AI works (and 8 s after) its own soft arrow replaces the pointer: it leans into the direction of movement, glows, ripples on clicks and shows drag, scroll and typing cues; while text is typed the arrow travels along the line under the letters. The arrow and the session pointer come from your cursor pack (a little bigger than the original). The label on top shows the session clock.
-* **Connection state is visible.** Blue edge = connected. If the link breaks (internet lost, VPN switch, sleep, server restart) the edge and the label turn **orange** ("Connection lost, reconnecting...") until the agent is back.
-
-**Linux:** the agent finds the user's desktop session by itself (also when started over SSH) and drives the mouse/keyboard through X11 directly, so nothing has to be installed (`scrot`/`python3-gi`, present on most desktops, are used for screenshots and the overlay). On **Wayland** screenshots (needs `grim`/`gnome-screenshot`), commands, files and browsers work, but mouse/keyboard control does not: log in with "Ubuntu on Xorg" for that.
-
-## 3. Connect your AI (once)
-
-```
-claude mcp add --transport http helper https://help.example.com/mcp --header "Authorization: Bearer YOUR_OPERATOR_KEY"
+```bash
+helpermcp connect claude      # Claude Code: prints the command to paste
+helpermcp connect codex       # Codex on Linux / macOS   (codex-win for Windows)
+helpermcp connect prompt      # any other AI: a text it reads and connects itself
 ```
 
-Any MCP client with streamable-HTTP support works: URL `https://help.example.com/mcp`, header `Authorization: Bearer <key>`.
+**3. Help a friend:**
 
-Then say: *"connect to K7M2-QX9P and find why the game crashes"*.
-
-Two ways to connect:
-
-* **`/mcp`**: connect once, every tool takes a `session` argument (the code). Use `list_sessions` to see who is online.
-* **`/s/<CODE>/mcp`**: one connection per help session. The friend's PC then looks like your own: no `session` argument, and the tools of any started child MCP server show up as native tools named `<server>__<tool>`. Best when your AI client lets you add a server on the fly.
-
-## Watch what is happening
-
-`open_viewer` returns a link (valid 12 h, usable only for that session; it does not expose your operator key). Open it in a browser and you get a **live view of the remote screen** (about 1 frame/s) next to a log of what the AI is doing. Ask your AI to open it for you, e.g. `start <url>` on Windows or `xdg-open <url>` on Linux. The viewer never moves the mouse and does not change the coordinates the AI clicks with.
-
-`open_viewer` gives two links. The first is **view only** (safe to share). The second ends with `#c=…` and is the **control** link: in the page press "Take control" (Управлять сам), then click, drag and scroll on the picture, type into the box at the bottom (Enter types it and presses Enter) or use the quick keys (Enter, Backspace, Tab, Esc, arrows; Back / Home / Recents on phones). While you control, the AI's calls are refused with a clear message and `wait_online` waits until you press "Give back to the helper" (or 5 minutes after your last input). The secret is in the URL fragment, so it never reaches a server log. The stream keeps two frames in flight, adapts its quality to the link and shows the helper's overlay without flicker; Windows/Linux pages have a monitor selector.
-
-## Tools
-
-| Tool | What |
-|------|------|
-| `sysinfo`, `screenshot`, `run`, `read_file`, `write_file`, `list_dir` | look around, run programs, edit configs. `read_file` returns images (renders, saved screenshots) as images |
-| `start_process` | start a program **detached** (GUI apps like Blender or Unity, servers) and keep it running |
-| `click`, `move`, `drag`, `scroll`, `type_text`, `press_key` | mouse (smooth glide, drag and drop) and keyboard (`ctrl+c`, `alt+f4`, `win+r`, `enter`), any Unicode text; coordinates are screenshot pixels |
-| `mcp_start`, `mcp_tools`, `mcp_call`, `mcp_stop` | run and use **other MCP servers on the friend's PC** |
-| `recipe` | verified how-tos for apps (`blender`, the generic `any-app`) |
-| `wait_job` | collect the result of a long operation (see below) |
-| `open_viewer` | link to a live view of the remote screen + action log |
-| `list_sessions`, `end_session` | session management |
-
-## Work on their PC like on your own
-
-The relay hands every connecting AI a short manual (MCP `instructions`): look first, check whether the app is installed, install it if not, start it, start its MCP server, work, clean up. The pieces that make this smooth:
-
-* **Missing runtimes appear on their own.** If a command mentions `node`/`npx`/`npm`/`uv`/`uvx` and it is not installed (or Node is older than 20 for `npx`), a portable copy is downloaded into a temp folder, put on `PATH` for everything you start, and deleted on exit. Python tools get `PYTHONUTF8=1`.
-* **Long operations never time out.** Installs, first-time package downloads and renders take minutes; MCP clients give up after about a minute. After ~45 s a call answers `Still running (job X)`; the work continues on the remote PC and `wait_job` collects the result. `timeout_s` on `run`, `mcp_start` and `mcp_call` raises the limits (up to an hour).
-* **Never blocked.** Screenshots, `sysinfo` and file reads are answered while a long command runs (the live viewer does not freeze behind an install).
-* **Stopping cleans up.** `mcp_stop` and closing the agent kill the whole process tree (`uvx`/`npx` start the real server as a grandchild).
-* **Installing apps.** `run` a package manager (`winget install -e --id ...`, `apt`/`flatpak`/`snap`, `brew`); an installer that needs administrator rights shows a UAC prompt the friend has to accept.
-
-### Example: "make a model in Blender"
-
-The AI calls `recipe blender` and does: look for Blender (`winget install` if missing, a background job) → `uvx mcp-for-blender install-addon` and enable the add-on without clicking → `start_process` Blender → `mcp_start uvx blender-mcp` → `execute_blender_code` to build the model → `look` / render + `read_file` to check it. On a PC without a usable GPU there is a no-window mode. Verified on a clean Windows 10 (no Blender, no uv, no Node) and on a PC where Blender was already open. The same pattern works for any app that has an MCP server: `recipe any-app`. Recipes are plain Markdown in [`recipes/`](recipes): add your own.
-
-### Using other MCP servers (e.g. their browser)
-
-```
-mcp_start  name="browser" command="playwright"
-mcp_call   server="browser" tool="browser_navigate" arguments={"url": "https://example.com"}
+```bash
+helpermcp link                # the link to send them
 ```
 
-`command="playwright"` opens a **real, visible Chrome/Edge window** on the friend's screen (their installed browser, sound on, no automation warnings), like a Playwright MCP on your own desktop. Any other stdio MCP server works the same way, several side by side, e.g. `command="npx" args=["-y","@modelcontextprotocol/server-filesystem","C:\\Users\\Friend\\Documents"]`. Servers that talk to a local app (Blender, Unity, ...) need that app and its add-on running on the friend's PC (see the recipes).
+They open it, run the line for their system and send you the code. Tell your AI:
 
-## Weak connections
+> help my friend, code 7FBV-HUVJ: Blender won't install
 
-* Screenshots travel as raw JPEG (no base64 inflation), big JSON output is gzipped.
-* The live viewer steps its quality up and down to keep about one frame per second, and sends nothing while the screen does not change.
-* On a slow link the AI's screenshots shrink on their own; `screenshot` takes `max_width` and `quality`, `monitor=N` crops to one screen.
+## Server commands
 
-## Android phone
+| Command | What it does |
+|---|---|
+| `helpermcp` | status: address, sessions, what's running |
+| `helpermcp panel` | the same, live |
+| `helpermcp help` | every command |
+| `helpermcp link` | the link for a friend |
+| `helpermcp connect [claude \| codex \| codex-win \| other \| prompt]` | how to connect your AI |
+| `helpermcp domain help.example.com` | add a domain later (HTTPS turns on) |
+| `helpermcp config` | change domain / IP / port step by step |
+| `helpermcp key` | new operator key |
+| `helpermcp update` | update to the latest version |
+| `helpermcp logs` / `restart` | logs, restart |
 
-A separate app (`android/`, Kotlin, no dependencies, Android 11+) instead of the one-liner. The landing page of your relay shows a QR code: scan it, download the APK, allow the install, open the app, switch **HelperMCP** on under *Accessibility* (step 1), press **Start help** (step 2) and tell the code to the helper. Sideloaded apps on Android 13+ need *App info → ⋮ → Allow restricted settings* once; the app says so.
+## What your friend sees
 
-* **What works:** `screenshot`, `click` (a tap; `button=right` = long press), `drag` (a swipe; `hold=true` = drag and drop), `scroll`, `type_text` (into the focused field), `press_key` (home, back, recents, notifications, enter, volume ...), `start_process` (app name, package or link), `actions` and `sysinfo`. No shell, no files and no MCP bridge on a phone.
-* **Same look as on the PC:** edge glow (blue connected, orange waiting for the helper or link lost), a label with the session clock (tap it to end the session), the AI's pointer that glides with a curve, leans into the movement, ripples on taps and shows typing dots, and a question card (Yes / Always / No / Stop) with a soft chime. The code is copied to the clipboard.
-* **Build and publish:** `cd android && ./gradlew assembleRelease -Prelay=https://your.relay` (needs the Android SDK and a full JDK 17+), then put `app/build/outputs/apk/release/app-release.apk` into the relay's `data/apk/helpermcp.apk` (or set `APK_FILE`). The relay then serves it at `/apk`, draws the QR code at `/qr.svg` and adds the Android section to the landing page. The release build is signed with the debug key: use your own key if you want a stable update channel. **Updates:** next to the APK keep `helpermcp.json` (`{"versionCode": 3, "versionName": "0.2.1"}`, the numbers from `android/app/build.gradle.kts`). The app asks `/apk/version` whenever it is opened and shows an orange *Update available* button when the number is higher; it downloads `/apk` and hands it to the system installer (Android asks the user to confirm, and once to allow installs from this app). Bump `versionCode` for every new APK.
-* **Mistake log:** a tap that lands on nothing tappable is answered with `MISS: …nearest tappable "X" at x,y` and written to `data/misses.jsonl` with the last 8 actions before it (typed text is never stored, only its length). The AI also calls `report_miss` when it had to redo something (what it wanted, what happened, what worked); read the log with the `misses` tool to find patterns.
-* **Phone label states:** blue island = working (the timer starts with the first action); `task_done` shows a green "Work finished" label and resets the timer; 150 s without a call returns it to orange "waiting for the helper". Screen off = pause; it continues 4 s after the phone is on and unlocked.
-* **Long sessions:** the AI can call `hold` before it stops (token or rate limit, a long break): the phone shows an orange "helper is on hold, back soon" label, keeps the screen awake and the session open, and the next action continues it. The screen is kept on for the whole session (the CPU lock is renewed every 30 min). The app has a slider for the screen corner radius of the glow (0 = automatic).
-* **The AI chooses its look:** `set_look` sets the working colour once per session (it cannot be changed again, so colours never flicker) and a short note (90 chars, at most once per 30 s) that the app shows under the status and on the label, e.g. "checking the subscription again in 5 min".
+| System | One line (the link page shows it) |
+|---|---|
+| Windows 10 / 11 (PowerShell) | `[Net.ServicePointManager]::SecurityProtocol=3072; irm https://your.server/h \| iex` |
+| Linux / macOS | `python3 <(curl -fsSL https://your.server/p)` |
+| Android 11+ | a small app, the link page has a QR code |
 
-## Stability: pause, outages, reboots
+- **Nothing is installed.** The PC agent runs from memory and is gone when the window closes.
+- **Everything is visible.** A glowing screen edge, a label with the current step, the AI's own smooth pointer.
+- **They stay in charge.** By default every action asks `Y / A(lways) / N`. **Esc** pauses or ends the session.
+- **It survives real life.** Lost internet, VPN switch, reboot: the session comes back with the same code.
 
-* **Esc opens a menu** in the friend's console: `P` pause, `R` continue, `X` end (with a second confirmation). Nothing ends without that confirmation, and a pause keeps the session and the code.
-* **The session is kept** (the helper asks once): internet loss, a VPN switch, a closed window or a reboot do not end it. The helper starts again with the PC (Windows: Run key, Linux: autostart), resumes the **same code** with the saved secret, and the AI just continues. The operator has `wait_online`, `session_log` and `agent_log` for this.
-* **Outages are diagnosed and logged:** adapters, gateway, internet, DNS, the relay; one repair attempt after 10 s (DNS flush; adapter restart when allowed; VPNs untouched); the report reaches the operator when the link returns. Logs stay on the PC (`agent.log`) so problems can be found and fixed quickly.
-* Not yet on Android (the phone app keeps its session only while it runs).
+## What your AI gets
 
-## Reconnecting by itself
+- **Eyes and hands:** screenshots, mouse, keyboard, commands, files, and short video (`watch`) when something moves.
+- **Self-checks:** every click and keystroke reports what changed on screen, or a loud *NO CHANGE*, so it stops instead of typing into the wrong window.
+- **A plan with stages:** each step has its own colour, shown on the friend's screen and in your live view.
+- **Other MCP servers on their PC:** a real visible browser (`playwright`), Blender, anything; missing Node / uv are fetched on the fly.
+- **Long jobs:** installs and renders don't time out, the AI collects the result later.
 
-The agent never gives up on a bad connection: failed requests are retried with a growing delay (1 s to 10 s), after two failures the overlay turns orange, and when the link is back everything continues. Connections that died with an old route (VPN switched) are dropped and re-opened. A session is kept for 5 minutes after the agent was last seen; `list_sessions` shows `online` and `last_seen_s`, and a call to an offline PC fails at once with a clear message instead of hanging. If the server forgot the session (restart without `data/`, outage longer than 5 minutes) the agent registers again and asks for **the same code**, so the operator keeps using it.
+The AI opens a **live view** for you right away: a view-only link to share and a control link to click, type and take over, then hand back.
 
-## Sessions survive restarts
+## Android
 
-The relay stores sessions (agent tokens hashed) and viewer links in `data/state.json`. Restart or update the server and the agents on the friends' PCs just keep working. Without that file (fresh server) an agent tells the friend to run the command again.
+Install the APK from the QR code on the link page, turn on **HelperMCP** in *Accessibility*, press **Start help**, send the code. The AI can tap, swipe, type, press keys and open apps. The glow follows the phone's real screen shape and camera cutout.
 
-## Develop and test
+To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=https://your.server`, then put the APK at `data/apk/helpermcp.apk` on the server.
+
+<details>
+<summary><b>More details</b></summary>
+
+- **Two MCP endpoints.** `/mcp`: one connection, every tool takes a `session` code. `/s/<CODE>/mcp`: per session, the friend's PC looks like your own and their MCP servers show up as native tools.
+- **Your own certificate.** Already have nginx / certbot? Set `TLS_CERT` / `TLS_KEY` in `.env`, or put the relay behind your proxy and set `PUBLIC_URL`. See `.env.example`.
+- **Cursor pack.** Drop `pointer.cur`, `link.cur`, `beam.cur` (and friends) into `data/cursor/` and agents use them during the session.
+- **Recipes.** `recipes/` has step-by-step guides the AI reads (`blender`, `any-app`). Plain Markdown, add your own.
+- **Weak connections.** Screenshots are raw JPEG and shrink on slow links, unchanged screens aren't sent, big output is gzipped.
+- **Linux.** Mouse and keyboard need X11 ("Ubuntu on Xorg"). On Wayland, screenshots, commands, files and browsers still work.
+- **Mistake log.** Missed taps and redone actions are saved with context (`misses` tool) so you can spot patterns.
+
+</details>
+
+## Develop
 
 ```bash
 cd relay && npm ci && npm test      # relay + real agent + MCP client, end to end
 ```
 
-`AGENT=ps|py` picks the agent, `GUI=1` also tests screenshots on a real desktop, `PORTABLE=1` hides Node to test the portable-Node download. The suite covers jobs, concurrency, restarts, process trees, recipes, viewer and the bandwidth path. CI runs on Windows and Ubuntu with Node 18 and 22.
+CI runs on Windows and Ubuntu, Node 18 and 22.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Wrong operator keys are rate-limited per IP. Short version: whoever holds `OPERATOR_KEY` has the same power as the friend on their PC while the window is open. Only run it for people who asked for help, and only send the link to them.
+Whoever holds the operator key can do what the friend can on their PC while a session is open. Keep it secret, help only people who asked. See [SECURITY.md](SECURITY.md). State is encrypted, files and sessions are deleted at the end.
 
-## License
-
-MIT
+MIT license.
 
 ---
 
-# HelperMCP (по-русски)
+## По-русски
 
-<p align="center"><img src="docs/demo.gif" alt="Демо: друг запускает одну строку, присылает код, ты просишь ИИ, и он ставит Blender на ПК друга" width="900"></p>
+Друг запускает одну строку и получает код. Ты даёшь код своему ИИ (Claude Code, Codex, Cursor, любой с MCP). Он видит экран друга, кликает, печатает, ставит и чинит. Ты смотришь вживую и можешь перехватить управление.
 
-**Как это работает:** друг запускает **одну строку** (Windows / Linux) или приложение (Android) и получает код → ты пишешь своей ИИ «помоги другу, код 7FBV-HUVJ: …» → ИИ работает на его устройстве через MCP, а ты смотришь живой просмотр и можешь перехватить управление.
-Демо-ролик собран в `docs/demo` (HyperFrames): `npx hyperframes preview` в этой папке, чтобы поправить, `npx hyperframes render`, чтобы пересобрать.
-
-Удалённая помощь друзьям через любую ИИ с поддержкой MCP (Claude, Cursor, Codex, свой агент). Друг открывает ссылку и вставляет **одну строку**, ты даёшь ИИ код с его экрана, и она работает на его ПК как на своём: смотрит экран, запускает программы, правит файлы и конфиги игр и может пользоваться **любыми другими MCP-серверами на его ПК** (браузер и т.д.) через тот же мост. Ничего устанавливать не нужно.
-
-**Сервер, одна команда** (нужен домен, указывающий на сервер):
+**1. Сервер** (любой Linux):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh | sudo bash -s -- --domain help.example.com
+curl -fsSL https://raw.githubusercontent.com/Kevanko/HelperMCP/master/install.sh | sudo bash
 ```
 
-Скрипт поставит Docker и HTTPS и выведет ссылку для друга, MCP-адрес и ключ.
+Спросит домен: есть — впиши, HTTPS настроится сам; нет — нажми Enter, заработает по IP. В конце выведет всё нужное.
 
-**Друг:** открывает твою ссылку и вставляет строку для своей системы (Windows: `irm https://help.example.com/h | iex`). Видит код вида `K7M2-QX9P`, называет тебе. Закрыл окно, и доступ исчез.
+**2. Подключи ИИ** (один раз):
 
-**Ты:** один раз подключаешь MCP (`claude mcp add ...`, команду печатает установщик) и пишешь ИИ: «подключись к K7M2-QX9P и выясни, почему вылетает игра». Для прозрачного режима используй `/s/КОД/mcp`: инструменты друга выглядят как твои собственные.
+```bash
+helpermcp connect claude      # команда для Claude Code
+helpermcp connect codex       # Codex на Linux / macOS   (codex-win для Windows)
+helpermcp connect prompt      # любой другой ИИ: текст, по которому он подключится сам
+```
 
-**Во время сессии** на каждом экране друга появляется плашка «Удалённое управление» и мягкое свечение по краям, как в Codex. Мышь и клавиатура работают сквозь неё.
+**3. Помоги другу:**
 
-**Браузер друга:** `mcp_start name="browser" command="playwright"` откроет настоящий видимый Chrome/Edge со звуком. Так же можно запускать любые другие MCP-серверы (файлы, Blender и т.д.), несколько одновременно. Если Node 20+ нет, агент скачает портативную копию во временную папку и удалит при выходе.
+```bash
+helpermcp link                # ссылка для друга
+```
 
-**Ubuntu:** агент сам находит сессию рабочего стола (даже если запущен по SSH). Для управления мышью нужен X11 («Ubuntu on Xorg»), на Wayland работают команды, файлы и браузер.
+Друг открывает её, запускает строку для своей системы и присылает код. Пишешь ИИ:
 
-Безопасность: см. [SECURITY.md](SECURITY.md). Ключ держи в секрете, ссылку давай только тем, кто сам попросил о помощи.
+> помоги другу, код 7FBV-HUVJ: не ставится Blender
 
+**Остальное:** `helpermcp help` — все команды, `helpermcp` — панель, `helpermcp domain help.example.com` — добавить домен потом, `helpermcp config` — сменить домен / IP / порт, `helpermcp key` — новый ключ, `helpermcp update` — обновиться.
 
-## Как работать на ПК друга «как на своём» (кратко)
-
-* ИИ при подключении получает инструкцию: посмотреть экран, проверить, стоит ли приложение, поставить, запустить, запустить его MCP, работать, убрать за собой.
-* Недостающие `node`/`npx`/`uv`/`uvx` подтягиваются сами (портативные, во временную папку, удаляются при выходе).
-* Долгие операции (установка, первый запуск MCP, рендер) не обрываются по таймауту клиента: через ~45 с приходит `Still running (job X)`, результат забирается через `wait_job`.
-* Скриншоты и просмотр не «замирают» во время долгой команды. `mcp_stop` и закрытие агента убивают всё дерево процессов.
-* `start_process` запускает программы отдельно (Blender, Unity и т.п.), `recipe blender` / `recipe any-app` описывают проверенные сценарии.
-* Слабый интернет: картинки без раздувания base64, JSON сжимается, качество кадров просмотра подстраивается, неизменный экран не передаётся, у скриншота есть `max_width` и `quality`.
-* Сессии и ссылки просмотра хранятся в `data/state.json` и переживают перезапуск сервера.
+**Друг всё видит и всё решает:** светящаяся рамка, плашка с текущим шагом, плавный курсор ИИ; каждое действие по умолчанию спрашивает `Y / A / N`, **Esc** ставит паузу или завершает. На ПК ничего не устанавливается, на Android — небольшое приложение (QR-код на странице ссылки). Сессия переживает обрыв интернета, смену VPN и перезагрузку.

@@ -23,9 +23,10 @@ for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) bre
 const PS = (process.env.AGENT || (process.platform === 'win32' ? 'ps' : 'py')) === 'ps';
 const src = await (await fetch(BASE + (PS ? '/h' : '/p'))).text();
 const file = path.join(SDIR, 'a.py'); fs.writeFileSync(file, src);
+const TOKEN_FILE = path.join(SDIR, 'token.txt');
 const killAgent = (a) => { if (PS) spawnSync('taskkill', ['/PID', String(a.pid), '/T', '/F']); else a.kill('SIGKILL'); };
 let agentOut = '';
-const startAgent = () => { const env = { ...process.env, HELPER_MODE: 'full', HELPER_PERSIST: '1', HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1' };
+const startAgent = () => { const env = { ...process.env, HELPER_MODE: 'full', HELPER_PERSIST: '1', HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_TOKEN_FILE: TOKEN_FILE };
   const a = PS ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env }) : spawn('python3', [file], { env }); kids.push(a); a.stdout.on('data', (d) => (agentOut += d)); a.stderr.on('data', (d) => (agentOut += d)); return a; };
 
 let client = new Client({ name: 'keep', version: '0' });
@@ -39,9 +40,12 @@ const code = (await waitFor(async () => (await sessions())[0]?.code, 'registrati
 assert.equal((await sessions())[0].kept, true, 'the session is marked as kept');
 assert.match((await call('run', { session: code, command: 'echo one' })).text, /one/);
 const sfile = path.join(SDIR, 'session.json');
-await waitFor(async () => fs.existsSync(sfile) || (fs.existsSync(path.join(SDIR, 'agent.log')) && /cannot save/.test(fs.readFileSync(path.join(SDIR, 'agent.log'), 'utf8')) && assert.fail('the agent could not save the session: ' + fs.readFileSync(path.join(SDIR, 'agent.log'), 'utf8'))), 'the saved session file', 20000);
-const saved = JSON.parse(fs.readFileSync(sfile, 'utf8').replace(/^﻿/, '')); assert.equal(saved.code, code);
-if (PS) saved.token = spawnSync('powershell', ['-NoProfile', '-Command', `if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'PowerShell[\\/]7') { $env:PSModulePath = @((Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'), (Join-Path $PSHOME 'Modules')) -join ';' }; $d = Get-Content '${path.join(SDIR, 'session.json')}' -Raw -Encoding UTF8 | ConvertFrom-Json; [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $d.token)))`]).stdout.toString().trim();   // DPAPI-encrypted on Windows console.log('kept session saved ok');
+await waitFor(async () => fs.existsSync(sfile) && fs.existsSync(TOKEN_FILE), 'the saved session + token files', 20000);
+const saved = JSON.parse(fs.readFileSync(sfile, 'utf8').replace(/^﻿/, ''));
+assert.equal(saved.code, code);
+saved.token = fs.readFileSync(TOKEN_FILE, 'utf8').trim();   // the agent wrote the plaintext token here under HELPER_TOKEN_FILE (DPAPI-encrypted in session.json)
+assert.ok(saved.token, 'the agent saved a non-empty token');
+console.log('kept session saved ok');
 
 // the PC dies (reboot / power): the session must stay, with the same code, offline
 killAgent(agent);

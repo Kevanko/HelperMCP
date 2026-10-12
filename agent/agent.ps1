@@ -1183,6 +1183,7 @@ function Save-Session($code, $token, $mode) {   # the token is encrypted for thi
         [void](New-Item $StateDir -ItemType Directory -Force)
         $enc = ConvertFrom-SecureString (ConvertTo-SecureString $token -AsPlainText -Force)
         @{ relay = $RELAY; code = $code; token = $enc; mode = $mode; boot = (Get-BootTime); saved = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json | Set-Content $SessionFile -Encoding UTF8
+        if ($env:HELPER_TOKEN_FILE) { Set-Content $env:HELPER_TOKEN_FILE $token -Encoding UTF8 -NoNewline }   # tests only: the plaintext token, so the harness need not re-decrypt DPAPI
     } catch { Write-AgentLog "cannot save the session: $_" }
 }
 function Load-Session {

@@ -7,7 +7,7 @@ if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'Power
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'util', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
@@ -173,6 +173,121 @@ function Probe-Report($before, $after, $what, $moved) {   # -> a short line for 
     if ($key -lt 3) { return "NO CHANGE: nothing changed where it should after this $what. It probably did not work (wrong window or field focused, a covered or disabled control). Do not continue: look first (screenshot or watch)." }
     'screen changed: ' + $(if ($cl -ge 0) { "at the target $cl cells, " } else { '' }) + "whole screen $ca cells"
 }
+
+# Files without the PowerShell pipeline (it is slow on big folders): tree, find, line ranges, exact edits; and argument quoting by the Windows rules.
+Add-Type -TypeDefinition @"
+using System; using System.IO; using System.Text; using System.Text.RegularExpressions; using System.Collections.Generic; using System.Diagnostics; using System.Runtime.InteropServices;
+namespace F__BUILD__ {
+  public static class Fs {
+    static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "__pycache__", "`$Recycle.Bin", "System Volume Information" };
+    public static string Human(long n) { double d = n; string[] u = { "B", "K", "M", "G", "T" }; int i = 0; while (d >= 1024 && i < 4) { d /= 1024; i++; } return i == 0 ? n + "B" : d.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + u[i]; }
+    static Regex Glob(string g) { if (string.IsNullOrEmpty(g)) return null; return new Regex("^" + Regex.Escape(g).Replace("\\*", ".*").Replace("\\?", ".") + "$", RegexOptions.IgnoreCase); }
+    static bool IsLink(FileSystemInfo f) { return (f.Attributes & FileAttributes.ReparsePoint) != 0; }
+
+    public static string Tree(string root, int depth, string pattern, int max) {
+      var sb = new StringBuilder(); var rx = Glob(pattern); int lines = 1, more = 0;
+      sb.Append(Path.GetFullPath(root)).Append('\n');
+      Action<DirectoryInfo, int> walk = null;
+      walk = (d, lvl) => {
+        FileSystemInfo[] ents;
+        try { ents = d.GetFileSystemInfos(); } catch (Exception e) { sb.Append(new string(' ', lvl * 2)).Append('[').Append(e.Message).Append("]\n"); return; }
+        Array.Sort(ents, (a, b) => { bool da = a is DirectoryInfo, db = b is DirectoryInfo; return da != db ? (da ? -1 : 1) : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase); });
+        foreach (var e in ents) {
+          var di = e as DirectoryInfo;
+          if (di == null && rx != null && !rx.IsMatch(e.Name)) continue;
+          if (lines > max) { more++; continue; }
+          lines++;
+          sb.Append(new string(' ', lvl * 2));
+          if (di != null) {
+            string n; try { n = di.GetFileSystemInfos().Length.ToString(); } catch { n = "?"; }
+            sb.Append(e.Name).Append("/  (").Append(n).Append(")").Append(IsLink(e) ? "  -> link" : "").Append('\n');
+            if (lvl < depth && !Skip.Contains(e.Name) && !IsLink(e)) walk(di, lvl + 1);
+          } else sb.Append(e.Name).Append("  ").Append(Human(((FileInfo)e).Length)).Append('\n');
+        }
+      };
+      walk(new DirectoryInfo(root), 1);
+      if (more > 0) sb.Append("... ").Append(more).Append(" more (raise max, lower depth or use find)\n");
+      return sb.ToString().TrimEnd();
+    }
+
+    public static string Find(string root, string name, string text, int max, int depth) {
+      var rx = Glob(string.IsNullOrEmpty(name) ? "*" : name); var tr = string.IsNullOrEmpty(text) ? null : new Regex(text, RegexOptions.IgnoreCase);
+      var outp = new List<string>(); var sw = Stopwatch.StartNew(); string stop = null;
+      var stack = new Stack<KeyValuePair<DirectoryInfo, int>>(); stack.Push(new KeyValuePair<DirectoryInfo, int>(new DirectoryInfo(root), 0));
+      while (stack.Count > 0 && stop == null) {
+        var cur = stack.Pop(); FileSystemInfo[] ents;
+        try { ents = cur.Key.GetFileSystemInfos(); } catch { continue; }
+        foreach (var e in ents) {
+          if (sw.Elapsed.TotalSeconds > 25) { stop = "... stopped after 25 s (narrow the path)"; break; }
+          var di = e as DirectoryInfo;
+          if (di != null) { if (cur.Value + 1 < depth && !Skip.Contains(e.Name) && !IsLink(e)) stack.Push(new KeyValuePair<DirectoryInfo, int>(di, cur.Value + 1)); continue; }
+          if (!rx.IsMatch(e.Name)) continue;
+          var fi = (FileInfo)e;
+          if (tr == null) outp.Add(fi.FullName + "  " + Human(fi.Length));
+          else {
+            if (fi.Length > 5000000) continue;
+            byte[] raw; try { raw = File.ReadAllBytes(fi.FullName); } catch { continue; }
+            if (Array.IndexOf(raw, (byte)0, 0, Math.Min(raw.Length, 4096)) >= 0 && !(raw.Length > 1 && raw[0] == 0xFF && raw[1] == 0xFE)) continue;
+            var lines = Decode(raw).Text.Split('\n');
+            for (int i = 0; i < lines.Length && outp.Count < max; i++)
+              if (tr.IsMatch(lines[i])) { var l = lines[i].Trim(); outp.Add(fi.FullName + ":" + (i + 1) + ": " + (l.Length > 160 ? l.Substring(0, 160) : l)); }
+          }
+          if (outp.Count >= max) { stop = "... stopped at " + max + " results (raise max or narrow path / name)"; break; }
+        }
+      }
+      if (stop != null) outp.Add(stop);
+      return outp.Count == 0 ? "nothing found" : string.Join("\n", outp);
+    }
+
+    public class Doc { public string Text; public Encoding Enc; public byte[] Bom; }
+    public static Doc Decode(byte[] raw) {
+      if (raw.Length >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) return new Doc { Text = new UTF8Encoding(false).GetString(raw, 3, raw.Length - 3), Enc = new UTF8Encoding(false), Bom = new byte[] { 0xEF, 0xBB, 0xBF } };
+      if (raw.Length >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) return new Doc { Text = Encoding.Unicode.GetString(raw, 2, raw.Length - 2), Enc = Encoding.Unicode, Bom = new byte[] { 0xFF, 0xFE } };
+      if (raw.Length >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) return new Doc { Text = Encoding.BigEndianUnicode.GetString(raw, 2, raw.Length - 2), Enc = Encoding.BigEndianUnicode, Bom = new byte[] { 0xFE, 0xFF } };
+      try { return new Doc { Text = new UTF8Encoding(false, true).GetString(raw), Enc = new UTF8Encoding(false), Bom = new byte[0] }; }
+      catch { var d = Encoding.Default; return new Doc { Text = d.GetString(raw), Enc = d, Bom = new byte[0] }; }   // an ANSI file stays ANSI
+    }
+
+    public static string ReadRange(string path, int offset, int count, int tail) {
+      var L = Decode(File.ReadAllBytes(path)).Text.Replace("\r\n", "\n").Split('\n');
+      int n = L.Length; if (n > 0 && L[n - 1] == "") n--;
+      int start = tail > 0 ? Math.Max(0, n - tail) : Math.Max(0, offset - 1); int cnt = tail > 0 ? tail : (count > 0 ? count : 200);
+      var sb = new StringBuilder(); int end = Math.Min(n, start + cnt);
+      for (int i = start; i < end; i++) sb.Append(i + 1).Append('\t').Append(L[i]).Append('\n');
+      sb.Append("[lines ").Append(start + 1).Append('-').Append(end).Append(" of ").Append(n).Append(']');
+      return sb.ToString();
+    }
+
+    static int Count(string s, string sub) { int n = 0, i = 0; while ((i = s.IndexOf(sub, i, StringComparison.Ordinal)) >= 0) { n++; i += sub.Length; } return n; }
+    public static string Edit(string path, string old, string neu, bool all) {
+      var d = Decode(File.ReadAllBytes(path)); var t = d.Text;
+      if (!t.Contains(old) && t.Contains("\r\n") && !old.Contains("\r\n")) { old = old.Replace("\n", "\r\n"); neu = neu.Replace("\n", "\r\n"); }   // the AI writes \n, the file has CRLF
+      int n = string.IsNullOrEmpty(old) ? 0 : Count(t, old);
+      if (n == 0) throw new Exception("old text not found (it must match exactly, spaces and line breaks included; read_file with offset/lines to copy it)");
+      if (n > 1 && !all) throw new Exception("old text found " + n + " times: add surrounding lines to make it unique, or all=true");
+      var body = d.Enc.GetBytes(t.Replace(old, neu)); var outb = new byte[d.Bom.Length + body.Length];
+      Buffer.BlockCopy(d.Bom, 0, outb, 0, d.Bom.Length); Buffer.BlockCopy(body, 0, outb, d.Bom.Length, body.Length);
+      File.WriteAllBytes(path, outb);
+      return "replaced " + n;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, UIntPtr w, string l, uint flags, uint timeout, out UIntPtr r);
+    public static void Broadcast() { UIntPtr r; SendMessageTimeout((IntPtr)0xffff, 0x1A, UIntPtr.Zero, "Environment", 2, 3000, out r); }   // WM_SETTINGCHANGE: Explorer and new programs see a changed PATH
+
+    // one argument for a Windows command line, by the rules of CommandLineToArgvW / the MS C runtime: quotes, backslashes before quotes, spaces
+    public static string Quote(string a) {
+      if (a.Length > 0 && a.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0) return a;
+      var sb = new StringBuilder("\"");
+      for (int i = 0; ; i++) {
+        int bs = 0; while (i < a.Length && a[i] == '\\') { bs++; i++; }
+        if (i == a.Length) { sb.Append('\\', bs * 2); break; }
+        if (a[i] == '"') sb.Append('\\', bs * 2 + 1).Append('"'); else sb.Append('\\', bs).Append(a[i]);
+      }
+      return sb.Append('"').ToString();
+    }
+  }
+}
+"@
 
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
@@ -482,9 +597,28 @@ function Ensure-For($text) {
 function Do-Run($a) {
     Ensure-For $a.command
     $secs = if ($a.timeout_s) { [int]$a.timeout_s } else { 60 }
-    $cmd = '[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference="SilentlyContinue"; ' + $a.command
-    $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
-    $psi.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $hasArgs = if ($a -is [hashtable]) { $a.ContainsKey('args') } else { [bool]$a.PSObject.Properties['args'] }
+    if ($hasArgs -and $null -ne $a.args) {   # no shell: every argument arrives exactly as given (quotes, $, &, %, JSON)
+        $exe = Resolve-Exe ([string]$a.command); if (-not $exe) { throw "'$($a.command)' is not recognized as an internal or external command (not found on PATH)" }
+        $argl = (@($a.args) | ForEach-Object { [F__BUILD__.Fs]::Quote([string]$_) }) -join ' '
+        if ($exe -match '\.(cmd|bat)$') { $psi.FileName = 'cmd.exe'; $psi.Arguments = '/d /s /c "' + [F__BUILD__.Fs]::Quote($exe) + ' ' + $argl + '"' }   # ponytail: cmd still reads % and ^ in batch arguments
+        else { $psi.FileName = $exe; $psi.Arguments = $argl }
+    } else {
+        switch ([string]$a.shell) {
+            'cmd' { $f = Join-Path $env:TEMP ("helpermcp-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.cmd'); [IO.File]::WriteAllText($f, "@chcp 65001>nul`r`n" + ($a.command -replace "`r?`n", "`r`n"), (New-Object Text.UTF8Encoding $false)); $script:TmpDirs += $f
+                $psi.FileName = 'cmd.exe'; $psi.Arguments = '/d /c "' + $f + '"' }
+            'python' { $py = Resolve-Exe 'python'; if (-not $py) { $py = Resolve-Exe 'py' }; if (-not $py) { throw "'python' is not recognized: Python is not installed" }
+                $f = Join-Path $env:TEMP ("helpermcp-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.py'); [IO.File]::WriteAllText($f, $a.command, (New-Object Text.UTF8Encoding $false)); $script:TmpDirs += $f
+                $psi.FileName = $py; $psi.Arguments = [F__BUILD__.Fs]::Quote($f) }
+            { $_ -in 'bash', 'sh' } { $b = Resolve-Exe 'bash'; if (-not $b) { throw "'bash' is not recognized: no Git Bash / WSL on this PC" }; $psi.FileName = $b; $psi.Arguments = '-c ' + [F__BUILD__.Fs]::Quote([string]$a.command) }
+            default {
+                $cmd = '[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference="SilentlyContinue"; ' + $a.command
+                $psi.FileName = if ($a.shell -eq 'pwsh') { $w = Resolve-Exe 'pwsh'; if (-not $w) { throw "'pwsh' is not recognized: PowerShell 7 is not installed" }; $w } else { 'powershell.exe' }
+                $psi.Arguments = '-NoProfile -NonInteractive -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+            }
+        }
+    }
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
@@ -492,6 +626,7 @@ function Do-Run($a) {
     $psi.EnvironmentVariables['PYTHONUTF8'] = '1'; $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'   # Python tools crash on non-ASCII output otherwise
     if ($a.cwd) { $psi.WorkingDirectory = $a.cwd }
     $p = [Diagnostics.Process]::Start($psi)
+    if ($a.stdin) { $p.StandardInput.Write([string]$a.stdin) }
     $p.StandardInput.Close()
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
     $deadline = [DateTime]::UtcNow.AddSeconds($secs)
@@ -500,7 +635,13 @@ function Do-Run($a) {
         Pump-Light
     }
     [void]$p.WaitForExit()
-    @{ text = Clip ("[exit $($p.ExitCode)]`n" + $o.Result + $e.Result) }
+    @{ text = Clip ("[exit $($p.ExitCode)]`n" + $o.Result + (Plain-Err $e.Result)) }
+}
+function Plain-Err($t) {   # powershell.exe sends errors as CLIXML when its output is redirected: turn that back into plain lines (and fewer tokens)
+    if ($t -notmatch '^#< CLIXML') { return $t }
+    $x = (@([regex]::Matches($t, '<S S="Error">(.*?)</S>') | ForEach-Object { $_.Groups[1].Value }) -join '')
+    $x = [regex]::Replace($x, '_x([0-9A-Fa-f]{4})_', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+    [Net.WebUtility]::HtmlDecode($x).Replace("`r`n", "`n")
 }
 
 function Do-ReadFile($a) {
@@ -518,6 +659,7 @@ function Do-ReadFile($a) {
             return @{ jpeg = $ms.ToArray(); mime = 'image/jpeg'; text = "$($img.Width)x$($img.Height) image" }
         } finally { $img.Dispose() }
     }
+    if ($a.offset -or $a.lines -or $a.tail) { return @{ text = [F__BUILD__.Fs]::ReadRange((Full $a.path), (Int-Or $a.offset 1), (Int-Or $a.lines 200), (Int-Or $a.tail 0)) } }
     $max = if ($a.max_bytes) { [int]$a.max_bytes } else { 200000 }
     $fs = [IO.File]::Open($a.path, 'Open', 'Read', 'ReadWrite')
     try { $buf = New-Object byte[] ([Math]::Min($max, $fs.Length)); [void]$fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
@@ -526,6 +668,10 @@ function Do-ReadFile($a) {
 # Upload a file to the relay and return a download link for the operator.
 function Do-FetchFile($a) {
     $f = (Resolve-Path -LiteralPath $a.path).Path
+    if (Test-Path -LiteralPath $f -PathType Container) {   # a folder travels as one zip
+        $d = Join-Path $env:TEMP ('helpermcp-zip-' + [guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item -ItemType Directory $d); $script:TmpDirs += $d
+        $z = Join-Path $d ((Split-Path $f.TrimEnd('\') -Leaf).TrimEnd(':') + '.zip'); Zip-Dir $f $z; $f = $z
+    }
     $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
     try {
         $resp = Invoke-WebRequest -Uri ("$RELAY/a/file?name=" + [Uri]::EscapeDataString((Split-Path $f -Leaf))) -Method Post -InFile $f `
@@ -535,9 +681,195 @@ function Do-FetchFile($a) {
     @{ text = "$($d.url)  ($($d.size) bytes, link valid 24 h)" }
 }
 function Do-WriteFile($a) {
-    [IO.File]::WriteAllText($a.path, $a.content, (New-Object Text.UTF8Encoding $false))
+    $b = if ($a.base64) { [Convert]::FromBase64String([string]$a.content) } else { (New-Object Text.UTF8Encoding $false).GetBytes([string]$a.content) }
+    $fs = [IO.File]::Open((Full $a.path), $(if ($a.append) { 'Append' } else { 'Create' }), 'Write')
+    try { $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
     @{ text = 'written' }
 }
+# ---- files: tree, find, exact edits, transfer both ways (the loops are in F__BUILD__.Fs)
+function Full($p) { if (-not $p) { $p = '.' }; [Environment]::ExpandEnvironmentVariables($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath([string]$p)) }
+function Int-Or($v, $d) { if ($null -ne $v -and "$v" -ne '') { [int]$v } else { $d } }
+function Do-Tree($a) { @{ text = [F__BUILD__.Fs]::Tree((Full $a.path), [Math]::Min((Int-Or $a.depth 2), 6), [string]$a.pattern, (Int-Or $a.max 300)) } }
+function Do-Find($a) { @{ text = [F__BUILD__.Fs]::Find((Full $a.path), [string]$a.name, [string]$a.text, (Int-Or $a.max 100), (Int-Or $a.depth 20)) } }
+function Do-EditFile($a) { @{ text = [F__BUILD__.Fs]::Edit((Full $a.path), [string]$a.old, [string]$a.new, [bool]$a.all) } }
+function Do-PushFile($a) {   # operator -> this PC: a relay link from the viewer upload, or any http link
+    $dest = Full $a.path; $dir = Split-Path $dest -Parent; if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Force $dir) }
+    $rq = [Net.WebRequest]::Create([string]$a.url); $rq.Timeout = 60000; $rq.ReadWriteTimeout = 120000
+    $resp = $rq.GetResponse(); $n = 0
+    try {
+        $in = $resp.GetResponseStream(); $out = [IO.File]::Create($dest + '.part')
+        try { $buf = New-Object byte[] 1048576; while (($k = $in.Read($buf, 0, $buf.Length)) -gt 0) { $out.Write($buf, 0, $k); $n += $k; Pump-Light } } finally { $out.Dispose(); $in.Dispose() }
+    } finally { $resp.Close() }
+    Move-Item -LiteralPath ($dest + '.part') -Destination $dest -Force
+    @{ text = "saved $dest ($([F__BUILD__.Fs]::Human($n)))" }
+}
+function Zip-Dir($src, $dest) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
+    [IO.Compression.ZipFile]::CreateFromDirectory($src, $dest, [IO.Compression.CompressionLevel]::Optimal, $true)
+}
+
+# ---- the state of the machine in one call
+function Do-System($a) {
+    $secs = if ($a.sections) { @($a.sections) } else { 'overview', 'disks', 'processes', 'network' }
+    $top = Int-Or $a.top 15; $o = New-Object Text.StringBuilder
+    $cul = [Threading.Thread]::CurrentThread.CurrentCulture; [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture   # 12.6, not 12,6
+    try {
+    function Sec($t) { [void]$o.Append("== $t`n") }
+    function Line($t) { [void]$o.Append("$t`n") }
+    foreach ($s in $secs) {
+        try {
+            switch ($s) {
+                'overview' {
+                    Sec 'overview'; $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+                    $up = (Get-Date) - $os.LastBootUpTime
+                    Line "$($os.Caption) build $($os.BuildNumber), $env:COMPUTERNAME\$env:USERNAME, admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator'))"
+                    Line ("up {0}d {1}h {2}m; cpu {3} ({4} cores) load {5}%; ram {6:0.0} of {7:0.0} GB free" -f $up.Days, $up.Hours, $up.Minutes, $cpu.Name.Trim(), $cpu.NumberOfLogicalProcessors, $cpu.LoadPercentage, ($os.FreePhysicalMemory / 1MB), ($os.TotalVisibleMemorySize / 1MB))
+                }
+                'disks' {
+                    Sec 'disks'
+                    Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { Line ("{0} {1} free of {2} ({3:0}% free) {4} {5}" -f $_.DeviceID, [F__BUILD__.Fs]::Human($_.FreeSpace), [F__BUILD__.Fs]::Human($_.Size), (100.0 * $_.FreeSpace / [Math]::Max(1.0, [double]$_.Size)), $_.FileSystem, $_.VolumeName) }
+                }
+                'processes' {
+                    Sec "processes: top $top by CPU now (%), then by memory"
+                    $n = [Environment]::ProcessorCount
+                    Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.Name -ne '_Total' -and $_.Name -ne 'Idle' } | Sort-Object PercentProcessorTime -Descending | Select-Object -First $top |
+                        ForEach-Object { Line ("{0,5:0}%  {1,8}  pid {2,-6} {3}" -f ($_.PercentProcessorTime / $n), [F__BUILD__.Fs]::Human($_.WorkingSetPrivate), $_.IDProcess, $_.Name) }
+                    Line '--'
+                    Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First $top | ForEach-Object { Line ("{0,8}  pid {1,-6} {2}" -f [F__BUILD__.Fs]::Human($_.WorkingSet64), $_.Id, $_.ProcessName) }
+                }
+                'network' {
+                    Sec 'network'
+                    Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Sort-Object { -not $_.DefaultIPGateway } | ForEach-Object { Line ("{0}: ip {1}; gw {2}; dns {3}; dhcp={4}" -f $_.Description, (@($_.IPAddress) -join ', '), (@($_.DefaultIPGateway) -join ', '), (@($_.DNSServerSearchOrder) -join ', '), $_.DHCPEnabled) }
+                    $px = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+                    if ($px.ProxyEnable) { Line "proxy: $($px.ProxyServer)" }
+                }
+                'services' {
+                    Sec 'auto-start services that are not running'
+                    Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | Select-Object -First 40 | ForEach-Object { Line "$($_.Name) ($($_.DisplayName)): $($_.State)" }
+                }
+                'startup' {
+                    Sec 'startup'
+                    Get-CimInstance Win32_StartupCommand | ForEach-Object { Line ("{0}: {1}  [{2}]" -f $_.Name, $_.Command, $_.Location) }
+                }
+                'apps' {
+                    $L = @(Installed-Apps '')
+                    Sec "installed programs ($($L.Count)); util {op:apps, name} searches"
+                    Line (($L | Select-Object -First 200 | ForEach-Object { $_.Split('|')[0] }) -join '; ')
+                }
+                'events' {
+                    Sec "system errors, last 24 h (newest first, $top)"
+                    Get-WinEvent -FilterHashtable @{ LogName = 'System', 'Application'; Level = 1, 2; StartTime = (Get-Date).AddDays(-1) } -MaxEvents $top -ErrorAction SilentlyContinue |
+                        ForEach-Object { Line ("{0:MM-dd HH:mm} {1} {2}: {3}" -f $_.TimeCreated, $_.ProviderName, $_.Id, (Cut ([string]$_.Message) 160)) }
+                }
+                default { Line "== ${s}: unknown section" }
+            }
+        } catch { Line "($s failed: $($_.Exception.Message))" }
+    }
+    } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $cul }
+    @{ text = $o.ToString().TrimEnd() }
+}
+
+# ---- ready-made operations: right on the first try, no quoting
+$ReadOnlyUtil = 'apps', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
+function Installed-Apps($q) {   # "name|version|publisher" from the uninstall keys (fast, no WMI Win32_Product)
+    $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and (-not $q -or $_.DisplayName -like "*$q*" -or $_.PSChildName -like "*$q*") } |
+        Sort-Object DisplayName -Unique | ForEach-Object { "$($_.DisplayName)|$($_.DisplayVersion)|$($_.Publisher)" }
+}
+function Run-Args($exe, [string[]]$argv, $secs = 1800) { $r = Do-Run @{ command = $exe; args = $argv; timeout_s = $secs }; $r.text }
+function Exit-Of($t) { if ($t -match '^\[exit (-?\d+)\]') { [int]$Matches[1] } else { -1 } }
+$WingetCodes = @{ -1978335212 = 'no package found with that name or id (search: run winget search <name>)'; -1978335189 = 'already installed, no newer version'; -1978335215 = 'the installer failed (see output)'
+    -1978334967 = 'a reboot is needed to finish'; -1978335224 = 'download failed (network)'; -1978335135 = 'already installed' }
+function Do-Util($a) {
+    $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
+    switch ($op) {
+        'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
+        { $_ -in 'install', 'uninstall' } {
+            if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }
+            $by = if ($name -match '^[\w-]+\.[\w.-]+$') { '--id' } else { '--name' }
+            $argv = @($op, $by, $name, '--exact', '--silent', '--disable-interactivity', '--accept-source-agreements') + $(if ($op -eq 'install') { '--accept-package-agreements' } else { @() })
+            $t = Run-Args 'winget' $argv; $c = Exit-Of $t
+            $t = ($t -split "`n" | Where-Object { $_ -notmatch '^\s*[-\\|/]\s*$' -and $_ -notmatch '[█▒]' }) -join "`n"   # drop the spinner and progress bars
+            if ($c -eq 0) { return @{ text = "ok: $op $name`n$(Cut $t 1500)" } }
+            if ($WingetCodes.ContainsKey($c)) { if ($c -in -1978335189, -1978335135) { return @{ text = "ok: $($WingetCodes[$c])" } }; throw "winget: $($WingetCodes[$c])`n$(Cut $t 1500)" }
+            throw "[exit $c] $(Cut $t 2000)"
+        }
+        'kill' {
+            $argv = if ($name -match '^\d+$') { @('/PID', $name, '/T', '/F') } else { @('/IM', $(if ($name -match '\.exe$') { $name } else { "$name.exe" }), '/T', '/F') }
+            $t = Run-Args 'taskkill' $argv 30; if ((Exit-Of $t) -ne 0) { throw $t }; return @{ text = $t }
+        }
+        'service' {
+            $sv = Get-Service -Name $name -ErrorAction SilentlyContinue; if (-not $sv) { $sv = Get-Service -DisplayName $name -ErrorAction Stop }
+            switch ($(if ($val) { $val } else { 'status' })) { 'start' { Start-Service -InputObject $sv } 'stop' { Stop-Service -InputObject $sv -Force } 'restart' { Restart-Service -InputObject $sv -Force } }
+            $sv.Refresh(); return @{ text = "$($sv.Name) ($($sv.DisplayName)): $($sv.Status), start $($sv.StartType)" }
+        }
+        'env_get' {
+            if (-not $name) { return @{ text = (Get-ChildItem Env: | ForEach-Object { "$($_.Name)=$(Cut $_.Value 200)" }) -join "`n" } }
+            return @{ text = "process: $([Environment]::GetEnvironmentVariable($name, 'Process'))`nuser: $([Environment]::GetEnvironmentVariable($name, 'User'))`nmachine: $([Environment]::GetEnvironmentVariable($name, 'Machine'))" }
+        }
+        'env_set' { [Environment]::SetEnvironmentVariable($name, $val, 'User'); [Environment]::SetEnvironmentVariable($name, $val, 'Process'); return @{ text = "set $name for the user (new programs see it; this agent too)" } }
+        'path_add' {
+            $dir = Full $(if ($p) { $p } else { $val }); $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+            try {
+                $cur = [string]$k.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)   # keep %VARS% as they are (setx would expand and cut at 1024)
+                if (@($cur -split ';' | Where-Object { $_.TrimEnd('\') -ieq $dir.TrimEnd('\') }).Count) { return @{ text = "already in the user PATH: $dir" } }
+                $k.SetValue('Path', ($(if ($cur) { $cur.TrimEnd(';') + ';' } else { '' }) + $dir), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            } finally { $k.Close() }
+            [F__BUILD__.Fs]::Broadcast(); $env:PATH = "$env:PATH;$dir"
+            return @{ text = "added to the user PATH: $dir (new programs see it; this agent too)" }
+        }
+        'reg_get' {
+            $rp = 'Registry::' + ($p -replace '^HKCU\\', 'HKEY_CURRENT_USER\' -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\')
+            if ($name) { return @{ text = [string](Get-ItemPropertyValue -LiteralPath $rp -Name $name) } }
+            $it = Get-Item -LiteralPath $rp
+            return @{ text = (@($it.Property | ForEach-Object { "$_ = $($it.GetValue($_))" }) + @(Get-ChildItem -LiteralPath $rp -ErrorAction SilentlyContinue | Select-Object -First 50 | ForEach-Object { "[$($_.PSChildName)]" })) -join "`n" }
+        }
+        'reg_set' {
+            $rp = 'Registry::' + ($p -replace '^HKCU\\', 'HKEY_CURRENT_USER\' -replace '^HKLM\\', 'HKEY_LOCAL_MACHINE\')
+            if (-not (Test-Path -LiteralPath $rp)) { [void](New-Item -Path $rp -Force) }
+            $type = if ($val -match '^\d{1,9}$') { 'DWord' } else { 'String' }
+            New-ItemProperty -LiteralPath $rp -Name $name -Value $(if ($type -eq 'DWord') { [int]$val } else { $val }) -PropertyType $type -Force | Out-Null
+            return @{ text = "set $p\$name = $val ($type)" }
+        }
+        'open' { Start-Process $(if ($a.url) { [string]$a.url } else { Full $p }); return @{ text = 'opened' } }
+        'clipboard_get' { return @{ text = (Get-Clipboard -Raw) } }
+        'clipboard_set' { Set-Clipboard -Value $val; return @{ text = 'ok' } }
+        'dns_flush' { Clear-DnsClientCache; return @{ text = 'DNS cache flushed' } }
+        'net_test' {
+            $h = if ($a.host) { [string]$a.host } else { $name }; $port = Int-Or $a.port 443
+            try { $ips = [Net.Dns]::GetHostAddresses($h) } catch { return @{ text = "dns ${h}: FAILED $($_.Exception.InnerException.Message)" } }
+            $ip = @($ips | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0]; if (-not $ip) { $ip = $ips[0] }
+            $c = New-Object Net.Sockets.TcpClient; $sw = [Diagnostics.Stopwatch]::StartNew()
+            try { $ok = $c.ConnectAsync($ip, $port).Wait(5000) } catch { $ok = $false } finally { $c.Close() }
+            return @{ text = "dns $h -> $(($ips | ForEach-Object { $_.ToString() }) -join ', ')`ntcp ${port}: " + $(if ($ok) { "open ($($sw.ElapsedMilliseconds) ms)" } else { 'FAILED (closed, filtered or timed out)' }) }
+        }
+        'ports' {
+            $L = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { -not $name -or $_.LocalPort -eq [int]$name } | Sort-Object LocalPort -Unique | Select-Object -First 80 |
+                ForEach-Object { $pr = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; "{0}:{1}  pid {2} {3}" -f $_.LocalAddress, $_.LocalPort, $_.OwningProcess, $pr.ProcessName }
+            return @{ text = $(if ($L) { $L -join "`n" } else { 'nothing listens there' }) }
+        }
+        'download' { return Do-PushFile @{ url = $a.url; path = $p } }
+        'zip' {
+            $src = Full $p; $dest = if ($a.dest) { Full $a.dest } else { $src.TrimEnd('\') + '.zip' }
+            if (Test-Path -LiteralPath $src -PathType Container) { Zip-Dir $src $dest }
+            else { Add-Type -AssemblyName System.IO.Compression.FileSystem; $z = [IO.Compression.ZipFile]::Open($dest, 'Create'); try { [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $src, (Split-Path $src -Leaf)) } finally { $z.Dispose() } }
+            return @{ text = "$dest ($([F__BUILD__.Fs]::Human((Get-Item -LiteralPath $dest).Length)))" }
+        }
+        'unzip' {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $src = Full $p; $dest = if ($a.dest) { Full $a.dest } else { [IO.Path]::ChangeExtension($src, $null).TrimEnd('.') }
+            [IO.Compression.ZipFile]::ExtractToDirectory($src, $dest); return @{ text = "extracted to $dest" }
+        }
+        'shortcut' {
+            $lnk = Full $(if ($a.dest) { $a.dest } else { Join-Path ([Environment]::GetFolderPath('Desktop')) ((Split-Path $p -Leaf) + '.lnk') })
+            $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk); $s.TargetPath = (Full $p); if ($val) { $s.Arguments = $val }; $s.Save()
+            return @{ text = "shortcut $lnk -> $(Full $p)" }
+        }
+        default { throw "unknown op $op" }
+    }
+}
+
 function Do-ListDir($a) {
     $rows = Get-ChildItem -LiteralPath $a.path -Force -ErrorAction SilentlyContinue | Select-Object -First 500 | ForEach-Object {
         '{0} {1,12} {2:yyyy-MM-dd HH:mm:ss} {3}' -f $(if ($_.PSIsContainer) { 'd' } else { '-' }), $(if ($_.PSIsContainer) { 0 } else { $_.Length }), $_.LastWriteTime, $_.Name
@@ -632,7 +964,7 @@ function Ensure-Node($cmd) {
     $script:ExtraPath = @($script:NodeBin) + $script:ExtraPath
 }
 
-function Quote-Arg($s) { if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s } }
+function Quote-Arg($s) { [F__BUILD__.Fs]::Quote([string]$s) }
 
 function Child-Rpc($c, $method, $params, $timeoutSec = 60, [switch]$Notify) {
     $msg = [ordered]@{ jsonrpc = '2.0'; method = $method }
@@ -1102,18 +1434,19 @@ function Cleanup-Children {
 
 # Light requests (screenshots, sysinfo, file reads) are answered even while a long command runs: the live viewer and the AI's
 # screenshots never freeze behind a 5-minute install or render. Heavy ones wait their turn.
-$LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools'
+$LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools', 'tree'
 $script:Deferred = New-Object System.Collections.ArrayList
 $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
 
 # ---- the friend's console: a pinned header with the session code (copied to the clipboard), Esc ends the session at any moment, a soft chime and a flashing window
 # when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
 # and after the answer the window focus and the pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
-$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'
-    write_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
+$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; util = 'commands'
+    write_file = 'files'; edit_file = 'files'; push_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
 $Quiet = @{ watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
-    read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP') }
+    read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP')
+    tree = @('смотрю папки', 'looking through folders'); find = @('ищу файлы', 'searching files'); system = @('смотрю состояние системы', 'reading the system state') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
 function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
 function Step-Text($st) {
@@ -1140,8 +1473,8 @@ function Steps-Of($name, $a) {   # the steps of a tool call; a move right before
 }
 function Describe-Action($name, $a) {   # -> array of short sentences
     if ($AskGroup[$name] -eq 'input') { return @(Steps-Of $name $a | ForEach-Object { Step-Text $_ }) }
-    $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
-    $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } else { ($a | ConvertTo-Json -Compress) }
+    $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'edit_file' { T 'изменить файл: ' 'edit file: ' } 'push_file' { T 'получить файл: ' 'receive file: ' } 'util' { (T 'утилита: ' 'utility: ') + $a.op + ' ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
+    $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } elseif ($a.url) { $a.url } elseif ($name -eq 'util') { '' } else { ($a | ConvertTo-Json -Compress) }
     @($pre + (Cut $tail 90))
 }
 function Say-Step($name, $a) {
@@ -1384,15 +1717,15 @@ function Process-Command($cmd) {
     try {
         Check-Esc
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name)) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
-        if ($script:Mode -eq 'ask' -and $AskTools -contains $name) { Ask-Permission $name $a }
+        if ($script:Mode -eq 'ask' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op)) { Ask-Permission $name $a }
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; util = 'Do-Util'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
-    } catch { $res.ok = $false; $res.error = $_.Exception.Message }
+    } catch { $ex = $_.Exception; while ($ex -is [Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }; $res.ok = $false; $res.error = $ex.Message }   # a C# helper's own message, not "Exception calling ..."
     if (-not $quietCall) { Overlay-Send 'idle' }
     if (-not $quietCall) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished

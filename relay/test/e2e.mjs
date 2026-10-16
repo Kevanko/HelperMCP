@@ -133,6 +133,57 @@ assert.ok(Buffer.from(await (await fetch(furl)).arrayBuffer()).equals(blob), 'do
 assert.equal((await fetch(BASE + '/f/' + '0'.repeat(24) + '/x')).status, 404); console.log('fetch_file ok');
 // privacy: files rest encrypted on the relay's disk, the state file is encrypted, and both are gone with the session
 globalThis.__furl = furl;
+
+// files without shell one-liners: tree, find, line ranges, exact edits, append / binary writes, files both ways, folders as zip
+const ft = path.join(tmp, 'tree'); fs.mkdirSync(path.join(ft, 'sub', 'deep'), { recursive: true });
+fs.writeFileSync(path.join(ft, 'a.log'), 'one\ntwo NEEDLE here\nthree\n'); fs.writeFileSync(path.join(ft, 'sub', 'b.txt'), 'nothing'); fs.writeFileSync(path.join(ft, 'sub', 'deep', 'c.log'), 'x\r\nNeedle again\r\n');
+const tre = txt(await tool('tree', { session: code, path: ft, depth: 3 }));
+assert.match(tre, /sub\/\s+\(2\)/); assert.match(tre, /a\.log\s+\d+B/); assert.match(tre, /c\.log/); console.log('tree ok');
+assert.doesNotMatch(txt(await tool('tree', { session: code, path: ft, depth: 3, pattern: '*.log' })), /b\.txt/);
+const byName = txt(await tool('find', { session: code, path: ft, name: '*.log' }));
+assert.match(byName, /a\.log/); assert.match(byName, /c\.log/); assert.doesNotMatch(byName, /b\.txt/);
+const byText = txt(await tool('find', { session: code, path: ft, text: 'needle' }));
+assert.match(byText, /a\.log:2: two NEEDLE here/); assert.match(byText, /c\.log:2: Needle again/); console.log('find ok');
+const rng = txt(await tool('read_file', { session: code, path: path.join(ft, 'a.log'), offset: 2, lines: 1 }));
+assert.match(rng, /^2\ttwo NEEDLE here\n\[lines 2-2 of 3\]$/); assert.match(txt(await tool('read_file', { session: code, path: path.join(ft, 'a.log'), tail: 1 })), /^3\tthree/); console.log('read_file ranges ok');
+const crlf = path.join(ft, 'sub', 'deep', 'c.log');
+assert.match(txt(await tool('edit_file', { session: code, path: crlf, old: 'x\nNeedle', new: 'y\nPin' })), /replaced 1/);
+assert.equal(fs.readFileSync(crlf, 'utf8'), 'y\r\nPin again\r\n', 'edit_file keeps CRLF');
+fs.writeFileSync(path.join(ft, 'dup.txt'), 'ab ab');
+const amb = await raw('edit_file', { session: code, path: path.join(ft, 'dup.txt'), old: 'ab', new: 'c' });
+assert.ok(amb.isError && /found 2 times/.test(txt(amb)) && /HINT:/.test(txt(amb)), 'ambiguous edit fails with a hint: ' + txt(amb));
+assert.match(txt(await tool('edit_file', { session: code, path: path.join(ft, 'dup.txt'), old: 'ab', new: 'c', all: true })), /replaced 2/);
+assert.equal(fs.readFileSync(path.join(ft, 'dup.txt'), 'utf8'), 'c c'); console.log('edit_file ok');
+await tool('write_file', { session: code, path: path.join(ft, 'dup.txt'), content: '+tail', append: true });
+assert.equal(fs.readFileSync(path.join(ft, 'dup.txt'), 'utf8'), 'c c+tail');
+await tool('write_file', { session: code, path: path.join(ft, 'bin.dat'), content: Buffer.from([0, 255, 1, 128]).toString('base64'), base64: true });
+assert.deepEqual([...fs.readFileSync(path.join(ft, 'bin.dat'))], [0, 255, 1, 128]); console.log('write_file append / base64 ok');
+const pushed = path.join(ft, 'in', 'blob-copy.bin');
+assert.match(txt(await tool('push_file', { session: code, url: globalThis.__furl, path: pushed })), /saved/);
+assert.ok(fs.readFileSync(pushed).equals(blob), 'push_file delivers the exact bytes'); console.log('push_file ok');
+const fz = txt(await tool('fetch_file', { session: code, path: path.join(ft, 'sub') }));
+const zurl = /(http\S+\/f\/\S+\.zip)/.exec(fz)?.[1]; assert.ok(zurl, 'a folder comes back as a zip link: ' + fz);
+const zip = Buffer.from(await (await fetch(zurl)).arrayBuffer());
+assert.equal(zip.slice(0, 2).toString(), 'PK'); assert.ok(zip.includes(Buffer.from('b.txt')) && zip.includes(Buffer.from('c.log')), 'zip holds the folder'); console.log('fetch_file folder ok');
+
+// system state and ready-made utilities
+const sy = txt(await tool('system', { session: code }));
+console.log(sy.slice(0, 1800)); assert.match(sy, /== overview/); assert.match(sy, /== disks/); assert.match(sy, /== processes/); assert.match(sy, /== network/); console.log('system ok');
+assert.match(txt(await tool('util', { session: code, op: 'env_get', name: 'PATH' })), useps ? /process: .+/ : /.+/);
+assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
+const zp = path.join(tmp, 'tree-copy.zip');
+assert.match(txt(await tool('util', { session: code, op: 'zip', path: ft, dest: zp })), /tree-copy\.zip/);
+assert.match(txt(await tool('util', { session: code, op: 'unzip', path: zp, dest: path.join(tmp, 'unz') })), /extracted/);
+assert.ok(fs.existsSync(path.join(tmp, 'unz', 'tree', 'a.log')), 'unzip restores the folder'); console.log('util ok');
+
+// no quoting traps: arguments reach the program byte for byte, and a missing program gets a hint
+const tricky = `a "b" 'c' $d & | %e% \\ "\\"x\\\\" ü`;
+const argOut = txt(await tool('run', { session: code, command: 'node', args: ['-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', tricky, '', 'two words'] }));
+assert.equal(argOut.replace(/^\[exit 0\]\n/, ''), JSON.stringify([tricky, '', 'two words']), 'args arrive exactly: ' + argOut);
+assert.match(txt(await tool('run', { session: code, command: 'node', args: ['-e', 'process.stdin.pipe(process.stdout)'], stdin: 'piped-in' })), /piped-in/); console.log('run args / stdin ok');
+const nf = await raw('run', { session: code, command: 'definitely-not-a-program-xyz --version' });
+assert.match(nf.content.map((c) => c.text).join(' '), /HINT: The program is not installed/);
+assert.match(txt(await tool('misses', { limit: 5 })), /"hint":"not-found-cmd"/, 'the failure is in the mistake log'); console.log('error hint + mistake log ok');
 const FDIR = path.join(path.dirname(STATE), 'files');
 for (const f of fs.readdirSync(FDIR)) assert.ok(!fs.readFileSync(path.join(FDIR, f)).includes(blob.subarray(1000, 1064)), 'a fetched file must not be readable on the relay disk');
 await new Promise((r) => setTimeout(r, 500));

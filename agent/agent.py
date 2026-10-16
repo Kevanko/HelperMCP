@@ -34,7 +34,7 @@ T = {
     "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "edit_file", "push_file", "util", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -354,7 +354,7 @@ def restore_focus(w):
 
 
 ASK_GROUP = {"click": "input", "move": "input", "drag": "input", "scroll": "input", "type_text": "input", "press_key": "input", "actions": "input", "run": "commands",
-             "start_process": "commands", "write_file": "files", "fetch_file": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
+             "start_process": "commands", "util": "commands", "write_file": "files", "edit_file": "files", "push_file": "files", "fetch_file": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
 GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
@@ -397,13 +397,14 @@ def steps_of(name, a):
 def describe(name, a):
     if name in ASK_GROUP and ASK_GROUP[name] == "input": return [step_text(st) for st in steps_of(name, a)]
     ru = RU
-    return [{"run": ("команда: ", "command: "), "start_process": ("запустить: ", "start: "), "write_file": ("записать файл: ", "write file: "), "fetch_file": ("скопировать файл: ", "copy file: "),
+    return [{"run": ("команда: ", "command: "), "start_process": ("запустить: ", "start: "), "write_file": ("записать файл: ", "write file: "), "fetch_file": ("скопировать файл: ", "copy file: "), "edit_file": ("изменить файл: ", "edit file: "), "push_file": ("получить файл: ", "receive file: "), "util": ("утилита: ", "utility: "),
              "mcp_start": ("запустить MCP: ", "start MCP: "), "mcp_call": ("вызвать MCP: ", "call MCP: ")}.get(name, (name + " ", name + " "))[0 if ru else 1]
-            + cut(a.get("command") or a.get("path") or a.get("name") or json.dumps(a, ensure_ascii=False), 90)]
+            + cut((a.get("op", "") + " " if name == "util" else "") + (a.get("command") or a.get("path") or a.get("name") or a.get("url") or json.dumps(a, ensure_ascii=False)), 90)]
 
 
 QUIET = {"watch": ("смотрю, что происходит на экране", "watching the screen"), "trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
-         "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP")}
+         "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP"),
+         "tree": ("смотрю папки", "looking through folders"), "find": ("ищу файлы", "searching files"), "system": ("смотрю состояние системы", "reading the system state")}
 
 
 LASTQ = [None]
@@ -803,8 +804,10 @@ def ensure_for(text, args=None):
 
 def run(a):
     ensure_for(a["command"])
+    if a.get("args") is not None: argv = [a["command"]] + [str(x) for x in a["args"]]   # no shell: every argument arrives exactly as given
+    else: argv = {"python": [sys.executable, "-c"], "sh": ["sh", "-c"]}.get(a.get("shell"), ["bash", "-c"]) + [a["command"]]
     try:
-        p = subprocess.run(["bash", "-c", a["command"]], capture_output=True, text=True, timeout=a.get("timeout_s", 60), errors="replace", env=with_path(), cwd=a.get("cwd"))
+        p = subprocess.run(argv, input=a.get("stdin"), capture_output=True, text=True, timeout=a.get("timeout_s", 60), errors="replace", env=with_path(), cwd=a.get("cwd"))
         code, out = p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as e:
         return {"text": f"[timeout after {a.get('timeout_s', 60)}s]\n" + clip(str(e.stdout or ""))}
@@ -830,7 +833,10 @@ def start_process(a):
 
 def fetch_file(a):
     """Upload a file to the relay and return a download link for the operator."""
-    path = os.path.expanduser(a["path"]); size = os.path.getsize(path)
+    path = os.path.expanduser(a["path"]).rstrip("/") or "/"
+    if os.path.isdir(path):   # a folder travels as one zip
+        z = os.path.join(tempfile.mkdtemp(), os.path.basename(path) + ".zip"); TMP.append(os.path.dirname(z)); zip_dir(path, z); path = z
+    size = os.path.getsize(path)
     req = urllib.request.Request(RELAY + "/a/file?name=" + urllib.parse.quote(os.path.basename(path)), method="POST")
     req.add_header("Authorization", "Bearer " + TOKEN); req.add_header("Content-Length", str(size)); req.add_header("Content-Type", "application/octet-stream")
     with open(path, "rb") as f, urllib.request.urlopen(req, f, timeout=3600) as resp:
@@ -850,13 +856,15 @@ def read_file(a):
             return {"jpeg": bytes(buf), "mime": "image/jpeg", "text": f"{w0}x{h0} image"}
         except Exception:
             with open(path, "rb") as f: return {"jpeg": f.read(), "mime": "image/png" if path.lower().endswith(".png") else "image/jpeg"}
+    if a.get("offset") or a.get("lines") or a.get("tail"): return read_range(path, a)
     with open(path, "rb") as f:
         return {"text": f.read(a.get("max_bytes", 200_000)).decode("utf-8", "replace")}
 
 
 def write_file(a):
-    with open(os.path.expanduser(a["path"]), "w", encoding="utf-8") as f:
-        f.write(a["content"])
+    data = base64.b64decode(a["content"]) if a.get("base64") else a["content"].encode("utf-8")
+    with open(os.path.expanduser(a["path"]), "ab" if a.get("append") else "wb") as f:
+        f.write(data)
     return {"text": "written"}
 
 
@@ -869,6 +877,200 @@ def list_dir(a):
         except OSError:
             rows.append(f"? {e.name}")
     return {"text": "\n".join(rows)}
+
+
+# ---- files: tree, find, ranges, exact edits, transfer both ways ---------------------------------------
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".cache"}
+
+
+def human(n):
+    for u in ("B", "K", "M", "G"):
+        if n < 1024 or u == "G": return f"{n:.0f}{u}" if u == "B" else f"{n:.1f}{u}"
+        n /= 1024
+
+
+def tree(a):
+    import fnmatch
+    root = os.path.expanduser(a.get("path") or "."); depth = min(int(a.get("depth") or 2), 6); pat = a.get("pattern"); cap = int(a.get("max") or 300)
+    out, more = [os.path.abspath(root)], [0]
+    def walk(d, lvl):
+        try: ents = sorted(os.scandir(d), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+        except OSError as e: out.append("  " * lvl + f"[{e.strerror}]"); return
+        for e in ents:
+            isd = e.is_dir(follow_symlinks=False)
+            if not isd and pat and not fnmatch.fnmatch(e.name.lower(), pat.lower()): continue
+            if len(out) > cap: more[0] += 1; continue
+            if isd:
+                try: n = len(os.listdir(e.path))
+                except OSError: n = "?"
+                out.append("  " * lvl + f"{e.name}/  ({n})")
+                if lvl < depth and e.name not in SKIP_DIRS: walk(e.path, lvl + 1)
+            else:
+                try: out.append("  " * lvl + f"{e.name}  {human(e.stat(follow_symlinks=False).st_size)}")
+                except OSError: out.append("  " * lvl + e.name)
+    walk(root, 1)
+    if more[0]: out.append(f"... {more[0]} more (raise max, lower depth or use find)")
+    return {"text": "\n".join(out)}
+
+
+def find(a):
+    import fnmatch
+    root = os.path.expanduser(a.get("path") or "."); name = (a.get("name") or "*").lower(); cap = int(a.get("max") or 100)
+    rx = re.compile(a["text"], re.I) if a.get("text") else None; maxd = int(a.get("depth") or 20); t0 = time.time()
+    out, base = [], os.path.abspath(root).rstrip(os.sep).count(os.sep)
+    for d, dirs, files in os.walk(root):
+        if os.path.abspath(d).count(os.sep) - base >= maxd: dirs[:] = []
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS]
+        for f in files:
+            if not fnmatch.fnmatch(f.lower(), name): continue
+            p = os.path.join(d, f)
+            if not rx:
+                try: out.append(f"{p}  {human(os.path.getsize(p))}")
+                except OSError: out.append(p)
+            else:
+                try:
+                    if os.path.getsize(p) > 5_000_000: continue
+                    with open(p, "rb") as fh: raw = fh.read()
+                    if b"\0" in raw[:4096]: continue
+                    for i, line in enumerate(_decode(raw)[0].splitlines(), 1):
+                        if rx.search(line):
+                            out.append(f"{p}:{i}: {line.strip()[:160]}")
+                            if len(out) >= cap: break
+                except OSError: continue
+            if len(out) >= cap: return {"text": "\n".join(out) + f"\n... stopped at {cap} results (raise max or narrow path / name)"}
+        if time.time() - t0 > 25: return {"text": "\n".join(out) + "\n... stopped after 25 s (narrow the path)"}
+    return {"text": "\n".join(out) or "nothing found"}
+
+
+def _decode(raw):
+    """-> (text, encoding, bom) so an edit writes the file back the way it was."""
+    for bom, enc in ((b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if raw.startswith(bom): return raw[len(bom):].decode(enc), enc, bom
+    try: return raw.decode("utf-8"), "utf-8", b""
+    except UnicodeDecodeError: return raw.decode("latin-1"), "latin-1", b""
+
+
+def read_range(path, a):
+    with open(path, "rb") as f: text = _decode(f.read())[0]
+    L = text.splitlines(); n = len(L)
+    if a.get("tail"): start = max(0, n - int(a["tail"])); cnt = int(a["tail"])
+    else: start = max(0, int(a.get("offset") or 1) - 1); cnt = int(a.get("lines") or 200)
+    part = L[start:start + cnt]
+    return {"text": "\n".join(f"{start + i + 1}\t{s}" for i, s in enumerate(part)) + f"\n[lines {start + 1}-{start + len(part)} of {n}]"}
+
+
+def edit_file(a):
+    path = os.path.expanduser(a["path"])
+    with open(path, "rb") as f: text, enc, bom = _decode(f.read())
+    old, new = a["old"], a.get("new", "")
+    if old not in text and "\r\n" in text and "\r\n" not in old:   # the AI writes \n, the file has CRLF
+        old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")
+    n = text.count(old) if old else 0
+    if n == 0: raise RuntimeError("old text not found (it must match exactly, spaces and line breaks included; read_file with offset/lines to copy it)")
+    if n > 1 and not a.get("all"): raise RuntimeError(f"old text found {n} times: add surrounding lines to make it unique, or all=true")
+    with open(path, "wb") as f: f.write(bom + text.replace(old, new).encode(enc))
+    return {"text": f"replaced {n}"}
+
+
+def push_file(a):
+    """operator -> this PC: download a URL (a relay link from the viewer upload, or any http link) to path."""
+    path = os.path.expanduser(a["path"]); os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    req = urllib.request.Request(a["url"], headers={"User-Agent": "helpermcp"})
+    n = 0
+    with urllib.request.urlopen(req, timeout=3600) as r, open(path + ".part", "wb") as f:
+        while True:
+            b = r.read(1 << 20)
+            if not b: break
+            f.write(b); n += len(b)
+    os.replace(path + ".part", path)
+    return {"text": f"saved {path} ({human(n)})"}
+
+
+def zip_dir(src, dest):
+    import zipfile
+    src = os.path.abspath(src)
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+        for d, _, files in os.walk(src):
+            for f in files:
+                p = os.path.join(d, f)
+                try: z.write(p, os.path.relpath(p, os.path.dirname(src)))
+                except OSError: pass
+
+
+# ---- system state in one call, ready-made utilities --------------------------------------------------
+def system(a):
+    secs = a.get("sections") or ["overview", "disks", "processes", "network"]; top = int(a.get("top") or 15); out = []
+    def add(title, cmd):
+        out.append(f"== {title}"); out.append(sh(cmd, 20)[1].strip()[:6000])
+    for s in secs:
+        if s == "overview": add("overview", "uname -srm; uptime -p; free -h | sed -n 2p; nproc")
+        elif s == "disks": add("disks", "df -h -x tmpfs -x devtmpfs -x squashfs -x overlay 2>/dev/null")
+        elif s == "processes": add("processes (cpu%, mem%)", f"ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -{top + 1}")
+        elif s == "network": add("network", "ip -br addr 2>/dev/null; ip route 2>/dev/null | head -3; grep -m3 nameserver /etc/resolv.conf")
+        elif s == "services": add("failed services", "systemctl --failed --no-legend 2>/dev/null | head -30")
+        elif s == "startup": add("startup", "ls ~/.config/autostart /etc/xdg/autostart 2>/dev/null")
+        elif s == "apps": add("apps", "(dpkg-query -W -f='${Package}\\n' 2>/dev/null || rpm -qa) | wc -l; flatpak list --app --columns=application 2>/dev/null | head -40")
+        elif s == "events": add("recent errors", "journalctl -p err -n 20 --no-pager -q 2>/dev/null")
+        else: out.append(f"== {s}: unknown section")
+    return {"text": "\n".join(out)}
+
+
+READONLY_UTIL = {"apps", "env_get", "clipboard_get", "net_test", "ports", "reg_get"}
+
+
+def util(a):
+    import shlex
+    q = lambda x: shlex.quote(str(x))
+    op = a["op"]; name = a.get("name") or ""; val = a.get("value") or ""; path = os.path.expanduser(a.get("path") or "")
+    def run_(cmd, t=600):
+        c, o = sh(cmd, t)
+        if c: raise RuntimeError(f"[exit {c}] {o.strip()[-1500:]}")
+        return o.strip()[-4000:] or "ok"
+    if op == "apps":
+        return {"text": sh(f"(dpkg-query -W -f='${{Package}} ${{Version}}\\n' 2>/dev/null; flatpak list --app --columns=application,version 2>/dev/null; snap list 2>/dev/null) | grep -i -- {q(name)} | head -50")[1].strip() or "not found"}
+    if op == "install":
+        if shutil.which("apt-get"): return {"text": run_(f"sudo -n apt-get install -y {q(name)} 2>&1 || pkexec apt-get install -y {q(name)}", 1800)}
+        if shutil.which("dnf"): return {"text": run_(f"sudo -n dnf install -y {q(name)}", 1800)}
+        return {"text": run_(f"flatpak install -y --noninteractive {q(name)}", 1800)}
+    if op == "uninstall":
+        return {"text": run_(f"sudo -n apt-get remove -y {q(name)} 2>&1 || flatpak uninstall -y {q(name)}", 1800)}
+    if op == "kill":
+        if name.isdigit(): os.kill(int(name), signal.SIGTERM); return {"text": "killed " + name}
+        return {"text": run_(f"pkill -f -- {q(name)} && echo killed")}
+    if op == "service":
+        return {"text": run_(f"systemctl {q(val or 'status')} {q(name)} --no-pager 2>&1 | head -20")}
+    if op == "env_get": return {"text": os.environ.get(name, "") if name else "\n".join(f"{k}={v[:200]}" for k, v in sorted(os.environ.items()))}
+    if op in ("env_set", "path_add"):
+        line = f'export PATH="{val or path}:$PATH"' if op == "path_add" else f"export {name}={q(val)}"
+        with open(os.path.expanduser("~/.profile"), "a") as f: f.write("\n" + line + "\n")
+        return {"text": f"added to ~/.profile: {line} (new logins see it)"}
+    if op == "open":
+        subprocess.Popen(["xdg-open", a.get("url") or path], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); return {"text": "opened"}
+    if op == "clipboard_get": return {"text": run_("xclip -o -selection clipboard 2>/dev/null || xsel -ob")}
+    if op == "clipboard_set":
+        for c in (["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+            if shutil.which(c[0]): subprocess.run(c, input=val.encode(), timeout=5); return {"text": "ok"}
+        raise RuntimeError("no xclip / xsel on this PC")
+    if op == "dns_flush": return {"text": run_("resolvectl flush-caches 2>/dev/null || systemd-resolve --flush-caches; echo flushed")}
+    if op == "net_test":
+        host = a.get("host") or name; port = int(a.get("port") or 443); lines = []
+        try: ip = socket.gethostbyname(host); lines.append(f"dns {host} -> {ip}")
+        except OSError as e: return {"text": f"dns {host}: FAILED {e}"}
+        t0 = time.time()
+        try: socket.create_connection((ip, port), 5).close(); lines.append(f"tcp {port}: open ({(time.time() - t0) * 1000:.0f} ms)")
+        except OSError as e: lines.append(f"tcp {port}: FAILED {e}")
+        return {"text": "\n".join(lines)}
+    if op == "ports": return {"text": sh("ss -ltnup 2>/dev/null" + (f" | grep -- {q(':' + name)}" if name else ""))[1].strip() or "nothing listens there"}
+    if op == "download": return push_file({"url": a["url"], "path": path})
+    if op == "zip":
+        dest = os.path.expanduser(a.get("dest") or path.rstrip("/") + ".zip"); zip_dir(path, dest); return {"text": f"{dest} ({human(os.path.getsize(dest))})"}
+    if op == "unzip":
+        import zipfile
+        dest = os.path.expanduser(a.get("dest") or os.path.splitext(path)[0])
+        with zipfile.ZipFile(path) as z: z.extractall(dest)
+        return {"text": "extracted to " + dest}
+    if op in ("reg_get", "reg_set", "shortcut"): raise RuntimeError(op + " is Windows only")
+    raise RuntimeError("unknown op " + op)
 
 
 def sysinfo(_):
@@ -1573,7 +1775,8 @@ def hold(a):
     PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
 def task_done(a):
     PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
-TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window)
+TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window,
+             tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util)
 META = {"look", "hold", "task_done"}
 
 
@@ -1597,7 +1800,7 @@ def handle(cmd, mode, token):
     res = {"id": cmd["id"]}
     try:
         if PAUSED.is_set() and name not in QUIET: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
-        if mode == "ask" and name in ASK_TOOLS:
+        if mode == "ask" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL):
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
             with GUI_LOCK: resume_state(name, args); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)

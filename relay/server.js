@@ -339,18 +339,35 @@ const tools = [
       quality: { type: 'integer', minimum: 10, maximum: 95, description: 'JPEG quality (default 60)' },
       fresh: { type: 'boolean', description: 'send the picture even if nothing changed since your last screenshot' },
       overlay: { type: 'boolean', description: 'Android only: keep the helper overlay (glow, label, pointer) in the picture, to see exactly how it looks on this phone' } } },
-  { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux) and wait for it. Returns exit code and combined output. Portable node/uv fetched by this bridge are on PATH. For GUI apps or anything long-lived use start_process instead.',
-    props: { command: str('Command line'), timeout_s: { type: 'integer', minimum: 1, maximum: 3600, description: 'default 60' }, cwd: str('working directory') }, required: ['command'],
+  { name: 'run', agent: true, description: 'Run a shell command (PowerShell on Windows, bash on Linux) and wait for it. Returns exit code and combined output. Portable node/uv fetched by this bridge are on PATH. For GUI apps or anything long-lived use start_process instead. With args the program is started directly, without a shell: every argument arrives exactly as given (no quoting problems, use it for JSON, paths with spaces, quotes, $ & | %).',
+    props: { command: str('Command line, or with args: the program (name or full path)'), args: { type: 'array', items: { type: 'string' }, description: 'arguments, passed as they are (no shell)' },
+      shell: { type: 'string', enum: ['powershell', 'pwsh', 'cmd', 'bash', 'sh', 'python'], description: 'what runs command (default PowerShell on Windows, bash on Linux); the text is never re-quoted' },
+      stdin: str('text sent to the program input'), timeout_s: { type: 'integer', minimum: 1, maximum: 3600, description: 'default 60' }, cwd: str('working directory') }, required: ['command'],
     ms: (a) => ((a.timeout_s || 60) + 10) * 1000 },
   { name: 'start_process', agent: true, description: 'Start a program detached and return immediately; it keeps running (use this for GUI apps such as Blender, Unity, Substance, or servers). Returns pid, whether it is still running, and the first output.',
     props: { command: str('Executable name or full path'), args: { type: 'array', items: { type: 'string' } }, cwd: str('working directory'), env: { type: 'object', additionalProperties: { type: 'string' } }, wait_s: { type: 'number', description: 'seconds to watch for an immediate crash, default 2' } }, required: ['command'] },
-  { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000). Image files (png, jpg, gif, bmp, webp) come back as images, scaled down to max_width: use it to look at renders and saved screenshots.',
-    props: { path: str('File path'), max_bytes: { type: 'integer', minimum: 1 }, max_width: { type: 'integer', minimum: 64, maximum: 4096, description: 'images only, default 1600' } }, required: ['path'] },
+  { name: 'read_file', agent: true, description: 'Read a text file (first max_bytes, default 200000). With offset/lines or tail only those lines come back, numbered (cheap: use it for logs and big configs, and to copy exact text for edit_file). Image files (png, jpg, gif, bmp, webp) come back as images, scaled down to max_width.',
+    props: { path: str('File path'), offset: { type: 'integer', minimum: 1, description: 'first line (1-based)' }, lines: { type: 'integer', minimum: 1, description: 'how many lines, default 200' }, tail: { type: 'integer', minimum: 1, description: 'the last N lines' },
+      max_bytes: { type: 'integer', minimum: 1 }, max_width: { type: 'integer', minimum: 64, maximum: 4096, description: 'images only, default 1600' } }, required: ['path'] },
   { name: 'fetch_file', agent: true, ms: (a) => 3_700_000,
-    description: 'Copy a file from the remote PC to the operator: returns a download link (valid 24 h). Use it to hand over results (renders, .blend files, logs, archives).',
+    description: 'Copy a file or a whole folder (sent as one zip) from the remote PC to the operator: returns a download link (valid 24 h). Use it to hand over results (renders, .blend files, logs, archives).',
     props: { path: str('File path on the remote PC') }, required: ['path'] },
-  { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it.',
-    props: { path: str('File path'), content: str('New content') }, required: ['path', 'content'] },
+  { name: 'write_file', agent: true, description: 'Write a text file (UTF-8), overwriting it (append=true adds to the end; base64=true writes binary content). To change part of a file use edit_file.',
+    props: { path: str('File path'), content: str('New content'), append: { type: 'boolean' }, base64: { type: 'boolean', description: 'content is base64 (binary files)' } }, required: ['path', 'content'] },
+  { name: 'edit_file', agent: true, description: 'Change part of a text file: replace the exact text old with new. Fails if old is not found or found more than once (add surrounding lines, or all=true). Keeps the encoding, BOM and line endings. Much cheaper and safer than rewriting the file or using sed / PowerShell replace.',
+    props: { path: str('File path'), old: str('exact text to replace (copy it from read_file)'), new: str('replacement'), all: { type: 'boolean', description: 'replace every occurrence' } }, required: ['path', 'old', 'new'] },
+  { name: 'push_file', agent: true, ms: (a) => 3_700_000, description: 'Send a file to the remote PC: download url (any http link, or a link of a file the operator uploaded in the live view) to path on the remote PC.',
+    props: { url: str('http(s) link'), path: str('where to save it on the remote PC (full file path)') }, required: ['url', 'path'] },
+  { name: 'tree', agent: true, description: 'Folder tree in one call: folders with their item count, files with size, a few levels deep. Much cheaper than list_dir over and over.',
+    props: { path: str('Folder'), depth: { type: 'integer', minimum: 1, maximum: 6, description: 'default 2' }, pattern: str('only files matching this glob, e.g. *.log'), max: { type: 'integer', minimum: 10, maximum: 3000, description: 'lines, default 300' } }, required: ['path'] },
+  { name: 'find', agent: true, ms: (a) => 60_000, description: 'Find files by name (glob) and/or by content (regex, case-insensitive): answers path (and size) or path:line: text. Skips .git / node_modules, binary files and files over 5 MB when searching content.',
+    props: { path: str('Folder to search'), name: str('file name glob, e.g. *.json or config*'), text: str('regex to search inside files'), max: { type: 'integer', minimum: 1, maximum: 1000, description: 'results, default 100' }, depth: { type: 'integer', minimum: 1, maximum: 50 } }, required: ['path'] },
+  { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (adapters, IP, gateway, DNS), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
+    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'events'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
+  { name: 'util', agent: true, ms: (a) => (/install|download|zip/.test(a.op) ? 1_900_000 : 120_000),
+    description: 'Ready-made, tested operations: right on the first try, no quoting. op: apps (search installed programs: name), install / uninstall (winget / apt id or name), kill (name or pid, whole process tree), service (name, value=start|stop|restart|status), env_get (name; empty = all), env_set (name, value; user scope), path_add (path; user PATH, no setx truncation), reg_get / reg_set (path = HKCU\\..., name, value), open (url or path with the default app), clipboard_get / clipboard_set (value), dns_flush, net_test (host, port: DNS + TCP check), ports (name = port number: who listens), download (url -> path, resumes), zip (path -> dest), unzip (path -> dest), shortcut (path = target, dest = .lnk file).',
+    props: { op: { type: 'string', enum: ['apps', 'install', 'uninstall', 'kill', 'service', 'env_get', 'env_set', 'path_add', 'reg_get', 'reg_set', 'open', 'clipboard_get', 'clipboard_set', 'dns_flush', 'net_test', 'ports', 'download', 'zip', 'unzip', 'shortcut'] },
+      name: str('program / service / variable / value name, process name or pid, port'), value: str('value / action'), path: str('file, folder or registry path'), dest: str('destination'), url: str('link'), host: str('host for net_test'), port: { type: 'integer' } }, required: ['op'] },
   { name: 'list_dir', agent: true, description: 'List a directory (name, type, size, modified).', props: { path: str('Directory path') }, required: ['path'] },
   { name: 'click', agent: true, description: 'Move the mouse to (x,y) in screenshot coordinates and click.',
     props: { x: num('x'), y: num('y'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, double: { type: 'boolean' } }, required: ['x', 'y'] },
@@ -407,6 +424,35 @@ const tools = [
 ];
 const byName = new Map(tools.map((t) => [t.name, t]));
 
+// ---- error hints: a failed command gets one line of advice (relay/hints.json), and the failure goes to the mistake log so the same trap is visible next time
+const HINTS = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'hints.json'), 'utf8')).map((h) => ({ ...h, rx: new RegExp(h.re, 'im') })); } catch { return []; } })();
+const HINT_TOOLS = new Set(['run', 'util', 'start_process', 'edit_file', 'push_file', 'fetch_file', 'read_file', 'write_file', 'mcp_start', 'tree', 'find']);
+function hintFor(s, code, tool, args, textOut, failed) {
+  if (!HINT_TOOLS.has(tool)) return '';
+  const ex = /^\[exit (-?\d+)\]/.exec(textOut); if (ex && ex[1] !== '0') failed = true;
+  if (/^\[timeout after/.test(textOut)) failed = true;
+  if (!failed) return '';
+  const h = HINTS.find((x) => x.rx.test(textOut)); if (!h) return '';
+  if (s) {
+    s.hinted = s.hinted || {};
+    if (!s.hinted[h.id] || Date.now() - s.hinted[h.id] > 120_000) {
+      s.hinted[h.id] = Date.now();
+      recordMiss(s, code, 'auto', { tool, hint: h.id, what: String(args.command || args.op || args.path || '').slice(0, 200), error: textOut.replace(/\s+/g, ' ').slice(0, 300) });
+    }
+  }
+  return 'HINT: ' + h.hint;
+}
+// the first sysinfo of a session: the traps this kind of system had before (from the mistake log)
+function pitfalls(s) {
+  const fam = (x) => (/android/i.test(x) ? 'android' : /windows/i.test(x) ? 'windows' : 'linux');
+  const mine = fam(s.info?.os || '');
+  let L = []; try { L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n').slice(-500).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter((e) => e && fam(e.device || '') === mine); } catch { return ''; }
+  const n = {}; for (const e of L) if (e.kind === 'auto' && e.hint) n[e.hint] = (n[e.hint] || 0) + 1;
+  const top = Object.entries(n).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id, k]) => `- (${k}x) ${HINTS.find((h) => h.id === id)?.hint || id}`);
+  const rep = L.filter((e) => e.kind === 'reported' && e.fixed_by).slice(-3).map((e) => `- wanted "${e.wanted}", ${e.happened}; worked: ${e.fixed_by}`);
+  return top.length || rep.length ? `\nKnown pitfalls on ${mine} machines (from earlier sessions):\n` + [...top, ...rep].join('\n') : '';
+}
+
 const fmt = (d) => {
   if (d?.content) return { content: d.content, isError: !!d.isError }; // passthrough from a child MCP server
   const out = [];
@@ -434,7 +480,9 @@ Workflow for any task:
 13. Work in stages: when you know the steps, call plan (titles + a colour per stage) and set_look {stage} as you move on; keep set_look {note} current.
 14. Save tokens and time: do not take a screenshot after every step. Every click, typing and key press reports what changed on the screen; trust it. Take a screenshot when you need to see something new; use region to read small things; an unchanged screen costs one line. Use watch when something happens over time.
 15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.
-16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.`;
+16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.
+17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), system (processes, disks, network, services, startup, apps, errors in one call), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
+18. No quoting traps: to start a program with arguments use run {command: "program", args: [...]} (no shell, each argument arrives exactly as given). For a longer script use write_file, then run the file. A failed command may come back with a HINT line: follow it instead of retrying the same thing.`;
 
 function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
@@ -481,13 +529,19 @@ function buildMcp(fixed) {
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
       const out = fmt(t.run ? await t.run(session, a) : name === 'screenshot' ? await aiShot(session, a) : await callJob(session, name, a, t.ms?.(a)));
       const sx = sessions.get(String(session).toUpperCase());
+      const first = out.content[0]?.type === 'text' ? out.content[0].text : '';
+      const hint = hintFor(sx, String(session).toUpperCase(), name, a, first, false);
+      if (hint) out.content.push({ type: 'text', text: hint });
+      if (name === 'sysinfo' && sx && !sx.pitfallsShown) { sx.pitfallsShown = true; const pf = pitfalls(sx); if (pf) out.content.push({ type: 'text', text: pf }); }
       if (sx && !sx.viewerShown && name !== 'open_viewer' && name !== 'end_session') {   // the first answer carries the live view: the operator gets it right away
         sx.viewerShown = true; const l = makeViewer(String(session).toUpperCase());
         out.content.push({ type: 'text', text: `LIVE VIEW of this session for the operator: open it in their browser now if you can run commands on their machine (Windows: start "" "${l.control}"; macOS: open; Linux: xdg-open), otherwise give them this link at once: ${l.control}` });
       }
       return out;
     } catch (e) {
-      return { isError: true, content: [{ type: 'text', text: e.message }] };
+      const code = String(fixed || params.arguments?.session || '').toUpperCase();
+      const hint = hintFor(sessions.get(code), code, name, params.arguments || {}, e.message, true);
+      return { isError: true, content: [{ type: 'text', text: e.message + (hint ? '\n' + hint : '') }] };
     }
   });
   return m;

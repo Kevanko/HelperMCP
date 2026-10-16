@@ -57,10 +57,13 @@ class HelperService : AccessibilityService() {
     private val stateExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val IDLE_MS = 15 * 60_000L   // no call from the helper for this long: the label goes back to "waiting for the helper" and the timer restarts
     private var wake: PowerManager.WakeLock? = null
+    private lateinit var phone: Phone
+    private lateinit var cast: Cast
 
     override fun onServiceConnected() {
         Crash.install(this)
-        inst = this; fx = Fx(this); phase = if (running) phase else "ready" }
+        inst = this; fx = Fx(this); phase = if (running) phase else "ready"
+        phone = Phone(this, { prefsRelay() }, { sessionToken }, { launch(it) }); cast = Cast(this, { prefsRelay() }, { sessionToken }, phone) }
     override fun onAccessibilityEvent(e: AccessibilityEvent?) { if (e == null) return; if (e.packageName?.toString() != packageName || e.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED || rootInActiveWindow?.packageName?.toString() == packageName) lastEventAt = SystemClock.uptimeMillis() }   // our own label is not a screen change
     override fun onInterrupt() { }
     override fun onDestroy() { endSession(); inst = null; phase = "off"; super.onDestroy() }
@@ -68,15 +71,18 @@ class HelperService : AccessibilityService() {
     // ------------------------------------------------------------------------------------------ session
     fun startSession(relay: String, ask: Boolean) {
         if (running) return
-        paused = false; note = ""; registerScreenReceiver()
+        paused = false; note = ""; Cast.denied = false; Cast.info = ""; registerScreenReceiver()
         running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; phase = "connecting"
         fx.onEnd = { endSession() }
         Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
     }
 
     fun refreshFx() { fx.rebuild() }
+    fun usageGranted() = if (::phone.isInitialized) phone.usageOk() else true
 
-    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); if (::fx.isInitialized) fx.hide() }
+    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); if (::fx.isInitialized) fx.hide(); if (::cast.isInitialized) cast.release() }
+    /** one picture for the live viewer when there is no video (the overlay stays in it, like the friend sees the screen) */
+    fun liveShot(): Shot = screenshot(JSONObject().put("view", true).put("max_width", 900).put("quality", 55))
 
     /** pause / continue: by the button in the app, and automatically when the screen is switched off (and back on after unlock) */
     fun setPaused(on: Boolean, by: String = "user") {
@@ -187,13 +193,14 @@ class HelperService : AccessibilityService() {
     private fun handle(relay: String, token: String, cmd: JSONObject) {
         val id = cmd.getString("id"); val tool = cmd.getString("tool"); val args = cmd.optJSONObject("args") ?: JSONObject()
         if (tool == "bye") { ended = true; return }
-        if (!args.optBoolean("view") && tool != "task_done" && tool != "hold" && tool != "look") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
+        if (!args.optBoolean("view") && tool != "task_done" && tool != "hold" && tool != "look" && tool != "stream") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "task_done" || tool == "hold" || tool == "look"
+        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "stream" || tool == "system" || tool == "task_done" || tool == "hold" || tool == "look"
         if (!quiet) fx.setBusy(true)
         try {
-            if (paused && tool != "screenshot" && tool != "sysinfo") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
+            if (paused && tool != "screenshot" && tool != "sysinfo" && tool != "stream") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
+            if (askMode && (tool in FILES || tool == "util" && args.optString("op") in UTIL_ASK)) askFiles(tool, args)
             val t0 = SystemClock.uptimeMillis()
             data = exec(tool, args)
             if (tool in GUI || tool == "start_process") {
@@ -226,6 +233,8 @@ class HelperService : AccessibilityService() {
     }
 
     private val CHECKED = setOf("click", "type_text", "press_key", "scroll")
+    private val FILES = setOf("tree", "find", "list_dir", "read_file", "write_file", "edit_file", "push_file", "fetch_file")
+    private val UTIL_ASK = setOf("kill", "uninstall", "download", "zip", "unzip", "clipboard_set")
     private val GUI = setOf("click", "move", "drag", "scroll", "type_text", "press_key", "actions")
 
     // ------------------------------------------------------------------------------------------ questions
@@ -269,6 +278,24 @@ class HelperService : AccessibilityService() {
         }
     }
 
+    private fun askFiles(tool: String, a: JSONObject) {
+        if ("files" in allowed) return
+        val what = when (tool) {
+            "tree", "list_dir" -> t("посмотреть папку ", "look into the folder ") + a.optString("path", "/sdcard")
+            "find" -> t("искать файлы в ", "search files in ") + a.optString("path", "/sdcard")
+            "read_file" -> t("прочитать файл ", "read the file ") + a.optString("path")
+            "write_file", "edit_file" -> t("изменить файл ", "change the file ") + a.optString("path")
+            "push_file" -> t("положить файл в ", "put a file into ") + a.optString("path")
+            "fetch_file" -> t("отправить помощнику ", "send the helper ") + a.optString("path")
+            else -> t("действие: ", "action: ") + a.optString("op") + " " + a.optString("name", a.optString("path"))
+        }
+        when (fx.ask(listOf(cut(what)), t("файлы и приложения", "files and apps"))) {
+            "a" -> allowed.add("files")
+            "n" -> throw RuntimeException("The user denied this action. Do not repeat it; ask the operator what to do instead.")
+            "esc" -> { endSession(); throw RuntimeException("The user ended the session (pressed Stop). Stop all work on this phone now and tell the operator; do not retry.") }
+        }
+    }
+
     // ------------------------------------------------------------------------------------------ tools
     private fun exec(tool: String, a: JSONObject): Any = when (tool) {
         "sysinfo" -> ok(sysinfo().toString(2))
@@ -287,7 +314,18 @@ class HelperService : AccessibilityService() {
         "press_key" -> { pressKey(a.getString("keys")); ok() }
         "start_process" -> { launch(a.optString("command", a.optString("name", ""))); ok() }
         "actions" -> actions(a)
-        else -> throw RuntimeException("'$tool' is not available on Android. Use screenshot, click, drag, scroll, type_text, press_key, actions, start_process and sysinfo.")
+        "stream" -> ok(cast.control(a))
+        "tree" -> phone.tree(a)
+        "find" -> phone.find(a)
+        "list_dir" -> phone.listDir(a)
+        "read_file" -> phone.readFile(a)
+        "write_file" -> phone.writeFile(a)
+        "edit_file" -> phone.editFile(a)
+        "push_file" -> phone.pushFile(a)
+        "fetch_file" -> phone.fetchFile(a)
+        "system" -> phone.system(a)
+        "util" -> phone.util(a)
+        else -> throw RuntimeException("'$tool' is not available on Android. Use screenshot, click, drag, scroll, type_text, press_key, actions, start_process, sysinfo, system, tree, find, list_dir, read_file, write_file, edit_file, push_file, fetch_file and util (apps, kill, uninstall, open, clipboard, net_test, download, zip, unzip).")
     }
 
     private fun ok(text: String = "ok") = JSONObject().put("text", text)
@@ -300,7 +338,8 @@ class HelperService : AccessibilityService() {
         return JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
             .put("screen", "${fx.width}x${fx.height}").put("battery", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).toString() + "%")
             .put("foreground_app", rootInActiveWindow?.packageName?.toString() ?: "?").put("screenshot_scale", scale.toDouble()).put("display", fx.diag())
-            .put("note", "Android: screenshot, click, drag, scroll, type_text, press_key (home, back, recents, notifications, enter, ...), actions, start_process (app name, package or URL).")
+            .put("files_allowed", phone.filesOk()).put("usage_allowed", phone.usageOk())
+            .put("note", "Android: screenshot, click, drag, scroll, type_text, press_key (home, back, recents, notifications, enter, ...), actions, start_process (app name, package or URL); files: tree, find, read_file, edit_file, push_file, fetch_file (need 'Allow file access'); system (overview, disks, network, processes, apps, services); util (apps, kill, uninstall, open settings:<screen>, clipboard, net_test, download, zip).")
     }
 
     @Volatile private var lastErr = -1

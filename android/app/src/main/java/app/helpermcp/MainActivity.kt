@@ -33,6 +33,8 @@ class MainActivity : Activity() {
     private lateinit var updateBtn: TextView
     private val allowViews = ArrayList<View>()
     private lateinit var start: TextView
+    private lateinit var filesBtn: TextView
+    private lateinit var usageBtn: TextView
     private lateinit var relay: EditText
     private lateinit var askSwitch: Switch
     private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
@@ -64,6 +66,9 @@ class MainActivity : Activity() {
         col.addView(appInfo); allowViews.add(appInfo)
         start = button(t("2. Начать помощь", "2. Start help"), 0xFF2E7D32.toInt()) { toggle() }; col.addView(start)
         pauseBtn = button(t("Пауза", "Pause"), 0xFF8D6E63.toInt()) { HelperService.inst?.setPaused(!HelperService.paused) }; col.addView(pauseBtn)
+        filesBtn = button(t("Разрешить доступ к файлам", "Allow file access"), 0xFF37474F.toInt()) { startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) }; col.addView(filesBtn)
+        usageBtn = button(t("Разрешить доступ к статистике приложений", "Allow usage access"), 0xFF37474F.toInt()) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS, Uri.parse("package:$packageName"))) }; col.addView(usageBtn)
+        col.addView(TextView(this).apply { text = t("По желанию: файлы нужны, чтобы помощник мог смотреть и передавать файлы; статистика — чтобы видеть, какие приложения запущены. Помощник спросит подтверждение на каждое такое действие, если включён вопрос выше.", "Optional: file access lets the helper browse and send files; usage access shows which apps are running. The helper still asks before each such action if the question switch below is on."); setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(6), 0, 0) })
         askSwitch = Switch(this).apply { text = t("Спрашивать подтверждение каждого действия", "Ask before every action"); setTextColor(Color.WHITE); isChecked = prefs.getBoolean("ask", true); setPadding(0, dp(18), 0, 0) }; col.addView(askSwitch)
         col.addView(TextView(this).apply { text = t("Сервер", "Server"); setTextColor(0xFF9FB0C8.toInt()); textSize = 13f; setPadding(0, dp(16), 0, 0) })
         relay = EditText(this).apply { setText(prefs.getString("relay", BuildConfig.RELAY)); setTextColor(Color.WHITE); inputType = InputType.TYPE_TEXT_VARIATION_URI; textSize = 14f }; col.addView(relay)
@@ -117,6 +122,8 @@ class MainActivity : Activity() {
         allow.visibility = if (on) View.GONE else View.VISIBLE
         allowViews.forEach { it.visibility = if (on) View.GONE else View.VISIBLE }
         pauseBtn.visibility = if (HelperService.running) View.VISIBLE else View.GONE
+        filesBtn.visibility = if (android.os.Environment.isExternalStorageManager()) View.GONE else View.VISIBLE
+        usageBtn.visibility = if (HelperService.inst?.usageGranted() != false) View.GONE else View.VISIBLE
         pauseBtn.text = if (HelperService.paused) t("Продолжить", "Continue") else t("Пауза", "Pause")
         start.text = if (HelperService.running) t("Завершить помощь", "End help") else t("2. Начать помощь", "2. Start help")
         if (System.currentTimeMillis() % 20000 < 600) Update.check(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY })

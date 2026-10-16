@@ -90,6 +90,8 @@ The AI opens a **live view** for you right away: a view-only link to share and a
 
 Install the APK from the QR code on the link page, turn on **HelperMCP** in *Accessibility*, press **Start help**, send the code. The AI can tap, swipe, type, press keys and open apps. The glow follows the phone's real screen shape and camera cutout.
 
+**Live video and the same fast tools as on a PC.** When someone opens the live view, the phone asks once (*Start recording or casting*, whole screen) and streams real H.264 video; if that is declined, it falls back to a few screenshots a second. The live view's System panel shows battery, RAM, network and the apps used lately, and its Files panel browses the phone. After the friend taps **Allow file access** (optional), `tree`, `find`, `read_file`, `edit_file`, `push_file` and `fetch_file` work on `/sdcard`. `system` lists installed apps (`!` = not from a store, or holding accessibility / device-admin power), VPN and private DNS, and which apps have risky powers; `util` opens any Settings screen, checks the network and more, so the AI can verify what the friend says without clicking through menus. In ask mode every file or app action is confirmed on the phone.
+
 To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=https://your.server`, then put the APK at `data/apk/helpermcp.apk` on the server.
 
 <details>

@@ -207,6 +207,48 @@ class Phone(private val ctx: Context, private val relay: () -> String, private v
         }
     }
 
+
+    /** make, copy, move, rename, delete, stat and look inside a file without downloading it (the viewer's Files tab) */
+    fun fsop(a: JSONObject): Any {
+        val op = a.getString("op"); val p = file(a.getString("path"))
+        return when (op) {
+            "mkdir" -> { p.mkdirs(); ok("created folder ${p.path}") }
+            "newfile" -> { if (p.exists()) throw RuntimeException("already exists: ${p.path}"); p.parentFile?.mkdirs(); p.createNewFile(); ok("created file ${p.path}") }
+            "copy", "move" -> {
+                var d = file(a.getString("dest")); if (d.isDirectory) d = File(d, p.name)
+                if (d.absolutePath == p.absolutePath) throw RuntimeException("source and destination are the same")
+                if (d.exists() && !a.optBoolean("overwrite")) throw RuntimeException("already exists: ${d.path} (overwrite:true replaces it)")
+                if (d.exists()) d.deleteRecursively()
+                if (op == "copy") p.copyRecursively(d) else if (!p.renameTo(d)) { p.copyRecursively(d); p.deleteRecursively() }
+                ok("${if (op == "copy") "copied" else "moved"} to ${d.path}")
+            }
+            "rename" -> { val n = a.optString("name"); if (n.isBlank() || n.contains('/')) throw RuntimeException("bad name"); if (!p.renameTo(File(p.parentFile, n))) throw RuntimeException("could not rename"); ok("renamed to $n") }
+            "delete" -> { if (!p.exists()) throw RuntimeException("not found: ${p.path}"); if (!(if (p.isDirectory) p.deleteRecursively() else p.delete())) throw RuntimeException("could not delete ${p.path}"); ok("deleted: ${p.path}") }
+            "stat" -> ok(JSONObject().put("path", p.path).put("dir", p.isDirectory).put("size", if (p.isDirectory) 0 else p.length()).put("modified", fmt.format(Date(p.lastModified()))).toString())
+            "preview" -> preview(p, a)
+            else -> throw RuntimeException("unknown op '$op' (mkdir, newfile, copy, move, rename, delete, stat, preview)")
+        }
+    }
+
+    private fun preview(f: File, a: JSONObject): Any {
+        if (f.isDirectory) throw RuntimeException("that is a folder")
+        val n = f.name.lowercase()
+        if (n.endsWith(".jpg") || n.endsWith(".jpeg") || n.endsWith(".png") || n.endsWith(".webp") || n.endsWith(".gif") || n.endsWith(".bmp")) return readFile(JSONObject().put("path", f.path).put("max_width", 1100).put("quality", 72))
+        val mx = a.optInt("max", 65536); val o = JSONObject().put("size", f.length()).put("modified", fmt.format(Date(f.lastModified()))).put("truncated", f.length() > mx)
+        if (n.endsWith(".zip") || n.endsWith(".apk") || n.endsWith(".jar") || n.endsWith(".docx") || n.endsWith(".xlsx")) {
+            java.util.zip.ZipFile(f).use { z -> val arr = JSONArray(); var c = 0; for (e in z.entries()) { if (c++ < 300) arr.put(JSONArray().put(e.name).put(e.size)) }; o.put("kind", "archive").put("entries", arr).put("count", c) }
+            return ok(o.toString())
+        }
+        val buf = ByteArray(mx); val k = f.inputStream().use { it.read(buf).coerceAtLeast(0) }; val b = buf.copyOf(k)
+        val bom16 = k >= 2 && ((b[0] == 0xFF.toByte() && b[1] == 0xFE.toByte()) || (b[0] == 0xFE.toByte() && b[1] == 0xFF.toByte()))
+        if (!bom16 && b.take(4096).any { it == 0.toByte() }) {
+            val sb = StringBuilder(); var r = 0
+            while (r < minOf(512, k)) { val e = minOf(r + 16, k); sb.append("%08x  %-47s  %s\n".format(r, (r until e).joinToString(" ") { "%02x".format(b[it]) }, (r until e).map { val c = b[it].toInt() and 255; if (c in 32..126) c.toChar() else '.' }.joinToString(""))); r += 16 }
+            o.put("kind", "binary").put("text", sb.toString())
+        } else o.put("kind", "text").put("text", String(b, if (bom16) Charsets.UTF_16 else Charsets.UTF_8).trimStart('\uFEFF'))
+        return ok(o.toString())
+    }
+
     // ------------------------------------------------------------------------------------------ system state
     private fun label(pkg: String): String = try { ctx.packageManager.getApplicationLabel(ctx.packageManager.getApplicationInfo(pkg, 0)).toString() } catch (_: Throwable) { pkg }
     private fun mem(): ActivityManager.MemoryInfo = ActivityManager.MemoryInfo().also { (ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it) }

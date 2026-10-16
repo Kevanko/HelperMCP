@@ -200,7 +200,7 @@ class HelperService : AccessibilityService() {
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo" && tool != "stream") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
-            if (askMode && (tool in FILES || tool == "util" && args.optString("op") in UTIL_ASK)) askFiles(tool, args)
+            if (askMode && (tool in FILES && !(tool == "fsop" && args.optString("op") in setOf("preview", "stat")) || tool == "util" && args.optString("op") in UTIL_ASK)) askFiles(tool, args)
             val t0 = SystemClock.uptimeMillis()
             data = exec(tool, args)
             if (tool in GUI || tool == "start_process") {
@@ -233,7 +233,7 @@ class HelperService : AccessibilityService() {
     }
 
     private val CHECKED = setOf("click", "type_text", "press_key", "scroll")
-    private val FILES = setOf("tree", "find", "list_dir", "read_file", "write_file", "edit_file", "push_file", "fetch_file")
+    private val FILES = setOf("tree", "find", "list_dir", "read_file", "write_file", "edit_file", "push_file", "fetch_file", "fsop")
     private val UTIL_ASK = setOf("kill", "uninstall", "download", "zip", "unzip", "clipboard_set")
     private val GUI = setOf("click", "move", "drag", "scroll", "type_text", "press_key", "actions")
 
@@ -284,7 +284,7 @@ class HelperService : AccessibilityService() {
             "tree", "list_dir" -> t("посмотреть папку ", "look into the folder ") + a.optString("path", "/sdcard")
             "find" -> t("искать файлы в ", "search files in ") + a.optString("path", "/sdcard")
             "read_file" -> t("прочитать файл ", "read the file ") + a.optString("path")
-            "write_file", "edit_file" -> t("изменить файл ", "change the file ") + a.optString("path")
+            "write_file", "edit_file", "fsop" -> t("изменить файл ", "change the file ") + a.optString("path")
             "push_file" -> t("положить файл в ", "put a file into ") + a.optString("path")
             "fetch_file" -> t("отправить помощнику ", "send the helper ") + a.optString("path")
             else -> t("действие: ", "action: ") + a.optString("op") + " " + a.optString("name", a.optString("path"))
@@ -323,6 +323,8 @@ class HelperService : AccessibilityService() {
         "edit_file" -> phone.editFile(a)
         "push_file" -> phone.pushFile(a)
         "fetch_file" -> phone.fetchFile(a)
+        "fsop" -> phone.fsop(a)
+        "sysdata" -> throw RuntimeException("the System tabs are for Windows PCs; this phone answers system {sections: [...]} as text")
         "system" -> phone.system(a)
         "util" -> phone.util(a)
         else -> throw RuntimeException("'$tool' is not available on Android. Use screenshot, click, drag, scroll, type_text, press_key, actions, start_process, sysinfo, system, tree, find, list_dir, read_file, write_file, edit_file, push_file, fetch_file and util (apps, kill, uninstall, open, clipboard, net_test, download, zip, unzip).")

@@ -34,7 +34,7 @@ T = {
     "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "edit_file", "push_file", "util", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "edit_file", "push_file", "fsop", "util", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -354,7 +354,7 @@ def restore_focus(w):
 
 
 ASK_GROUP = {"click": "input", "move": "input", "drag": "input", "scroll": "input", "type_text": "input", "press_key": "input", "actions": "input", "run": "commands",
-             "start_process": "commands", "util": "commands", "write_file": "files", "edit_file": "files", "push_file": "files", "fetch_file": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
+             "start_process": "commands", "util": "commands", "write_file": "files", "edit_file": "files", "push_file": "files", "fetch_file": "files", "fsop": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
 GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
@@ -1013,6 +1013,55 @@ def zip_dir(src, dest):
                 except OSError: pass
 
 
+
+def fsop(a):
+    """make, copy, move, rename, delete (the trash when there is one), look inside a file without downloading it"""
+    op = a["op"]; p = os.path.expanduser(a["path"])
+    if op == "mkdir": os.makedirs(p, exist_ok=True); return {"text": f"created folder {p}"}
+    if op == "newfile":
+        if os.path.exists(p): raise RuntimeError(f"already exists: {p}")
+        os.makedirs(os.path.dirname(os.path.abspath(p)), exist_ok=True); open(p, "wb").close(); return {"text": f"created file {p}"}
+    if op in ("copy", "move"):
+        d = os.path.expanduser(a["dest"])
+        if os.path.isdir(d): d = os.path.join(d, os.path.basename(p.rstrip("/")))
+        if os.path.abspath(d) == os.path.abspath(p): raise RuntimeError("source and destination are the same")
+        if os.path.exists(d) and not a.get("overwrite"): raise RuntimeError(f"already exists: {d} (overwrite:true replaces it)")
+        if os.path.exists(d) and a.get("overwrite"): shutil.rmtree(d) if os.path.isdir(d) else os.remove(d)
+        if op == "copy": shutil.copytree(p, d) if os.path.isdir(p) else shutil.copy2(p, d)
+        else: shutil.move(p, d)
+        return {"text": f"{'copied' if op == 'copy' else 'moved'} to {d}"}
+    if op == "rename":
+        n = a.get("name") or ""
+        if not n or "/" in n or "\\" in n: raise RuntimeError("bad name")
+        os.rename(p, os.path.join(os.path.dirname(p), n)); return {"text": f"renamed to {n}"}
+    if op == "delete":
+        if not os.path.lexists(p): raise RuntimeError(f"not found: {p}")
+        if not a.get("permanent") and shutil.which("gio") and sh(["gio", "trash", p], 20)[0] == 0: return {"text": f"moved to the trash: {p}"}
+        shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p); return {"text": f"deleted for good: {p}"}
+    if op == "stat":
+        st = os.stat(p); fmt = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+        return {"text": json.dumps({"path": os.path.abspath(p), "dir": os.path.isdir(p), "size": 0 if os.path.isdir(p) else st.st_size, "created": fmt(st.st_ctime), "modified": fmt(st.st_mtime), "attrs": oct(st.st_mode)})}
+    if op == "preview":
+        if os.path.isdir(p): raise RuntimeError("that is a folder")
+        if p.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")): return read_file({"path": p, "max_width": 1100, "quality": 72})
+        st = os.stat(p); mx = int(a.get("max") or 65536); o = {"size": st.st_size, "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)), "truncated": st.st_size > mx}
+        if p.lower().endswith((".zip", ".jar", ".apk", ".docx", ".xlsx", ".pptx")):
+            import zipfile
+            with zipfile.ZipFile(p) as z: o["kind"] = "archive"; o["entries"] = [[i.filename, i.file_size] for i in z.infolist()[:300]]; o["count"] = len(z.infolist())
+            return {"text": json.dumps(o)}
+        with open(p, "rb") as f: b = f.read(mx)
+        bom16 = b[:2] in (b"\xff\xfe", b"\xfe\xff")
+        if not bom16 and b"\0" in b[:4096]:
+            o["kind"] = "binary"; o["text"] = "".join(f"{r:08x}  {' '.join(f'{c:02x}' for c in b[r:r + 16]):<47}  {''.join(chr(c) if 32 <= c < 127 else '.' for c in b[r:r + 16])}\n" for r in range(0, min(512, len(b)), 16))
+        else: o["kind"] = "text"; o["text"] = b.decode("utf-16" if bom16 else "utf-8", "replace").lstrip("\ufeff")
+        return {"text": json.dumps(o)}
+    raise RuntimeError(f"unknown op '{op}' (mkdir, newfile, copy, move, rename, delete, stat, preview)")
+
+
+def sysdata(a):
+    raise RuntimeError("the System tabs are for Windows PCs; this device answers system {sections: [...]} as text")
+
+
 # ---- system state in one call, ready-made utilities --------------------------------------------------
 def system(a):
     secs = a.get("sections") or ["overview", "disks", "processes", "network"]; top = int(a.get("top") or 15); out = []
@@ -1026,7 +1075,35 @@ def system(a):
         elif s == "services": add("failed services", "systemctl --failed --no-legend 2>/dev/null | head -30")
         elif s == "reach": add("reach: adapters, default route, VPN / DPI / proxy programs", "ip -br addr 2>/dev/null; ip route get 1.1.1.1 2>/dev/null | head -1; ps -eo pid,comm | grep -Ei 'zapret|nfqws|goodbyedpi|clash|mihomo|v2ray|xray|sing-box|openvpn|wireguard|wg-quick|tailscale|zerotier|hamachi|warp|tor$' | grep -v grep; env | grep -i '_proxy=' ")
         elif s == "connections": add("connections: TCP per process", f"ss -tnpH state established 2>/dev/null | awk '{{print $4, $5, $6}}' | head -{top * 3}")
-        elif s == "startup": add("startup", "ls ~/.config/autostart /etc/xdg/autostart 2>/dev/null")
+        elif s == "startup": add("startup: autostart entries, enabled services, cron", "ls ~/.config/autostart /etc/xdg/autostart 2>/dev/null; echo '-- enabled units'; systemctl list-unit-files --state=enabled --no-legend 2>/dev/null | head -60; echo '-- cron'; crontab -l 2>/dev/null | grep -v '^#' | head; ls /etc/cron.d 2>/dev/null")
+        elif s == "perf": add("performance", "uptime; echo; top -bn1 | head -12; echo; free -h; echo; df -h / | tail -1; echo; ip -s -br link 2>/dev/null | head -12; (command -v iostat >/dev/null && iostat -x 1 2 | tail -8) || true")
+        elif s == "policy": add("policies (managed browsers, sudoers.d, package pins)", "ls /etc/opt/chrome/policies/managed /etc/chromium/policies/managed /etc/firefox/policies 2>/dev/null; ls /etc/sudoers.d 2>/dev/null; cat /etc/apt/preferences 2>/dev/null | head -20; echo 'proxy env:'; env | grep -i '_proxy=' ")
+        elif s == "activation": out.append("== activation: not applicable on Linux")
+        elif s == "health":
+            out.append("== health check")
+            def hf(sev, area, msg, fix=""): out.append(f"[{sev}] {area}: {msg}" + (f"  -> {fix}" if fix else ""))
+            n = len([l for l in sh("systemctl --failed --no-legend 2>/dev/null", 10)[1].splitlines() if l.strip()])
+            hf("BAD" if n else "OK", "services", f"{n} failed unit(s)" if n else "no failed units", "systemctl --failed" if n else "")
+            for l in sh("df -P / /home /var 2>/dev/null | tail -n +2", 10)[1].splitlines():
+                f = l.split()
+                if len(f) >= 5 and f[4].rstrip("%").isdigit() and int(f[4].rstrip("%")) >= 90: hf("BAD", "disk", f"{f[5]} is {f[4]} full", "free space: updates need room")
+            if os.path.exists("/var/run/reboot-required"): hf("WARN", "reboot", "a reboot is pending", "restart")
+            m = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo") if l.split(":")[0] in ("MemTotal", "MemAvailable")}
+            if m["MemAvailable"] < 0.08 * m["MemTotal"]: hf("WARN", "memory", "less than 8% of RAM is available", "see system {sections:[processes]}")
+            if "synchronized: no" in sh("timedatectl 2>/dev/null", 10)[1]: hf("WARN", "time", "the clock is not synchronized", "timedatectl set-ntp true")
+            if os.environ.get("http_proxy") or os.environ.get("https_proxy"): hf("WARN", "proxy", "a proxy is set in the environment")
+            out.append("== end")
+        elif s == "process":
+            pid = int(a.get("pid") or 0)
+            if not pid: out.append("== process: give pid")
+            else:
+                out.append(f"== process {pid} in detail"); r = lambda f: (open(f"/proc/{pid}/{f}", "rb").read() if os.path.exists(f"/proc/{pid}/{f}") else b"")
+                try:
+                    out.append("path: " + os.readlink(f"/proc/{pid}/exe")); out.append("cmd: " + r("cmdline").replace(b"\0", b" ").decode("utf-8", "replace"))
+                    st = dict(l.split(":\t", 1) for l in r("status").decode("utf-8", "replace").splitlines() if ":\t" in l); out.append(f"state: {st.get('State')}; ppid: {st.get('PPid')}; uid: {st.get('Uid', '').split()[0] if st.get('Uid') else ''}; threads: {st.get('Threads')}; rss: {st.get('VmRSS')}")
+                    out.append("started: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.stat(f"/proc/{pid}").st_ctime)))
+                    out.append("connections: " + "; ".join(sh(f"ss -tnpH 2>/dev/null | grep 'pid={pid},' | awk '{{print $1, $4, $5}}' | head -15", 10)[1].splitlines()))
+                except OSError as e: out.append(f"cannot read: {e}")
         elif s == "apps": add("apps", "(dpkg-query -W -f='${Package}\\n' 2>/dev/null || rpm -qa) | wc -l; flatpak list --app --columns=application 2>/dev/null | head -40")
         elif s == "drivers": add("loaded kernel modules (lsmod), biggest first", "lsmod | sort -k2 -n -r | head -40")
         elif s == "events": add("recent errors", "journalctl -p err -n 20 --no-pager -q 2>/dev/null")
@@ -1912,7 +1989,7 @@ def post_result(res, token):
         api("/a/result", res, token, timeout=60)
 
 
-TOOLS = dict(agent_log=agent_log, actions=actions, move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
+TOOLS = dict(fsop=fsop, sysdata=sysdata, agent_log=agent_log, actions=actions, move=move, drag=drag, fetch_file=fetch_file, screenshot=screenshot, press_key=press_key, click=click, scroll=scroll, type_text=type_text, run=run,
              read_file=read_file, write_file=write_file, list_dir=list_dir, sysinfo=sysinfo,
              start_process=start_process, mcp_start=mcp_start, mcp_tools=mcp_tools, mcp_call=mcp_call, mcp_stop=mcp_stop)
 
@@ -1958,7 +2035,7 @@ def handle(cmd, mode, token):
     res = {"id": cmd["id"]}
     try:
         if PAUSED.is_set() and name not in QUIET and name not in META: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
-        if mode == "ask" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL):
+        if mode == "ask" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL) and not (name == "fsop" and (args or {}).get("op") in ("preview", "stat")):
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
             with GUI_LOCK: resume_state(name, args); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)

@@ -449,10 +449,12 @@ const tools = [
     props: { url: str('http(s) link'), path: str('where to save it on the remote PC (full file path)') }, required: ['url', 'path'] },
   { name: 'tree', agent: true, description: 'Folder tree in one call: folders with their item count, files with size, a few levels deep. Much cheaper than list_dir over and over.',
     props: { path: str('Folder'), depth: { type: 'integer', minimum: 1, maximum: 6, description: 'default 2' }, pattern: str('only files matching this glob, e.g. *.log'), max: { type: 'integer', minimum: 10, maximum: 3000, description: 'lines, default 300' } }, required: ['path'] },
+  { name: 'fsop', agent: true, ms: (a) => 300_000, description: 'File operations without shell quoting: mkdir, newfile, copy / move (path -> dest; a folder dest receives the item), rename (path, name), delete (to the Recycle Bin on Windows; permanent:true deletes for good), stat, preview (the start of a text file, a hex dump of a binary, the entries of a zip, a small picture).',
+    props: { op: { type: 'string', enum: ['mkdir', 'newfile', 'copy', 'move', 'rename', 'delete', 'stat', 'preview'] }, path: str('item'), dest: str('destination file or folder (copy, move)'), name: str('new name (rename)'), overwrite: { type: 'boolean' }, permanent: { type: 'boolean', description: 'delete: skip the Recycle Bin' } }, required: ['op', 'path'] },
   { name: 'find', agent: true, ms: (a) => 60_000, description: 'Find files by name (glob) and/or by content (regex, case-insensitive): answers path (and size) or path:line: text. Skips .git / node_modules, binary files and files over 5 MB when searching content.',
     props: { path: str('Folder to search'), name: str('file name glob, e.g. *.json or config*'), text: str('regex to search inside files'), max: { type: 'integer', minimum: 1, maximum: 1000, description: 'results, default 100' }, depth: { type: 'integer', minimum: 1, maximum: 50 } }, required: ['path'] },
   { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (EVERY adapter: type, speed, IP, gateway, DNS, MAC, which one is the default route and which one the agent uses), reach (tests each adapter against the relay, lists VPN / DPI-bypass / proxy programs and network filter drivers, proxies, hosts file), connections (TCP connections per process), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
-    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events', 'reach', 'connections'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
+    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events', 'reach', 'connections', 'perf', 'policy', 'activation', 'health', 'process'] } }, pid: { type: 'integer', description: 'for section process: one process in detail (path, command line, parent chain, publisher, signature, hash, services, autostart entries, connections)' }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
   { name: 'util', agent: true, ms: (a) => (/install|download|zip/.test(a.op) ? 1_900_000 : 120_000),
     description: 'Ready-made, tested operations: right on the first try, no quoting. op: apps (search installed programs: name), install / uninstall (winget / apt id or name), kill (name or pid, whole process tree), service (name, value=start|stop|restart|status), env_get (name; empty = all), env_set (name, value; user scope), path_add (path; user PATH, no setx truncation), reg_get / reg_set (path = HKCU\\..., name, value), open (url or path with the default app), clipboard_get / clipboard_set (value), dns_flush, net_test (host, port: DNS + TCP check), ports (name = port number: who listens), download (url -> path, resumes), zip (path -> dest), unzip (path -> dest), shortcut (path = target, dest = .lnk file).',
     props: { op: { type: 'string', enum: ['apps', 'install', 'uninstall', 'kill', 'service', 'env_get', 'env_set', 'path_add', 'reg_get', 'reg_set', 'open', 'clipboard_get', 'clipboard_set', 'dns_flush', 'net_test', 'ports', 'download', 'zip', 'unzip', 'shortcut'] },
@@ -766,7 +768,6 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 <div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
 <aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
 <section id=sys hidden><h2 id=hSys style="padding-left:0"></h2><div id=sg></div><div class=bar><i id=bc></i></div><div class=bar><i id=bm></i></div><div id=sp></div></section>
-<section id=files hidden><h2 id=hFiles style="padding-left:0"></h2><div id=fbar><button id=fup title=up>..</button><input id=fp spellcheck=false><button id=fgo>&#8635;</button></div><div id=fl></div><div id=fmsg></div></section>
 <div id=log></div></aside></div>
 <div id=kb><label for=txt>$</label><input id=txt autocomplete=off><button id=send></button><button data-k=enter>Enter</button><button data-k=backspace>&#9003;</button><button data-k=tab>Tab</button><button data-k=esc>Esc</button><button data-k=left>&larr;</button><button data-k=up>&uarr;</button><button data-k=down>&darr;</button><button data-k=right>&rarr;</button>${android ? '<button data-k=back>Back</button><button data-k=home>Home</button><button data-k=recents>Recents</button>' : ''}</div>
 <script>
@@ -791,7 +792,7 @@ async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
 let gone=false,abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve();
 const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
-setInterval(()=>{if(gotEver&&!noLive&&dot.className==='on')status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
+setInterval(()=>{if(gotEver&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
 const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
 function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(1)+'G':n>=1048576?Math.round(n/1048576)+'M':Math.round(n/1024)+'K';
@@ -860,27 +861,6 @@ async function info(){while(!ended){try{
   if(!s.online)status(L.off,'bad');else if(s.paused)status(L.paused,'bad')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
 info();
-// files (control link): browse the remote folders, click a file to download it, drop files onto the page to put them in the open folder
-if(CTL){const F=ru?{t:'Файлы',drop:'Перетащите файлы на страницу: они попадут в эту папку',up:'загружаю',ok:'сохранено',get:'готовлю ссылку…'}:{t:'Files',drop:'Drop files onto the page: they land in this folder',up:'uploading',ok:'saved',get:'preparing the link…'};
- const fl=$('fl'),fp=$('fp'),fm=$('fmsg'),BS=String.fromCharCode(92);let cwd='~';
- $('files').hidden=false;$('hFiles').textContent=F.t;fm.textContent=F.drop;
- const join=(d,n)=>{const sp=d.includes(BS)?BS:'/';return d.endsWith(sp)?d+n:d+sp+n};
- const up=d=>{const sp=d.includes(BS)?BS:'/';let p=d.replace(/[/]+$/,'');if(sp===BS)while(p.endsWith(BS))p=p.slice(0,-1);const i=p.lastIndexOf(sp);if(i<0)return d;p=p.slice(0,i);return p===''?'/':p.endsWith(':')?p+BS:p};
- async function ls(p){fl.textContent='…';try{const r=await fetch(base+'/ls?path='+encodeURIComponent(p),{headers:{'x-ctl':CTL}}),j=await r.json();if(!r.ok)throw new Error(j.error);
-  const L2=j.text.split(String.fromCharCode(10));cwd=L2[0];fp.value=cwd;fl.innerHTML='';
-  for(const l of L2.slice(1)){const x=l.trim();if(!x)continue;const el=document.createElement('div'),k=x.indexOf('/  (');
-   if(k>0){const n=x.slice(0,k);el.innerHTML='<b></b><i></i>';el.firstChild.textContent=n+'/';el.lastChild.textContent=x.slice(k+3);el.onclick=()=>ls(join(cwd,n))}
-   else{const k2=x.lastIndexOf('  ');const n=k2>0?x.slice(0,k2):x;el.innerHTML='<span></span><i></i>';el.firstChild.textContent=n;el.lastChild.textContent=k2>0?x.slice(k2+2):'';
-    el.onclick=async()=>{fm.textContent=F.get;try{const r=await fetch(base+'/get',{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify({path:join(cwd,n)})}),j=await r.json();const u=(j.text||'').split(' ')[0];if(!r.ok||!u.startsWith('http'))throw new Error(j.error||j.text);fm.textContent=n;location.href=u}catch(e){fm.textContent=String(e.message||e)}}}
-   fl.appendChild(el)}}catch(e){fl.textContent=String(e.message||e)}}
- $('fup').onclick=()=>ls(up(cwd));$('fgo').onclick=()=>ls(fp.value);fp.addEventListener('keydown',e=>{if(e.key==='Enter')ls(fp.value)});
- document.addEventListener('dragover',e=>{e.preventDefault();document.body.classList.add('drop')});
- document.addEventListener('dragleave',e=>{if(!e.relatedTarget)document.body.classList.remove('drop')});
- document.addEventListener('drop',async e=>{e.preventDefault();document.body.classList.remove('drop');
-  for(const f of e.dataTransfer.files){fm.textContent=F.up+' '+f.name+'…';
-   try{const r=await fetch(base+'/upload?name='+encodeURIComponent(f.name)+'&dir='+encodeURIComponent(cwd),{method:'POST',headers:{'x-ctl':CTL},body:f}),j=await r.json();if(!r.ok)throw new Error(j.error);fm.textContent=F.ok+': '+j.path}catch(e){fm.textContent=String(e.message||e)}}
-  ls(cwd)});
- ls('~')}
 async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
 function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
 // zoom into the picture (wheel to zoom toward the cursor, drag to pan when zoomed; the control coordinates stay correct because real() reads the live box)
@@ -909,7 +889,8 @@ if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textConte
  txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();if(txt.value)send('/input',{a:'text',text:txt.value});setTimeout(()=>send('/input',{a:'key',keys:'enter'}),350);txt.value=''}});
  kb.querySelectorAll('[data-k]').forEach(x=>x.onclick=()=>send('/input',{a:'key',keys:x.dataset.k}));
  setInterval(()=>{if(control)send('/takeover',{on:true})},60000)}   // the hand-over lasts while this page is in control; the relay lets it lapse a few minutes after the page closes
-</script>`;
+</script>
+<link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
 }
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /i, '');
@@ -925,8 +906,13 @@ async function handler(req, res) {
   const p = url.pathname;
   try {
     res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('referrer-policy', 'no-referrer'); res.setHeader('strict-transport-security', 'max-age=31536000');
-    res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'");
+    res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; connect-src 'self'; frame-ancestors 'none'");
     if (p === '/health') return text(res, 200, 'ok');
+    if (p === '/assets/panels.js' || p === '/assets/panels.css') {   // the viewer's System / Files drawer
+      const f = path.join(here, p.slice(8));
+      try { res.writeHead(200, { 'content-type': p.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' }); return res.end(fs.readFileSync(f)); }
+      catch { return text(res, 404, 'not found'); }
+    }
     if (p === '/apk') {   // the Android app (people scan the QR code on the landing page)
       if (!fs.existsSync(APK_FILE)) return text(res, 404, 'The Android app is not installed on this server');
       res.writeHead(200, { 'content-type': 'application/vnd.android.package-archive', 'content-disposition': 'attachment; filename="HelperMCP.apk"', 'cache-control': 'no-cache' });
@@ -965,7 +951,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -996,10 +982,45 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         try { const d = await call(v.code, 'util', { op: 'kill', name: String(pid) }, 30_000, { human: true }); evPush(s, { t: Date.now(), type: 'killed', data: { pid, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'killed' }); }
         catch (e) { return json(res, 503, { error: e.message }); }
       }
+      if (vw[2] === '/fsop' || vw[2] === '/preview' || vw[2] === '/act') {   // control link only; every change is logged as the operator's
+        if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        v.fn = (v.fn || 0) + 1; const nowf = Date.now(); if (nowf - (v.fnt || 0) > 1000) { v.fnt = nowf; v.fn = 1; } if (v.fn > 30) return json(res, 429, { error: 'too fast' });
+        try {
+          if (vw[2] === '/preview') {
+            const d = await call(v.code, 'fsop', { op: 'preview', path: String(url.searchParams.get('path') || '') }, 60_000, { human: true });
+            if (d && d.jpeg) { res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(d.jpeg); }
+            res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }); return res.end(String(d?.text || '{}'));
+          }
+          if (req.method !== 'POST') return json(res, 405, {});
+          const b = JSON.parse((await body(req, 20_000)) || '{}');
+          if (vw[2] === '/fsop') {
+            if (!/^(mkdir|newfile|copy|move|rename|delete|stat)$/.test(String(b.op))) return json(res, 400, { error: 'bad op' });
+            const args = { op: b.op, path: String(b.path || ''), ...(b.dest ? { dest: String(b.dest) } : {}), ...(b.name ? { name: String(b.name) } : {}), ...(b.overwrite ? { overwrite: true } : {}), ...(b.permanent ? { permanent: true } : {}) };
+            const d = await call(v.code, 'fsop', args, 300_000, { human: true }); evPush(s, { t: Date.now(), type: 'fsop', data: { ...args, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'ok' });
+          }
+          // /act: a few safe, named actions for the System tabs
+          const act = String(b.act || '');
+          if (act === 'service') {
+            if (!/^[\w .@$-]{1,80}$/.test(String(b.name || '')) || !/^(start|stop|restart)$/.test(String(b.value))) return json(res, 400, { error: 'bad service action' });
+            const d = await call(v.code, 'util', { op: 'service', name: String(b.name), value: String(b.value) }, 60_000, { human: true }); evPush(s, { t: Date.now(), type: 'service', data: { name: b.name, value: b.value, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'ok' });
+          }
+          if (act === 'find') { const d = await call(v.code, 'find', { path: String(b.path || '~'), ...(b.name ? { name: String(b.name) } : {}), ...(b.text ? { text: String(b.text) } : {}), max: 200 }, 60_000, { human: true }); return json(res, 200, { text: d?.text || '' }); }
+          if (act === 'open') { const d = await call(v.code, 'util', { op: 'open', path: String(b.path || ''), value: String(b.path || ''), name: String(b.path || '') }, 30_000, { human: true }); evPush(s, { t: Date.now(), type: 'open', data: { path: b.path, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'ok' }); }
+          if (act === 'system') { const secs = (Array.isArray(b.sections) ? b.sections : []).filter((x) => /^(overview|disks|processes|network|services|apps|startup|health|policy|perf|connections|drivers|events)$/.test(x)).slice(0, 4); const d = await call(v.code, 'system', { sections: secs.length ? secs : ['overview'], top: 30 }, 90_000, { human: true }); return json(res, 200, { text: d?.text || '' }); }
+          return json(res, 400, { error: 'unknown action' });
+        } catch (e) { return json(res, 503, { error: e.message }); }
+      }
+      if (vw[2] === '/sysdata') {   // the System tabs: JSON from the agent (control link only: command lines and startup entries are not for view-only guests)
+        if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        const kind = String(url.searchParams.get('kind') || ''), pid = Math.round(Number(url.searchParams.get('pid') || 0));
+        if (!/^(procs|perf|services|startup|disks|policy|health|activation|process|adapters|reach)$/.test(kind)) return json(res, 400, { error: 'bad kind' });
+        try { const d = await call(v.code, 'sysdata', { kind, ...(pid ? { pid } : {}) }, 90_000, { human: true }); res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }); return res.end(String(d?.text || 'null')); }
+        catch (e) { return json(res, 503, { error: e.message }); }
+      }
       if (vw[2] === '/ls' || vw[2] === '/get' || vw[2] === '/upload') {   // files: browse, download, drop a file onto the PC (control link only)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         try {
-          if (vw[2] === '/ls') return json(res, 200, await call(v.code, 'tree', { path: url.searchParams.get('path') || '~', depth: 1, max: 500 }, 30_000, { human: true }));
+          if (vw[2] === '/ls') return json(res, 200, await call(v.code, url.searchParams.get('mode') === 'list' ? 'list_dir' : 'tree', url.searchParams.get('mode') === 'list' ? { path: url.searchParams.get('path') || '~' } : { path: url.searchParams.get('path') || '~', depth: 1, max: 500 }, 30_000, { human: true }));
           if (req.method !== 'POST') return json(res, 405, {});
           if (vw[2] === '/get') { const b = JSON.parse((await body(req, 5000)) || '{}'); return json(res, 200, await call(v.code, 'fetch_file', { path: String(b.path || '') }, 3_700_000, { human: true })); }
           const f = await storeFile(req, url.searchParams.get('name'), v.code), dir = String(url.searchParams.get('dir') || '');

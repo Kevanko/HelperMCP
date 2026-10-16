@@ -285,6 +285,38 @@ assert.equal(kj.status, 200, 'control link ends a process: ' + await kj.text());
 await new Promise((x) => setTimeout(x, 800));
 assert.throws(() => process.kill(victim.pid, 0), /ESRCH|kill/, 'the process is gone'); console.log('viewer kill ok');
 
+// file operations and previews: the same agent tool serves the AI and the viewer's Files tab
+const od = path.join(tmp, 'ops'), sep = path.sep, J = (...x) => x.join(sep);
+assert.ok(!(await tool('fsop', { session: code, op: 'mkdir', path: od })).isError);
+await tool('write_file', { session: code, path: J(od, 'a.txt'), content: 'hello' + String.fromCharCode(10) + 'world' });
+assert.ok(!(await tool('fsop', { session: code, op: 'newfile', path: J(od, 'empty.txt') })).isError, 'newfile');
+assert.ok((await tool('fsop', { session: code, op: 'newfile', path: J(od, 'empty.txt') })).isError, 'newfile refuses to overwrite');
+assert.ok(!(await tool('fsop', { session: code, op: 'copy', path: J(od, 'a.txt'), dest: J(od, 'b.txt') })).isError, 'copy');
+assert.ok((await tool('fsop', { session: code, op: 'copy', path: J(od, 'a.txt'), dest: J(od, 'b.txt') })).isError, 'copy refuses to replace without overwrite');
+await tool('fsop', { session: code, op: 'rename', path: J(od, 'b.txt'), name: 'c.txt' }); await tool('fsop', { session: code, op: 'mkdir', path: J(od, 'sub') });
+await tool('fsop', { session: code, op: 'move', path: J(od, 'c.txt'), dest: J(od, 'sub') });
+const tr = txt(await tool('tree', { session: code, path: od, depth: 2 })); assert.ok(/sub/.test(tr) && /c\.txt/.test(tr) && /a\.txt/.test(tr) && !/b\.txt/.test(tr), 'copy / rename / move worked: ' + tr);
+const pv = JSON.parse(txt(await tool('fsop', { session: code, op: 'preview', path: J(od, 'a.txt') }))); assert.equal(pv.kind, 'text'); assert.ok(pv.text.includes('hello'), 'preview shows the text without downloading');
+fs.writeFileSync(J(od, 'bin.dat'), Buffer.from([0, 1, 2, 3, 255, 0, 65, 66])); const pb = JSON.parse(txt(await tool('fsop', { session: code, op: 'preview', path: J(od, 'bin.dat') }))); assert.equal(pb.kind, 'binary'); assert.ok(/00 01 02 03/.test(pb.text), 'a binary file shows as a hex dump');
+await tool('fsop', { session: code, op: 'delete', path: J(od, 'sub'), permanent: true }); assert.ok(!/sub/.test(txt(await tool('tree', { session: code, path: od, depth: 1 }))), 'delete');
+// the viewer's doors: view-only link refused, control link works, everything is in the action log
+assert.equal((await fetch(vurl + '/fsop', { method: 'POST', body: '{"op":"mkdir","path":"x"}' })).status, 403); assert.equal((await fetch(vurl + '/preview?path=x')).status, 403); assert.equal((await fetch(vurl + '/sysdata?kind=procs')).status, 403);
+const vpv = await (await fetch(vurl + '/preview?path=' + encodeURIComponent(J(od, 'a.txt')), { headers: ctl })).json(); assert.ok(vpv.text.includes('world'), 'viewer preview');
+assert.equal((await fetch(vurl + '/fsop', { method: 'POST', headers: { ...ctl, 'content-type': 'application/json' }, body: JSON.stringify({ op: 'mkdir', path: J(od, 'viaviewer') }) })).status, 200); assert.ok(fs.existsSync(J(od, 'viaviewer')), 'viewer mkdir');
+const ls2 = await (await fetch(vurl + '/ls?mode=list&path=' + encodeURIComponent(od), { headers: ctl })).json(); assert.ok(/a\.txt/.test(ls2.text) && /^d /m.test(ls2.text) && /\d{4}-\d\d-\d\d/.test(ls2.text), 'list mode gives type, size and time');
+assert.equal((await fetch(vurl.replace(/\/v\/.*/, '/assets/panels.js'))).status, 200, 'the drawer script is served');
+if (useps) {   // Windows collectors: services, startup, performance, policies, activation, health, one process in detail; JSON for the tabs
+  for (const sec of ['services', 'startup', 'perf', 'policy', 'activation', 'health']) { const t = txt(await tool('system', { session: code, sections: [sec] })); assert.ok(t.length > 40 && !/failed:/.test(t), sec + ': ' + t.slice(0, 120)); }
+  assert.match(txt(await tool('system', { session: code, sections: ['process'], pid: process.pid })), /path: .*node/i);
+  const pj = await (await fetch(vurl + '/sysdata?kind=procs', { headers: ctl })).json(); assert.ok(pj.n > 20 && pj.p.some((r) => r[0] === process.pid), 'process table lists this node process');
+  const sv = await (await fetch(vurl + '/sysdata?kind=services', { headers: ctl })).json(); assert.ok(sv.length > 20 && sv[0].name, 'services JSON');
+  const pf = await (await fetch(vurl + '/sysdata?kind=perf', { headers: ctl })).json(); assert.ok(pf.cores.length >= 1 && pf.ram.total > 0, 'perf JSON');
+  const hc = await (await fetch(vurl + '/sysdata?kind=health', { headers: ctl })).json(); assert.ok(Array.isArray(hc) && hc.length >= 1 && hc[0].sev, 'health JSON');
+}
+else { const t = txt(await tool('system', { session: code, sections: ['health', 'perf', 'startup'] })); assert.match(t, /== health check/); assert.match(t, /== performance/); assert.match(t, /== startup/); }
+console.log('file operations + previews + system tabs ok');
+
+
 // stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)
 const pidFile = path.join(tmp, 'grandchild.pid');
 await tool('mcp_start', { session: code, name: 'tree', command: 'node', args: [echoJs], env: { GRANDCHILD_PIDFILE: pidFile } });

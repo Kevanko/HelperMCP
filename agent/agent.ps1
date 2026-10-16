@@ -7,7 +7,7 @@ if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'Power
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = $env:HELPER_LANG -eq 'ru'   # the console speaks English; HELPER_LANG=ru for Russian
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'util', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'fsop', 'util', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
@@ -339,7 +339,109 @@ namespace F__BUILD__ {
         if (n > 0) sb.Append(',');
         sb.AppendFormat(inv, "[{0},{1},{2:0.0},{3},{4},{5},{6}]", pid, J(names[pid]), pick[n][1], (long)pick[n][2], J(f[1]), J(f[0]), J(f[2]));
       }
+      return sb.Append("]").Append(SnapExtra()).Append("}").ToString();
+    }
+
+    // ---- full process table, per-core load, system counters, network and disk throughput (the viewer's System tabs and the AI's system tool)
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct PROCESSENTRY32 { public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID; public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile; }
+    [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32First(IntPtr h, ref PROCESSENTRY32 e);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32Next(IntPtr h, ref PROCESSENTRY32 e);
+    [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
+    [StructLayout(LayoutKind.Sequential)] struct PERFINFO { public uint cb; public UIntPtr CommitTotal, CommitLimit, CommitPeak, PhysicalTotal, PhysicalAvailable, SystemCache, KernelTotal, KernelPaged, KernelNonpaged, PageSize; public uint HandleCount, ProcessCount, ThreadCount; }
+    [DllImport("psapi.dll")] static extern bool GetPerformanceInfo(out PERFINFO p, int size);
+    [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
+
+    static Dictionary<int, int[]> Toolhelp() {   // pid -> { parent pid, threads }
+      var d = new Dictionary<int, int[]>(); thNames = new Dictionary<int, string>(); var h = CreateToolhelp32Snapshot(2, 0); if (h == (IntPtr)(-1)) return d;
+      var e = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32)) };
+      for (bool ok = Process32First(h, ref e); ok; ok = Process32Next(h, ref e)) { d[(int)e.th32ProcessID] = new[] { (int)e.th32ParentProcessID, (int)e.cntThreads }; thNames[(int)e.th32ProcessID] = e.szExeFile; }
+      CloseHandle(h); return d;
+    }
+    static Dictionary<int, string> thNames;
+    public static string Chain(int pid) {   // who started whom: parent, grandparent ... (names and pids), "|"-separated
+      var d = Toolhelp(); var o = new List<string>(); var seen = new HashSet<int> { pid }; int cur = pid;
+      while (o.Count < 8) { int[] x; if (!d.TryGetValue(cur, out x) || x[0] <= 0 || !seen.Add(x[0])) break; cur = x[0]; string n; o.Add((thNames.TryGetValue(cur, out n) ? n : "exited") + " (" + cur + ")"); }
+      return string.Join("|", o.ToArray());
+    }
+    static string[] Info(int pid) {   // exe path, publisher, ! flag: once per process
+      string[] f; if (sInfo.TryGetValue(pid, out f)) return f;
+      string path = PathOf(pid), company = "";
+      if (path.Length > 0) { try { company = (System.Diagnostics.FileVersionInfo.GetVersionInfo(path).CompanyName ?? "").Trim(); } catch { } }
+      f = new[] { path, company, Looks(path, company) ? "!" : "" }; sInfo[pid] = f; return f;
+    }
+
+    static Dictionary<int, TimeSpan> aPrev; static DateTime aT;
+    // every process: [pid, parent, name, cpu %, working set, private bytes, threads, handles, path, publisher, flag]; CPU % is the change since the previous call
+    public static string ProcsAll() {
+      var inv = System.Globalization.CultureInfo.InvariantCulture; var th = Toolhelp();
+      Func<Dictionary<int, TimeSpan>> sample = () => { var c = new Dictionary<int, TimeSpan>(); foreach (var p in System.Diagnostics.Process.GetProcesses()) { try { c[p.Id] = p.TotalProcessorTime; } catch { } finally { p.Dispose(); } } return c; };
+      if (aPrev == null || (DateTime.UtcNow - aT).TotalSeconds > 15) { aPrev = sample(); aT = DateTime.UtcNow; System.Threading.Thread.Sleep(300); }
+      var now = DateTime.UtcNow; double dt = (now - aT).TotalMilliseconds * Environment.ProcessorCount; var cur = new Dictionary<int, TimeSpan>(); var rows = new List<object[]>();
+      if (sInfo.Count > 3000) sInfo.Clear();
+      foreach (var p in System.Diagnostics.Process.GetProcesses()) {
+        try {
+          int pid = p.Id; TimeSpan t = TimeSpan.Zero; bool ok = false; try { t = p.TotalProcessorTime; ok = true; } catch { }
+          double c = 0; TimeSpan a; if (ok) { cur[pid] = t; if (dt > 0 && aPrev.TryGetValue(pid, out a)) c = Math.Max(0, (t - a).TotalMilliseconds / dt * 100.0); }
+          int[] x; th.TryGetValue(pid, out x); var f = Info(pid); long priv = 0; int hc = 0; try { priv = p.PrivateMemorySize64; hc = p.HandleCount; } catch { }
+          rows.Add(new object[] { pid, x != null ? x[0] : 0, pid == 0 ? "Idle" : p.ProcessName, Math.Round(c, 1), p.WorkingSet64, priv, x != null ? x[1] : 0, hc, f[0], f[1], f[2] });
+        } catch { } finally { p.Dispose(); }
+      }
+      aPrev = cur; aT = now; rows.Sort((x, y) => ((double)y[3]).CompareTo((double)x[3]) != 0 ? ((double)y[3]).CompareTo((double)x[3]) : ((long)y[4]).CompareTo((long)x[4]));
+      var sb = new System.Text.StringBuilder("{\"n\":" + rows.Count + ",\"p\":[");
+      for (int i = 0; i < rows.Count; i++) { var r = rows[i]; if (i > 0) sb.Append(','); sb.AppendFormat(inv, "[{0},{1},{2},{3:0.0},{4},{5},{6},{7},{8},{9},{10}]", r[0], r[1], J((string)r[2]), r[3], r[4], r[5], r[6], r[7], J((string)r[8]), J((string)r[9]), J((string)r[10])); }
       return sb.Append("]}").ToString();
+    }
+
+    static long[] CoreTimes() {   // per core: idle, busy (kernel + user, kernel already includes idle)
+      int n = Environment.ProcessorCount, sz = 48 * n; IntPtr b = Marshal.AllocHGlobal(sz);
+      try { int r; if (NtQuerySystemInformation(8, b, sz, out r) != 0) return null; var o = new long[n * 2]; for (int i = 0; i < n; i++) { long idle = Marshal.ReadInt64(b, i * 48), k = Marshal.ReadInt64(b, i * 48 + 8), u = Marshal.ReadInt64(b, i * 48 + 16); o[i * 2] = idle; o[i * 2 + 1] = k + u; } return o; }
+      catch { return null; } finally { Marshal.FreeHGlobal(b); }
+    }
+    static long[] cPrev;
+    static double[] Cores() {   // per-core busy % since the previous call
+      var c = CoreTimes(); if (c == null) return new double[0]; var p = cPrev; cPrev = c; if (p == null || p.Length != c.Length) return new double[c.Length / 2];
+      var o = new double[c.Length / 2]; for (int i = 0; i < o.Length; i++) { double tot = c[i * 2 + 1] - p[i * 2 + 1], idle = c[i * 2] - p[i * 2]; o[i] = tot <= 0 ? 0 : Math.Round(Math.Max(0, Math.Min(100, (tot - idle) / tot * 100.0))); }
+      return o;
+    }
+    static string Arr(double[] a) { return "[" + string.Join(",", Array.ConvertAll(a, v => v.ToString(System.Globalization.CultureInfo.InvariantCulture))) + "]"; }
+
+    static Dictionary<string, long[]> nPrev = new Dictionary<string, long[]>(); static DateTime nT;
+    // network throughput per adapter that is up: [name, received bytes/s, sent bytes/s, link speed bit/s], change since the previous call
+    static string Net(out long rxAll, out long txAll) {
+      var inv = System.Globalization.CultureInfo.InvariantCulture; var now = DateTime.UtcNow; double dt = nT == default(DateTime) ? 0 : (now - nT).TotalSeconds; var cur = new Dictionary<string, long[]>(); var sb = new System.Text.StringBuilder("["); rxAll = 0; txAll = 0; int n = 0;
+      foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()) {
+        if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up || ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+        try {
+          var s = ni.GetIPv4Statistics(); long rx = s.BytesReceived, tx = s.BytesSent; cur[ni.Id] = new[] { rx, tx }; long[] p; long r = 0, t = 0;
+          if (dt > 0 && nPrev.TryGetValue(ni.Id, out p)) { r = (long)Math.Max(0, (rx - p[0]) / dt); t = (long)Math.Max(0, (tx - p[1]) / dt); }
+          rxAll += r; txAll += t; if (n++ > 0) sb.Append(','); sb.AppendFormat(inv, "[{0},{1},{2},{3}]", J(ni.Name), r, t, ni.Speed);
+        } catch { }
+      }
+      nPrev = cur; nT = now; return sb.Append("]").ToString();
+    }
+
+    static volatile System.Diagnostics.PerformanceCounter[] dc; static volatile bool dcBusy;
+    // the whole-machine performance picture, sampled over ~0.35 s: CPU, every core, memory, commit, handles / threads / processes, disks and network throughput
+    public static string Perf() {
+      var inv = System.Globalization.CultureInfo.InvariantCulture; Cores(); long rx, tx; Net(out rx, out tx); double cpu0 = 0;
+      long i1, k1, u1; GetSystemTimes(out i1, out k1, out u1);
+      if (dc == null && !dcBusy) { dcBusy = true; var th = new System.Threading.Thread(() => { try { var l = new[] { new System.Diagnostics.PerformanceCounter("PhysicalDisk", "Disk Read Bytes/sec", "_Total"), new System.Diagnostics.PerformanceCounter("PhysicalDisk", "Disk Write Bytes/sec", "_Total"), new System.Diagnostics.PerformanceCounter("PhysicalDisk", "% Disk Time", "_Total"), new System.Diagnostics.PerformanceCounter("PhysicalDisk", "Avg. Disk Queue Length", "_Total") }; foreach (var c in l) c.NextValue(); dc = l; } catch { } dcBusy = false; }); th.IsBackground = true; th.Start(); }
+      else if (dc != null) { try { foreach (var c in dc) c.NextValue(); } catch { dc = null; } }
+      System.Threading.Thread.Sleep(350);
+      long i2, k2, u2; GetSystemTimes(out i2, out k2, out u2); double tot = (k2 - k1) + (u2 - u1); cpu0 = tot <= 0 ? 0 : Math.Round((tot - (i2 - i1)) / tot * 100.0);
+      var cores = Cores(); var netj = Net(out rx, out tx); var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) }; GlobalMemoryStatusEx(ref m);
+      PERFINFO pi; pi.cb = (uint)Marshal.SizeOf(typeof(PERFINFO)); bool okp = GetPerformanceInfo(out pi, (int)pi.cb); ulong pg = okp ? pi.PageSize.ToUInt64() : 4096;
+      string disk = "null"; try { if (dc != null) disk = string.Format(inv, "{{\"rd\":{0:0},\"wr\":{1:0},\"busy\":{2:0},\"q\":{3:0.00}}}", dc[0].NextValue(), dc[1].NextValue(), Math.Min(100, dc[2].NextValue()), dc[3].NextValue()); } catch { }
+      var up = TimeSpan.FromMilliseconds((double)GetTickCount64());
+      return string.Format(inv, "{{\"cpu\":{0},\"cores\":{1},\"ram\":{{\"total\":{2},\"avail\":{3},\"load\":{4}}},\"commit\":{{\"used\":{5},\"limit\":{6},\"peak\":{7}}},\"cache\":{8},\"kpaged\":{9},\"knon\":{10},\"procs\":{11},\"threads\":{12},\"handles\":{13},\"up\":{14},\"net\":{15},\"rx\":{16},\"tx\":{17},\"disk\":{18},\"cpus\":{19}}}",
+        cpu0, Arr(cores), m.ullTotalPhys, m.ullAvailPhys, m.dwMemoryLoad, okp ? (long)(pi.CommitTotal.ToUInt64() * pg) : 0, okp ? (long)(pi.CommitLimit.ToUInt64() * pg) : 0, okp ? (long)(pi.CommitPeak.ToUInt64() * pg) : 0,
+        okp ? (long)(pi.SystemCache.ToUInt64() * pg) : 0, okp ? (long)(pi.KernelPaged.ToUInt64() * pg) : 0, okp ? (long)(pi.KernelNonpaged.ToUInt64() * pg) : 0, okp ? pi.ProcessCount : 0, okp ? pi.ThreadCount : 0, okp ? pi.HandleCount : 0, (long)up.TotalSeconds, netj, rx, tx, disk, Environment.ProcessorCount);
+    }
+
+    // the S frame carries the cores and the network speed too
+    public static string SnapExtra() {
+      long rx, tx; var n = Net(out rx, out tx); return ",\"cores\":" + Arr(Cores()) + ",\"rx\":" + rx + ",\"tx\":" + tx;
     }
 
     public static double CpuLoad(int ms) {   // whole-machine CPU busy %, sampled over ms (kernel time already includes idle)
@@ -1217,8 +1319,10 @@ function Do-System($a) {
                     Line ("up {0}d {1}h {2}m; cpu {3} ({4} cores) busy {5}%; {6}" -f $up.Days, $up.Hours, $up.Minutes, $st.cpu, $st.cores, [F__BUILD__.Sys]::CpuLoad(150), [F__BUILD__.Sys]::Mem())
                 }
                 'disks' {
-                    Sec 'disks'
-                    [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object { Line ("{0} {1} free of {2} ({3:0}% free) {4} {5}" -f $_.Name.TrimEnd('\'), [F__BUILD__.Fs]::Human($_.AvailableFreeSpace), [F__BUILD__.Fs]::Human($_.TotalSize), (100.0 * $_.AvailableFreeSpace / [Math]::Max(1.0, [double]$_.TotalSize)), $_.DriveFormat, $_.VolumeLabel) }
+                    Sec 'disks: every drive'
+                    $dk = Disks-All
+                    foreach ($d in $dk.drives) { if ($d.ready) { Line ("{0} {1} [{2}] {3} {4} free of {5} ({6:0}% free)" -f $d.name, $d.label, $d.type, $d.fs, [F__BUILD__.Fs]::Human($d.free), [F__BUILD__.Fs]::Human($d.total), $(if ($d.total) { 100.0 * $d.free / $d.total } else { 0 })) } else { Line ("{0} [{1}] not ready" -f $d.name, $d.type) } }
+                    foreach ($pd in $dk.physical) { Line ("physical: {0} {1} {2} {3} health={4} {5}" -f $pd.name, $pd.media, $pd.bus, [F__BUILD__.Fs]::Human($pd.size), $pd.health, $pd.status) }
                 }
                 'processes' {
                     Sec "processes: real CPU % (sampled), memory, who signed it, where it runs from"
@@ -1264,12 +1368,45 @@ function Do-System($a) {
                     Line "$($rows.Count) third-party running"
                 }
                 'services' {
-                    Sec 'auto-start services that are not running'
-                    Get-CimInstance Win32_Service -Filter "StartMode='Auto' AND State<>'Running'" | Select-Object -First 40 | ForEach-Object { Line "$($_.Name) ($($_.DisplayName)): $($_.State)" }
+                    $sv = @(Svc-List); $run = @($sv | Where-Object state -eq 'Running'); $off = @($sv | Where-Object start -eq 'Disabled')
+                    Sec ("services: $($sv.Count) total, $($run.Count) running, $(@($sv | Where-Object state -ne 'Running').Count) stopped, $($off.Count) disabled (non-Microsoft running ones below; ! = unusual file)")
+                    foreach ($x in ($run | Where-Object { -not $_.ms } | Sort-Object name | Select-Object -First 60)) { $w = Trust-Of $x.exe; Line ("{0}{1} ({2}) [{3}, {4}] {5}" -f $(if ($w) { '! ' } else { '' }), $x.name, $x.disp, $x.start, $x.acct, $x.exe) }
+                    $as = @($sv | Where-Object { $_.start -eq 'Auto' -and $_.state -ne 'Running' }); if ($as.Count) { Line ("auto-start but stopped: " + (($as | Select-Object -First 25 | ForEach-Object { $_.name }) -join ', ')) }
+                    if ($off.Count) { Line ("disabled: " + (($off | Select-Object -First 40 | ForEach-Object { $_.name }) -join ', ')) }
                 }
                 'startup' {
-                    Sec 'startup'
-                    Get-CimInstance Win32_StartupCommand | ForEach-Object { Line ("{0}: {1}  [{2}]" -f $_.Name, $_.Command, $_.Location) }
+                    $su = @(Startup-List); Sec ("startup: $($su.Count) entries (! = file missing, unusual place or a Windows-logon trick; off = disabled in Task Manager)")
+                    foreach ($x in $su) { Line ("{0}{1,-8} {2}  {3}  [{4}]{5}{6}" -f $(if ($x.flag) { '! ' } else { '  ' }), $x.kind, $x.name, (Cut $x.cmd 110), $x.where, $(if (-not $x.on) { ' off' } else { '' }), $(if ($x.flag) { '  <- ' + $x.flag } else { '' })) }
+                }
+                'perf' {
+                    Sec 'performance'
+                    $pf = [F__BUILD__.Sys]::Perf() | ConvertFrom-Json
+                    Line ("cpu {0}% over {1} cores: {2}" -f $pf.cpu, $pf.cpus, (($pf.cores | ForEach-Object { "$_%" }) -join ' '))
+                    Line ("ram {0} used of {1} ({2}%), cache {3}, commit {4} of {5}, kernel paged {6} / non-paged {7}" -f [F__BUILD__.Fs]::Human($pf.ram.total - $pf.ram.avail), [F__BUILD__.Fs]::Human($pf.ram.total), $pf.ram.load, [F__BUILD__.Fs]::Human($pf.cache), [F__BUILD__.Fs]::Human($pf.commit.used), [F__BUILD__.Fs]::Human($pf.commit.limit), [F__BUILD__.Fs]::Human($pf.kpaged), [F__BUILD__.Fs]::Human($pf.knon))
+                    Line ("{0} processes, {1} threads, {2} handles, up {3}d {4}h {5}m" -f $pf.procs, $pf.threads, $pf.handles, [int][Math]::Floor($pf.up / 86400), [int][Math]::Floor(($pf.up % 86400) / 3600), [int][Math]::Floor(($pf.up % 3600) / 60))
+                    if ($pf.disk) { Line ("disk: read {0}/s, write {1}/s, busy {2}%, queue {3}" -f [F__BUILD__.Fs]::Human($pf.disk.rd), [F__BUILD__.Fs]::Human($pf.disk.wr), $pf.disk.busy, $pf.disk.q) }
+                    foreach ($n in $pf.net) { Line ("net {0}: down {1}/s, up {2}/s, link {3} Mbit/s" -f $n[0], [F__BUILD__.Fs]::Human($n[1]), [F__BUILD__.Fs]::Human($n[2]), [int]($n[3] / 1000000)) }
+                }
+                'policy' {
+                    $pl = @(Policy-List); Sec ("policies: $($pl.Count) custom values set (registry Policies keys); the ones with a note change how Windows behaves")
+                    foreach ($x in ($pl | Sort-Object { -not $_.note }, root, key, name | Select-Object -First 120)) { Line ("{0}{1}\{2}\{3} = {4}{5}" -f $(if ($x.note) { '! ' } else { '  ' }), $x.root, $x.key, $x.name, (Cut $x.value 60), $(if ($x.note) { '   <- ' + $x.note } else { '' })) }
+                    if (-not $pl.Count) { Line 'none: no group policy / registry policy has been set on this PC' }
+                    $gp = Join-Path $env:SystemRoot 'System32\GroupPolicy\Machine\Registry.pol'; if (Test-Path $gp) { Line ("local group policy file: $gp changed " + (Get-Item $gp).LastWriteTime.ToString('yyyy-MM-dd HH:mm')) }
+                    $ac = Activation-Info; Line ("activation: $($ac.status); $($ac.name); channel $($ac.channel)$(if ($ac.kms) { '; KMS ' + $ac.kms })")
+                }
+                'activation' {
+                    Sec 'windows activation'; $ac = Activation-Info
+                    Line ("{0}; {1}; channel {2}; key {3}{4}{5}" -f $ac.status, $ac.name, $ac.channel, $ac.key, $(if ($ac.kms) { '; KMS ' + $ac.kms } else { '' }), $(if ($ac.grace) { "; grace left $($ac.grace) min" } else { '' }))
+                }
+                'health' {
+                    Sec 'health check: bad = fix first, warn = look, ok = fine'
+                    foreach ($x in @(Health-Check | Sort-Object @{ e = { @{ bad = 0; warn = 1; ok = 2 }[$_.sev] } })) { Line ("[{0}] {1}: {2}{3}" -f $x.sev.ToUpper(), $x.area, $x.msg, $(if ($x.fix) { "  -> $($x.fix)" } else { '' })) }
+                }
+                'process' {
+                    if (-not $a.pid) { Line 'process: give pid'; break }
+                    Sec "process $($a.pid) in detail"
+                    $pd = Process-Detail ([int]$a.pid)
+                    foreach ($pr in $pd.GetEnumerator()) { $v = $pr.Value; if ($v -is [array]) { $v = ($v -join ' | ') }; Line ("{0}: {1}" -f $pr.Key, (Cut ([string]$v) 400)) }
                 }
                 'apps' {
                     $L = @(Installed-Apps '')
@@ -1287,6 +1424,256 @@ function Do-System($a) {
     }
     } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $cul }
     @{ text = $o.ToString().TrimEnd() }
+}
+
+
+# ---- system analysis: services, startup, performance, disks, policies, activation, one health check, one process in detail.
+# The same collectors feed the AI (`system` sections, compact text) and the live viewer (`sysdata`, JSON).
+function Exe-Of($cmd) {   # the executable path out of a command line
+    $c = ([string]$cmd).Trim(); if (-not $c) { return '' }
+    if ($c.StartsWith('"')) { $i = $c.IndexOf('"', 1); if ($i -gt 0) { return [Environment]::ExpandEnvironmentVariables($c.Substring(1, $i - 1)) } }
+    $m = [regex]::Match($c, '^(.+?\.(exe|dll|bat|cmd|ps1|vbs|js|msc|com|scr|sys))(\s|$)', 'IgnoreCase'); if ($m.Success) { return [Environment]::ExpandEnvironmentVariables($m.Groups[1].Value) }
+    [Environment]::ExpandEnvironmentVariables(($c -split '\s+')[0])
+}
+$ShadyRx = '(?i)\\(temp|tmp)\\|\\downloads\\|\\\$recycle|\\appdata\\local\\temp|\\users\\public\\|\\programdata\\[^\\]+\.(exe|dll)$'
+$NormalRx = '(?i)^[a-z]:\\(windows|program files|program files \(x86\)|programdata\\microsoft)\\|\\steamapps\\|\\epic games\\|\\riot games\\|\\windowsapps\\'
+function Trust-Of($exe) {   # '', or why this file deserves a look
+    if (-not $exe) { return '' }
+    if (-not (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue)) { return 'file missing' }
+    if ($exe -match $ShadyRx) { return 'runs from a temp / download / public folder' }
+    if ($exe -notmatch $NormalRx) { $co = ''; try { $co = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).CompanyName } catch { }; if (-not $co) { return 'no publisher, outside the normal install folders' } }
+    ''
+}
+function Svc-List {
+    Get-CimInstance Win32_Service -ErrorAction Stop | ForEach-Object {
+        $exe = Exe-Of $_.PathName
+        [pscustomobject]@{ name = $_.Name; disp = $_.DisplayName; state = [string]$_.State; start = [string]$_.StartMode; pid = [int]$_.ProcessId; acct = [string]$_.StartName; exe = $exe; ms = ($exe -match '(?i)^[a-z]:\\windows\\' -or $exe -match '(?i)\\microsoft\\|\\windows defender\\|\\windowsapps\\') }
+    }
+}
+function Startup-Disabled($hive, $kind, $name) {   # Task Manager's Startup tab keeps its on/off switch here
+    try { $b = (Get-ItemProperty "${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\$kind" -ErrorAction Stop).$name; if ($b -and ($b[0] -band 1)) { return $true } } catch { }
+    $false
+}
+function Startup-List($withTasks = $true) {   # everything that starts by itself: Run keys, startup folders, logon / boot tasks, auto services, Winlogon / IFEO / AppInit tricks
+    $rows = New-Object Collections.Generic.List[object]
+    function Add-Row($kind, $name, $cmd, $where, $on, $note) { $exe = Exe-Of $cmd; $why = if ($note) { $note } else { Trust-Of $exe }; $rows.Add([pscustomobject]@{ kind = $kind; name = [string]$name; cmd = [string]$cmd; where = $where; on = [bool]$on; exe = $exe; flag = [string]$why }) }
+    foreach ($k in @(@('HKLM', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'Run'), @('HKLM', 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'Run32'), @('HKCU', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'Run'), @('HKLM', 'SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce', ''), @('HKCU', 'SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce', ''))) {
+        $p = Get-ItemProperty "$($k[0]):\$($k[1])" -ErrorAction SilentlyContinue
+        if ($p) { foreach ($v in $p.PSObject.Properties) { if ($v.Name -notmatch '^PS(Path|ParentPath|ChildName|Drive|Provider)$') { Add-Row 'run' $v.Name $v.Value "$($k[0]) $($k[1] -replace '^SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\','')" (-not ($k[2] -and (Startup-Disabled $k[0] $k[2] $v.Name))) '' } } }
+    }
+    foreach ($d in @(@([Environment]::GetFolderPath('Startup'), 'user startup folder'), @([Environment]::GetFolderPath('CommonStartup'), 'all-users startup folder'))) {
+        Get-ChildItem -LiteralPath $d[0] -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' } | ForEach-Object { $t = $_.FullName; if ($_.Extension -eq '.lnk') { try { $t = (New-Object -ComObject WScript.Shell).CreateShortcut($_.FullName).TargetPath } catch { } }; Add-Row 'folder' $_.BaseName $t $d[1] $true '' }
+    }
+    $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+    if ($wl) {
+        if ($wl.Shell -and $wl.Shell.Trim() -ne 'explorer.exe') { Add-Row 'winlogon' 'Shell' $wl.Shell 'Winlogon' $true 'the Windows shell was replaced (normally explorer.exe)' }
+        if ($wl.Userinit -and $wl.Userinit.Trim().TrimEnd(',') -notmatch '(?i)^[a-z]:\\windows\\system32\\userinit\.exe$') { Add-Row 'winlogon' 'Userinit' $wl.Userinit 'Winlogon' $true 'Userinit was changed (normally only userinit.exe)' }
+    }
+    $ai = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows' -ErrorAction SilentlyContinue
+    if ($ai -and $ai.AppInit_DLLs) { Add-Row 'winlogon' 'AppInit_DLLs' $ai.AppInit_DLLs 'Windows' $true 'a DLL is injected into every program' }
+    foreach ($ifeo in @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options' -ErrorAction SilentlyContinue)) { $dbg = (Get-ItemProperty $ifeo.PSPath -ErrorAction SilentlyContinue).Debugger; if ($dbg) { Add-Row 'winlogon' $ifeo.PSChildName $dbg 'Image File Execution Options' $true 'a debugger is attached: launching this program starts something else' } }
+    if ($withTasks) {
+        $td = Join-Path $env:SystemRoot 'System32\Tasks'
+        foreach ($f in @(Get-ChildItem -LiteralPath $td -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Microsoft\\Windows\\' })) {
+            try {
+                $x = [xml](Get-Content -LiteralPath $f.FullName -Raw -ErrorAction Stop); $t = $x.Task; $trg = @($t.Triggers.ChildNodes | ForEach-Object { $_.Name })
+                if (-not ($trg -contains 'LogonTrigger' -or $trg -contains 'BootTrigger')) { continue }
+                $cmd = (@($t.Actions.Exec | ForEach-Object { ($_.Command + ' ' + $_.Arguments).Trim() }) -join ' ; ')
+                Add-Row 'task' ($f.FullName.Substring($td.Length + 1)) $cmd ('task at ' + ($(if ($trg -contains 'BootTrigger') { 'boot' } else { 'logon' }))) ($t.Settings.Enabled -ne 'false') ''
+            } catch { }
+        }
+    }
+    foreach ($s in @(Svc-List | Where-Object { $_.start -eq 'Auto' -and -not $_.ms })) { Add-Row 'service' $s.name $s.exe ("service (" + $s.state + ", " + $s.acct + ")") $true '' }
+    $rows
+}
+function Disks-All {   # every drive (fixed, removable, network, optical) and the physical disks behind them
+    $d = @([IO.DriveInfo]::GetDrives() | ForEach-Object { $r = [ordered]@{ name = $_.Name.TrimEnd('\'); type = [string]$_.DriveType; ready = $_.IsReady; label = ''; fs = ''; total = 0; free = 0 }; if ($_.IsReady) { try { $r.label = $_.VolumeLabel; $r.fs = $_.DriveFormat; $r.total = $_.TotalSize; $r.free = $_.AvailableFreeSpace } catch { } }; [pscustomobject]$r })
+    $p = @(); try { $p = @(Get-PhysicalDisk -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ name = $_.FriendlyName; media = [string]$_.MediaType; bus = [string]$_.BusType; size = [int64]$_.Size; health = [string]$_.HealthStatus; status = [string]$_.OperationalStatus } }) } catch { }
+    @{ drives = $d; physical = $p }
+}
+$PolicyNotes = @(   # registry key (under a Policies root) / value -> what it does
+    @('Microsoft\Windows\WindowsUpdate\AU', 'NoAutoUpdate', 'automatic Windows updates are switched off by policy'),
+    @('Microsoft\Windows\WindowsUpdate\AU', 'AUOptions', 'automatic update behaviour is forced by policy'),
+    @('Microsoft\Windows\WindowsUpdate', 'DisableWindowsUpdateAccess', 'the Windows Update page and scans are blocked: updates, and the Store that depends on them, may fail'),
+    @('Microsoft\Windows\WindowsUpdate', 'WUServer', 'updates come from a WSUS server, not Microsoft: if it is gone, updates and the Store fail'),
+    @('Microsoft\Windows\WindowsUpdate', 'DoNotConnectToWindowsUpdateInternetLocations', 'Windows Update may not reach Microsoft'),
+    @('Microsoft\Windows\WindowsUpdate', 'TargetReleaseVersion', 'the Windows version is pinned: no feature updates past it'),
+    @('Microsoft\WindowsStore', 'RemoveWindowsStore', 'the Microsoft Store is removed by policy'),
+    @('Microsoft\WindowsStore', 'DisableStoreApps', 'Store apps are disabled by policy'),
+    @('Microsoft\Windows Defender', 'DisableAntiSpyware', 'Microsoft Defender is disabled by policy'),
+    @('Microsoft\Windows Defender\Real-Time Protection', 'DisableRealtimeMonitoring', 'Defender real-time protection is off by policy'),
+    @('Microsoft\Windows\System', 'EnableSmartScreen', 'SmartScreen is controlled by policy (0 = off)'),
+    @('Microsoft\Windows\System', 'DisableCMD', 'the command prompt is blocked'),
+    @('Microsoft\Windows NT\CurrentVersion\Winlogon', 'DisableLockWorkstation', 'locking the PC is blocked'),
+    @('Microsoft\Windows\CloudContent', 'DisableWindowsConsumerFeatures', 'consumer features (suggested apps) are off'),
+    @('Microsoft\Windows\DataCollection', 'AllowTelemetry', 'telemetry level is forced by policy'),
+    @('Microsoft\Windows NT\DNSClient', 'DoHPolicy', 'DNS over HTTPS is forced by policy'),
+    @('Microsoft\Windows\NetworkConnectivityStatusIndicator', 'NoActiveProbe', 'Windows does not check for internet: the "no internet" icon may be wrong'),
+    @('Microsoft\Windows\Network Connections', 'NC_PersonalFirewallConfig', 'firewall settings are locked by policy'),
+    @('Microsoft\WindowsFirewall\StandardProfile', 'EnableFirewall', 'the firewall (private profile) is set by policy'),
+    @('Microsoft\WindowsFirewall\PublicProfile', 'EnableFirewall', 'the firewall (public profile) is set by policy'),
+    @('Microsoft\Windows\Appx', 'AllowAllTrustedApps', 'sideloading of apps is controlled by policy'),
+    @('Microsoft\Windows\Safer', '', 'software restriction (AppLocker / SRP) rules exist'),
+    @('Microsoft\Windows\System', 'EnableActivityFeed', 'activity history is controlled by policy'),
+    @('Microsoft\Edge', '', 'Microsoft Edge is managed by policy'),
+    @('Google\Chrome', '', 'Google Chrome is managed by policy'),
+    @('Mozilla\Firefox', '', 'Firefox is managed by policy'))
+function Policy-List {   # every custom policy that is set (registry Policies keys), with what the well-known ones mean
+    $out = New-Object Collections.Generic.List[object]
+    $roots = @(@('HKLM', 'SOFTWARE\Policies'), @('HKCU', 'SOFTWARE\Policies'), @('HKLM', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'), @('HKCU', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies'), @('HKLM', 'SYSTEM\CurrentControlSet\Policies'))
+    foreach ($r in $roots) {
+        $base = "$($r[0]):\$($r[1])"; if (-not (Test-Path $base)) { continue }
+        foreach ($k in @(Get-Item $base -ErrorAction SilentlyContinue) + @(Get-ChildItem $base -Recurse -ErrorAction SilentlyContinue)) {
+            $rel = ($k.Name -replace '^[^\\]+\\', '') -replace ('^' + [regex]::Escape($r[1]) + '\\?'), ''
+            foreach ($n in $k.GetValueNames()) {
+                if ($n -eq '') { continue }
+                $v = $k.GetValue($n); if ($v -is [byte[]]) { $v = '<' + $v.Length + ' bytes>' } elseif ($v -is [array]) { $v = $v -join ',' }
+                $note = ''; foreach ($pn in $PolicyNotes) { if ($pn[1] -and $n -eq $pn[1] -and $rel -ieq $pn[0]) { $note = $pn[2]; break } }
+                if (-not $note -and $r[1] -like '*CurrentVersion\Policies') { $note = if ($n -eq 'EnableLUA' -and $v -eq 0) { 'UAC is switched off' } elseif ($n -match '^(DisableTaskMgr|DisableRegistryTools|NoControlPanel|NoRun|NoDrives|NoViewOnDrive|NoDispCPL)$' -and $v -ne 0) { "restriction: $n" } else { '' } }
+                $out.Add([pscustomobject]@{ root = "$($r[0])\$($r[1])"; key = $rel; name = $n; value = [string]$v; note = $note })
+            }
+            foreach ($pn in $PolicyNotes) { if (-not $pn[1] -and $rel -ieq $pn[0] -and $k.GetValueNames().Count -ge 0) { $out.Add([pscustomobject]@{ root = "$($r[0])\$($r[1])"; key = $rel; name = '(key present)'; value = ''; note = $pn[2] }) } }
+        }
+    }
+    $out
+}
+function Activation-Info {
+    try {
+        $p = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop | Select-Object -First 1
+        if (-not $p) { return [pscustomobject]@{ status = 'no product key found'; ok = $false; name = ''; channel = ''; kms = ''; grace = 0 } }
+        $st = @{ 0 = 'UNLICENSED'; 1 = 'licensed (activated)'; 2 = 'grace period (not activated yet)'; 3 = 'grace period expired'; 4 = 'NON-GENUINE grace'; 5 = 'NOTIFICATION mode (activation required)'; 6 = 'extended grace' }[[int]$p.LicenseStatus]
+        [pscustomobject]@{ status = $st; ok = ([int]$p.LicenseStatus -eq 1); name = $p.Name; channel = [string]$p.ProductKeyChannel; kms = [string]$p.KeyManagementServiceMachine; grace = [int]$p.GracePeriodRemaining; key = '*****-' + $p.PartialProductKey }
+    } catch { [pscustomobject]@{ status = "could not read: $($_.Exception.Message)"; ok = $false; name = ''; channel = ''; kms = ''; grace = 0 } }
+}
+function Health-Check {   # a quick tour of the things that usually explain "it just stopped working": findings with severity (bad / warn / ok) and what to do
+    $f = New-Object Collections.Generic.List[object]
+    function F($sev, $area, $msg, $fix) { $f.Add([pscustomobject]@{ sev = $sev; area = $area; msg = $msg; fix = [string]$fix }) }
+    $svc = @{}; try { foreach ($s in (Svc-List)) { $svc[$s.name] = $s } } catch { F 'warn' 'services' "could not list services: $($_.Exception.Message)" '' }
+    # Windows Update and the Microsoft Store share the same plumbing
+    foreach ($n in 'wuauserv', 'UsoSvc', 'BITS', 'cryptsvc', 'DoSvc', 'WaaSMedicSvc', 'ClipSVC', 'AppXSvc', 'InstallService', 'StateRepository', 'LicenseManager') {
+        $s = $svc[$n]; if (-not $s) { continue }
+        if ($s.start -eq 'Disabled') { F 'bad' 'update / Store' "service $n ($($s.disp)) is DISABLED" "util {op:service, name:$n, value:start} after setting its start type: sc config $n start= demand" }
+    }
+    $pol = @(); try { $pol = @(Policy-List) } catch { }
+    foreach ($p in $pol) { if ($p.note -and $p.name -ne '(key present)' -and ($p.note -match 'update|Store|Defender|firewall|SmartScreen|UAC|internet|blocked|removed|disabled|off')) { F 'warn' 'policy' "$($p.root)\$($p.key)\$($p.name) = $($p.value): $($p.note)" 'if unintended: remove the value (reg delete) or reset the local policy, then gpupdate /force' } }
+    try { $ux = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' -ErrorAction Stop; if ($ux.PauseUpdatesExpiryTime -and ([DateTime]$ux.PauseUpdatesExpiryTime) -gt (Get-Date)) { F 'warn' 'update' "updates are paused until $($ux.PauseUpdatesExpiryTime)" 'Settings > Windows Update > Resume updates' } } catch { }
+    try { $last = (New-Object -ComObject Microsoft.Update.AutoUpdate).Results.LastInstallationSuccessDate; if ($last -and ((Get-Date) - $last).TotalDays -gt 90) { F 'warn' 'update' ("the last successful update install was " + [int]((Get-Date) - $last).TotalDays + " days ago") 'check the Windows Update service, policies and free disk space' } } catch { }
+    $act = Activation-Info; if (-not $act.ok) { F 'bad' 'activation' "Windows: $($act.status)" 'slmgr /ato after checking the key; the Store and personalization may be limited' } else { F 'ok' 'activation' "Windows is activated ($($act.channel))" '' }
+    # protection
+    try { $mp = Get-MpComputerStatus -ErrorAction Stop; if (-not $mp.RealTimeProtectionEnabled) { F 'warn' 'defender' 'Defender real-time protection is OFF' 'turn it on in Windows Security unless another antivirus is installed' }; if ($mp.AntivirusSignatureAge -gt 7) { F 'warn' 'defender' "virus definitions are $($mp.AntivirusSignatureAge) days old" 'Update-MpSignature' } } catch { if ($svc['WinDefend'] -and $svc['WinDefend'].state -ne 'Running') { F 'warn' 'defender' "WinDefend service is $($svc['WinDefend'].state) (fine only if another antivirus is installed)" '' } }
+    foreach ($pr in 'DomainProfile', 'StandardProfile', 'PublicProfile') { try { $e = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\$pr" -ErrorAction Stop).EnableFirewall; if ($e -eq 0) { F 'warn' 'firewall' "firewall is OFF for the $($pr -replace 'Profile','') profile" 'netsh advfirewall set allprofiles state on' } } catch { } }
+    try { if ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction Stop).EnableLUA -eq 0) { F 'warn' 'uac' 'UAC is switched off' 'turn it back on and reboot' } } catch { }
+    # space, reboot, hosts, proxy, devices
+    foreach ($d in [IO.DriveInfo]::GetDrives()) { if ($d.DriveType -eq 'Fixed' -and $d.IsReady) { $pct = 100 * $d.AvailableFreeSpace / $d.TotalSize; if ($pct -lt 5 -or $d.AvailableFreeSpace -lt 3GB) { F 'bad' 'disk' ("$($d.Name) has only " + [F__BUILD__.Fs]::Human($d.AvailableFreeSpace) + " free (" + [int]$pct + "%)") 'free space: updates and the Store need several GB' } elseif ($pct -lt 12) { F 'warn' 'disk' ("$($d.Name) is getting full: " + [F__BUILD__.Fs]::Human($d.AvailableFreeSpace) + " free") '' } } }
+    $reb = @(); if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reb += 'component servicing' }; if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reb += 'Windows Update' }; if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations) { $reb += 'pending file operations' }
+    if ($reb.Count) { F 'warn' 'reboot' ('a reboot is pending (' + ($reb -join ', ') + '): installs and updates can fail until then') 'restart the PC' }
+    try { $hf = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'; foreach ($l in @(Get-Content $hf -ErrorAction Stop | Where-Object { $_ -match '^\s*(0\.0\.0\.0|127\.0\.0\.1|::1)\s+\S*(microsoft|windows|msftconnecttest|live\.com|xboxlive|office|bing|steam|epicgames)' })) { F 'warn' 'hosts' "hosts file blocks: $($l.Trim())" 'delete the line if you did not mean it' } } catch { }
+    try { $px = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction Stop; if ($px.ProxyEnable -eq 1) { F 'warn' 'proxy' "a system proxy is set: $($px.ProxyServer)" 'if that program (VPN / proxy client) is not running, apps stop reaching the internet: turn the proxy off' } } catch { }
+    try { $bad = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop | Select-Object -First 6); foreach ($b in $bad) { F 'warn' 'device' "device problem (code $($b.ConfigManagerErrorCode)): $($b.Name)" 'reinstall or update the driver' } } catch { }
+    foreach ($n in 'Dnscache', 'W32Time', 'Winmgmt', 'EventLog', 'Schedule', 'mpssvc', 'BFE') { $s = $svc[$n]; if ($s -and $s.state -ne 'Running' -and $s.start -eq 'Auto') { F 'warn' 'services' "core service $n ($($s.disp)) is $($s.state)" "util {op:service, name:$n, value:start}" } elseif ($s -and $s.start -eq 'Disabled') { F 'bad' 'services' "core service $n ($($s.disp)) is DISABLED" "sc config $n start= auto" } }
+    if (-not @($f | Where-Object { $_.sev -ne 'ok' }).Count) { F 'ok' 'summary' 'no common causes found' '' }
+    $f
+}
+function Process-Detail([int]$id) {   # where a process came from, who started it, what it runs, what it talks to
+    $p = [Diagnostics.Process]::GetProcessById($id); $o = [ordered]@{ pid = $id; name = $p.ProcessName }
+    $c = $null; try { $c = Get-CimInstance Win32_Process -Filter "ProcessId=$id" -ErrorAction Stop } catch { }
+    $exe = ''; if ($c -and $c.ExecutablePath) { $exe = [string]$c.ExecutablePath } else { try { $exe = [string]$p.MainModule.FileName } catch { } }
+    $o.path = [string]$exe; $o.cmd = if ($c) { [string]$c.CommandLine } else { '' }
+    $chain = @([F__BUILD__.Sys]::Chain($id) -split '\|' | Where-Object { $_ })
+    $o.parents = $chain
+    try { $o.started = $p.StartTime.ToString('yyyy-MM-dd HH:mm:ss'); $o.running_for = [int]((Get-Date) - $p.StartTime).TotalMinutes } catch { }
+    if ($c) { try { $own = Invoke-CimMethod -InputObject $c -MethodName GetOwner -ErrorAction Stop; $o.user = if ($own.User) { "$($own.Domain)\$($own.User)" } else { '' } } catch { } }
+    $o.threads = $p.Threads.Count; $o.handles = $p.HandleCount; $o.mem_ws = $p.WorkingSet64; $o.mem_private = $p.PrivateMemorySize64
+    if ($exe -and (Test-Path -LiteralPath $exe)) {
+        $fi = Get-Item -LiteralPath $exe; $o.size = $fi.Length; $o.file_created = $fi.CreationTime.ToString('yyyy-MM-dd HH:mm'); $o.file_modified = $fi.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+        try { $v = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe); $o.company = $v.CompanyName; $o.product = $v.ProductName; $o.version = $v.FileVersion; $o.description = $v.FileDescription } catch { }
+        try { $sig = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction Stop; $o.signature = [string]$sig.Status; $o.signer = if ($sig.SignerCertificate) { ($sig.SignerCertificate.Subject -replace '^.*?CN=([^,]+).*$', '$1') } else { '' } } catch { }
+        if ($fi.Length -lt 150MB) { try { $o.sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256 -ErrorAction Stop).Hash } catch { } }
+        $o.trust = Trust-Of $exe
+    }
+    try { $sv = @(Get-CimInstance Win32_Service -Filter "ProcessId=$id" -ErrorAction Stop | ForEach-Object { "$($_.Name) ($($_.DisplayName))" }); if ($sv.Count) { $o.services = $sv } } catch { }
+    try { $esc = [regex]::Escape($exe); if ($exe) { $o.autostart = @(Startup-List $false | Where-Object { $_.exe -and $_.exe -ieq $exe } | ForEach-Object { "$($_.where): $($_.name)" }) } } catch { }
+    $cn = @(); foreach ($l in (netstat -ano -p tcp 2>$null)) { if ($l -match "^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+$id\s*$") { $cn += "$($Matches[3]) $($Matches[1]) -> $($Matches[2])" } }
+    $o.connections = @($cn | Select-Object -First 25)
+    $o
+}
+function Do-SysData($a) {   # JSON for the live viewer's System tabs
+    $kind = [string]$a.kind; $cul = [Threading.Thread]::CurrentThread.CurrentCulture; [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::InvariantCulture
+    try {
+        $j = switch ($kind) {
+            'procs' { [F__BUILD__.Sys]::ProcsAll() }
+            'perf' { [F__BUILD__.Sys]::Perf() }
+            'services' { ConvertTo-Json -Compress -Depth 4 -InputObject @(Svc-List | Select-Object name, disp, state, start, pid, acct, exe, ms) }
+            'startup' { ConvertTo-Json -Compress -Depth 4 -InputObject @(Startup-List) }
+            'disks' { ConvertTo-Json -Compress -Depth 5 -InputObject (Disks-All) }
+            'policy' { ConvertTo-Json -Compress -Depth 4 -InputObject @(Policy-List) }
+            'health' { ConvertTo-Json -Compress -Depth 4 -InputObject @(Health-Check) }
+            'activation' { ConvertTo-Json -Compress -Depth 3 -InputObject (Activation-Info) }
+            'process' { ConvertTo-Json -Compress -Depth 5 -InputObject (Process-Detail ([int]$a.pid)) }
+            'adapters' { [F__BUILD__.Route]::Report($false) | ConvertTo-Json -Compress }
+            'reach' { [F__BUILD__.Route]::Report($true) | ConvertTo-Json -Compress }
+            default { throw "unknown kind '$kind' (procs, perf, services, startup, disks, policy, health, activation, process, adapters, reach)" }
+        }
+        @{ text = [string]$j }
+    } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $cul }
+}
+
+
+# ---- file operations for the live viewer (and the AI): make, copy, move, rename, delete (to the Recycle Bin), look inside a file without downloading it
+function Do-FsOp($a) {
+    $op = [string]$a.op; $p = Full ([string]$a.path)
+    switch ($op) {
+        'mkdir' { [void][IO.Directory]::CreateDirectory($p); return @{ text = "created folder $p" } }
+        'newfile' {
+            if (Test-Path -LiteralPath $p) { throw "already exists: $p" }
+            [void][IO.Directory]::CreateDirectory((Split-Path $p)); [IO.File]::WriteAllBytes($p, [byte[]]@()); return @{ text = "created file $p" }
+        }
+        { $_ -in 'copy', 'move' } {
+            $d = Full ([string]$a.dest); if (Test-Path -LiteralPath $d -PathType Container) { $d = Join-Path $d (Split-Path $p -Leaf) }
+            if ($d -ieq $p) { throw 'source and destination are the same' }
+            if ((Test-Path -LiteralPath $d) -and -not $a.overwrite) { throw "already exists: $d (overwrite:true replaces it)" }
+            if ($op -eq 'copy') { Copy-Item -LiteralPath $p -Destination $d -Recurse -Force:([bool]$a.overwrite) -ErrorAction Stop } else { Move-Item -LiteralPath $p -Destination $d -Force:([bool]$a.overwrite) -ErrorAction Stop }
+            return @{ text = "$(if ($op -eq 'copy') { 'copied' } else { 'moved' }) to $d" }
+        }
+        'rename' {
+            $n = [string]$a.name; if (-not $n -or $n -match '[\\/:*?"<>|]') { throw 'bad name' }
+            Rename-Item -LiteralPath $p -NewName $n -ErrorAction Stop; return @{ text = "renamed to $n" }
+        }
+        'delete' {   # the Recycle Bin unless permanent:true
+            if (-not (Test-Path -LiteralPath $p)) { throw "not found: $p" }
+            if ($a.permanent) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop; return @{ text = "deleted for good: $p" } }
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            if (Test-Path -LiteralPath $p -PathType Container) { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p, 'OnlyErrorDialogs', 'SendToRecycleBin') } else { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p, 'OnlyErrorDialogs', 'SendToRecycleBin') }
+            return @{ text = "moved to the Recycle Bin: $p" }
+        }
+        'stat' {
+            $i = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+            return @{ text = (ConvertTo-Json -Compress @{ path = $i.FullName; dir = [bool]$i.PSIsContainer; size = $(if ($i.PSIsContainer) { 0 } else { $i.Length }); created = $i.CreationTime.ToString('yyyy-MM-dd HH:mm:ss'); modified = $i.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'); attrs = [string]$i.Attributes }) }
+        }
+        'preview' {
+            $i = Get-Item -LiteralPath $p -Force -ErrorAction Stop; if ($i.PSIsContainer) { throw 'that is a folder' }
+            if ($p -match '\.(png|jpe?g|gif|bmp|webp|tiff?)$') { return Do-ReadFile @{ path = $p; max_width = 1100; quality = 72 } }
+            $max = Int-Or $a.max 65536; $o = [ordered]@{ size = $i.Length; modified = $i.LastWriteTime.ToString('yyyy-MM-dd HH:mm'); truncated = ($i.Length -gt $max) }
+            if ($p -match '\.(zip|jar|apk|docx|xlsx|pptx)$') {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem; $z = [IO.Compression.ZipFile]::OpenRead($p)
+                try { $o.kind = 'archive'; $o.entries = @($z.Entries | Select-Object -First 300 | ForEach-Object { @($_.FullName, $_.Length) }); $o.count = $z.Entries.Count } finally { $z.Dispose() }
+                return @{ text = (ConvertTo-Json -Compress -Depth 4 $o) }
+            }
+            $fs = [IO.File]::Open($p, 'Open', 'Read', 'ReadWrite')
+            try { $buf = New-Object byte[] ([Math]::Min($max, $fs.Length)); [void]$fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+            $bom16 = $buf.Length -ge 2 -and (($buf[0] -eq 0xFF -and $buf[1] -eq 0xFE) -or ($buf[0] -eq 0xFE -and $buf[1] -eq 0xFF))
+            $nul = $false; if (-not $bom16) { for ($k = 0; $k -lt [Math]::Min(4096, $buf.Length); $k++) { if ($buf[$k] -eq 0) { $nul = $true; break } } }
+            if ($nul) {
+                $o.kind = 'binary'; $sb = New-Object Text.StringBuilder
+                for ($r = 0; $r -lt [Math]::Min(512, $buf.Length); $r += 16) { $n = [Math]::Min(16, $buf.Length - $r); $hex = (0..($n - 1) | ForEach-Object { '{0:x2}' -f $buf[$r + $_] }) -join ' '; $asc = -join (0..($n - 1) | ForEach-Object { $c = $buf[$r + $_]; if ($c -ge 32 -and $c -lt 127) { [char]$c } else { '.' } }); [void]$sb.AppendFormat("{0:x8}  {1,-47}  {2}`n", $r, $hex, $asc) }
+                $o.text = $sb.ToString()
+            } else {
+                $o.kind = 'text'; $enc = if ($bom16) { [Text.Encoding]::Unicode } else { New-Object Text.UTF8Encoding $false }; $t = $enc.GetString($buf); $o.text = $t.TrimStart([char]0xFEFF)
+            }
+            return @{ text = (ConvertTo-Json -Compress -Depth 4 $o) }
+        }
+        default { throw "unknown op '$op' (mkdir, newfile, copy, move, rename, delete, stat, preview)" }
+    }
 }
 
 # ---- ready-made operations: right on the first try, no quoting
@@ -1973,12 +2360,12 @@ $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::Min
 # ---- the friend's console: a pinned header with the session code (copied to the clipboard), Esc ends the session at any moment, a soft chime and a flashing window
 # when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
 # and after the answer the window focus and the pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
-$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; util = 'commands'
+$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; fsop = 'files'; util = 'commands'
     write_file = 'files'; edit_file = 'files'; push_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
 $Quiet = @{ watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP')
-    tree = @('смотрю папки', 'looking through folders'); find = @('ищу файлы', 'searching files'); system = @('смотрю состояние системы', 'reading the system state') }
+    tree = @('смотрю папки', 'looking through folders'); find = @('ищу файлы', 'searching files'); system = @('смотрю состояние системы', 'reading the system state'); sysdata = @('читаю состояние системы', 'reading the system state'); fsop = @('работаю с файлами', 'working with files') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
 function Cut($t, $n) { $t = ([string]$t) -replace "[\r\n]+", ' '; if ($t.Length -gt $n) { $t.Substring(0, $n) + '…' } else { $t } }
 function Step-Text($st) {
@@ -2005,7 +2392,7 @@ function Steps-Of($name, $a) {   # the steps of a tool call; a move right before
 }
 function Describe-Action($name, $a) {   # -> array of short sentences
     if ($AskGroup[$name] -eq 'input') { return @(Steps-Of $name $a | ForEach-Object { Step-Text $_ }) }
-    $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'edit_file' { T 'изменить файл: ' 'edit file: ' } 'push_file' { T 'получить файл: ' 'receive file: ' } 'util' { (T 'утилита: ' 'utility: ') + $a.op + ' ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
+    $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'edit_file' { T 'изменить файл: ' 'edit file: ' } 'push_file' { T 'получить файл: ' 'receive file: ' } 'fsop' { (T 'файлы: ' 'files: ') + $a.op + ' ' } 'util' { (T 'утилита: ' 'utility: ') + $a.op + ' ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
     $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } elseif ($a.url) { $a.url } elseif ($name -eq 'util') { '' } else { ($a | ConvertTo-Json -Compress) }
     @($pre + (Cut $tail 90))
 }
@@ -2262,11 +2649,11 @@ function Process-Command($cmd) {
     try {
         Check-Esc
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
-        if ($script:Mode -eq 'ask' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op)) { Ask-Permission $name $a }
+        if ($script:Mode -eq 'ask' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name

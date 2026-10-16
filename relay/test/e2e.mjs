@@ -360,8 +360,9 @@ console.log('look controls ok');
 
 // stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)
 const pidFile = path.join(tmp, 'grandchild.pid');
-await tool('mcp_start', { session: code, name: 'tree', command: 'node', args: [echoJs], env: { GRANDCHILD_PIDFILE: pidFile } });
-for (let i = 0; i < 40 && !fs.existsSync(pidFile); i++) await new Promise((x) => setTimeout(x, 250));   // a slow runner needs a moment to start the grandchild
+const mcpStart = await tool('mcp_start', { session: code, name: 'tree', command: 'node', args: [echoJs], env: { GRANDCHILD_PIDFILE: pidFile } });
+for (let i = 0; i < 80 && !fs.existsSync(pidFile); i++) await new Promise((x) => setTimeout(x, 250));
+assert.ok(fs.existsSync(pidFile), 'the MCP server started: ' + txt(mcpStart).slice(0, 300));   // a slow runner needs a moment to start the grandchild
 const gpid = Number(fs.readFileSync(pidFile, 'utf8'));
 assert.ok(gpid > 0); process.kill(gpid, 0);                                // alive while the server runs
 await tool('mcp_stop', { session: code, name: 'tree' });

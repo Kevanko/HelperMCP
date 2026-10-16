@@ -307,7 +307,7 @@ def _ui_node(At, acc, depth):
         if typ == "edit" and role != "password text":
             ti = acc.get_text_iface()
             if ti:
-                n = ti.get_character_count(); val = ti.get_text(0, min(n, 200)) if n else ""
+                n = At.Text.get_character_count(ti); val = At.Text.get_text(ti, 0, min(n, 200)) if n else ""
         has = lambda s: _ui_has(At, ss, s)
         flags = []
         enabled = has("ENABLED") or has("SENSITIVE")
@@ -462,9 +462,9 @@ def ui_set(a):
     overlay_send("active"); glide(sx, sy)
     ei = acc.get_editable_text_iface()
     if ei:
-        if not ei.set_text_contents(v): raise RuntimeError("the control refused the text (read-only?)")
+        if not At.EditableText.set_text_contents(ei, v): raise RuntimeError("the control refused the text (read-only?)")
         if n["role"] == "password text": return {"text": f"{d}: set (password, not shown)"}
-        ti = acc.get_text_iface(); now = ti.get_text(0, min(ti.get_character_count(), 200)) if ti else v
+        ti = acc.get_text_iface(); now = At.Text.get_text(ti, 0, min(At.Text.get_character_count(ti), 200)) if ti else v
         return {"text": f"{d}: " + ("set" if now == v else f'set, but it now holds "{cut(now, 80)}" (the control may reformat the value, or ignore it: check with ui_tree)')}
     comp = acc.get_component_iface()
     if comp: comp.grab_focus()

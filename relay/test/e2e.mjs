@@ -242,6 +242,16 @@ assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);
 assert.equal((await fetch(vurl + '/input', { method: 'POST', body: '{"a":"key","keys":"x"}' })).status, 403, 'the view-only link cannot control');
 if (process.env.GUI) { const fr = await fetch(vurl + '/frame'); assert.equal(fr.headers.get('content-type'), 'image/jpeg'); assert.ok((await fr.arrayBuffer()).byteLength > 1000); }
 console.log('viewer ok');
+// files from the live view (control link only): browse, download, drop a file onto the PC; the AI hears about the upload
+const ctl = { 'x-ctl': /#c=([0-9a-f]+)/.exec(vtxt)[1] };
+assert.equal((await fetch(vurl + '/ls?path=' + encodeURIComponent(tmp))).status, 403, 'view-only link cannot browse files');
+const lsj = await (await fetch(vurl + '/ls?path=' + encodeURIComponent(tmp), { headers: ctl })).json();
+assert.match(lsj.text, /tree\/\s+\(\d+\)/); assert.match(lsj.text, /blob\.bin/);
+const gj = await (await fetch(vurl + '/get', { method: 'POST', headers: { ...ctl, 'content-type': 'application/json' }, body: JSON.stringify({ path: blobPath }) })).json();
+assert.ok(Buffer.from(await (await fetch(gj.text.split(' ')[0])).arrayBuffer()).equals(blob), 'download from the viewer');
+const uj = await (await fetch(vurl + '/upload?name=' + encodeURIComponent('от оператора.txt') + '&dir=' + encodeURIComponent(tmp), { method: 'POST', headers: ctl, body: 'hello from the viewer' })).json();
+assert.ok(uj.path && fs.readFileSync(uj.path, 'utf8') === 'hello from the viewer', 'upload lands on the PC: ' + JSON.stringify(uj));
+assert.match((await tool('sysinfo', { session: code })).content.map((c) => c.text).join(' '), /The operator put these files on the remote PC/); console.log('viewer files ok');
 
 // stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)
 const pidFile = path.join(tmp, 'grandchild.pid');
@@ -291,6 +301,21 @@ if (process.env.GUI) {
   console.log(`viewer adapts to a slow link ok (levels ${vlevels}, bytes ${vsizes})`);
   const shot = await tool('screenshot', { session: code });
   assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 200)); console.log('screenshot ok');
+  // live stream (like a video call): a full picture first, then only the tiles that changed while the pointer moves
+  const ac = new AbortController(), lr = await fetch(vurl + '/live', { signal: ac.signal });
+  assert.equal(lr.status, 200);
+  const rd = lr.body.getReader(), seen = [], t0 = Date.now(); let lbuf = Buffer.alloc(0);
+  const mover = (async () => { await new Promise((x) => setTimeout(x, 1500)); for (let i = 0; i < 8; i++) await tool('move', { session: code, x: 300 + i * 70, y: 320 + (i % 2) * 60 }); })();
+  while (Date.now() - t0 < 9000) {
+    const { value, done } = await rd.read(); if (done) break;
+    lbuf = Buffer.concat([lbuf, Buffer.from(value)]);
+    while (lbuf.length >= 5) { const n = lbuf.readUInt32BE(0); if (lbuf.length < 5 + n) break; seen.push({ ty: String.fromCharCode(lbuf[4]), n, t: Date.now() - t0 }); lbuf = lbuf.subarray(5 + n); }
+  }
+  ac.abort(); await mover;
+  const firstK = seen.find((f) => f.ty === 'K')?.t, tiles = seen.filter((f) => f.ty === 'T');
+  assert.ok(firstK !== undefined && firstK < 3000, 'a full picture arrives within 3 s: ' + JSON.stringify(seen.slice(0, 5)));
+  assert.ok(tiles.length >= 3, 'changed tiles stream while the pointer moves: ' + JSON.stringify(seen.slice(0, 20)));
+  console.log(`live stream ok (first picture after ${firstK} ms, ${seen.filter((f) => f.ty === 'K').length} full + ${tiles.length} tile frames, ${Math.round(seen.reduce((a, f) => a + f.n, 0) / 1024)} KB in 9 s)`);
 }
 
 await tool('end_session', { session: code });

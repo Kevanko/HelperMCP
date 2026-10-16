@@ -175,8 +175,9 @@ function Probe-Report($before, $after, $what, $moved) {   # -> a short line for 
 }
 
 # Files without the PowerShell pipeline (it is slow on big folders): tree, find, line ranges, exact edits; and argument quoting by the Windows rules.
-Add-Type -TypeDefinition @"
+Add-Type -ReferencedAssemblies System.Drawing, System.Windows.Forms -TypeDefinition @"
 using System; using System.IO; using System.Text; using System.Text.RegularExpressions; using System.Collections.Generic; using System.Diagnostics; using System.Runtime.InteropServices;
+using System.Drawing; using System.Drawing.Imaging; using System.Net; using System.Threading;
 namespace F__BUILD__ {
   public static class Fs {
     static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "__pycache__", "`$Recycle.Bin", "System Volume Information" };
@@ -284,6 +285,114 @@ namespace F__BUILD__ {
         if (a[i] == '"') sb.Append('\\', bs * 2 + 1).Append('"'); else sb.Append('\\', bs).Append(a[i]);
       }
       return sb.Append('"').ToString();
+    }
+  }
+
+  // The live picture for the viewer, like a video call: its own thread films the screen ~15 times a second, compares it with the last frame in
+  // 64x64 tiles and sends only the tiles that changed (a full picture when much changed, on request and every 10 s) over one long upload.
+  // ponytail: JPEG tiles, not H.264; a portable ffmpeg (gdigrab + libx264 -tune zerolatency) could feed V frames the same way if more is needed
+  public static class Live {
+    public static string Relay, Token; public static volatile string Err = "";
+    static volatile bool run, key; static volatile int mon = -1; static Thread th;
+    public static void Start(int m) { if (m != mon) key = true; mon = m; run = true; if (th == null || !th.IsAlive) { th = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }; th.Start(); } }
+    public static void Stop() { run = false; }
+    public static void Key() { key = true; }
+    public static bool Running { get { return th != null && th.IsAlive && run; } }
+
+    static void Loop() { while (run) { try { Session(); } catch (Exception e) { Err = e.Message; } if (run) Thread.Sleep(1000); } }
+
+    static ImageCodecInfo Jpg = Array.Find(ImageCodecInfo.GetImageEncoders(), c => c.MimeType == "image/jpeg");
+    static byte[] Jpeg(Bitmap b, long q) { using (var ms = new MemoryStream()) { var ep = new EncoderParameters(1); ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, q); b.Save(ms, Jpg, ep); return ms.ToArray(); } }
+    static void Put16(MemoryStream m, int v) { m.WriteByte((byte)(v >> 8)); m.WriteByte((byte)v); }
+    static void Put32(MemoryStream m, int v) { m.WriteByte((byte)(v >> 24)); m.WriteByte((byte)(v >> 16)); m.WriteByte((byte)(v >> 8)); m.WriteByte((byte)v); }
+    static void Send(Stream st, char type, byte[] p) { var h = new byte[] { (byte)(p.Length >> 24), (byte)(p.Length >> 16), (byte)(p.Length >> 8), (byte)p.Length, (byte)type }; st.Write(h, 0, 5); st.Write(p, 0, p.Length); st.Flush(); }
+
+    [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public int x, y; }
+    [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHot, yHot; public IntPtr hbmMask, hbmColor; }
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO ci);
+    [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr h, out ICONINFO ii);
+    [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+    static void DrawCursor(Graphics g, Rectangle area) {   // the real pointer is not in a screen copy: draw it, so the viewer sees what the friend points at
+      var ci = new CURSORINFO { cbSize = Marshal.SizeOf(typeof(CURSORINFO)) };
+      if (!GetCursorInfo(ref ci) || (ci.flags & 1) == 0 || ci.hCursor == IntPtr.Zero) return;
+      ICONINFO ii; int hx = 0, hy = 0; if (GetIconInfo(ci.hCursor, out ii)) { hx = ii.xHot; hy = ii.yHot; if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask); if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor); }
+      var dc = g.GetHdc(); try { DrawIconEx(dc, ci.x - area.Left - hx, ci.y - area.Top - hy, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3); } finally { g.ReleaseHdc(dc); }
+    }
+
+    static bool TileDiff(int[] a, int[] b, int w, int h, int x0, int y0) {
+      int x1 = Math.Min(w, x0 + 64), y1 = Math.Min(h, y0 + 64);
+      for (int y = y0; y < y1; y++) { int i = y * w + x0, e = y * w + x1; for (; i < e; i++) if (a[i] != b[i]) return true; }
+      return false;
+    }
+
+    static void Session() {
+      var rq = (HttpWebRequest)WebRequest.Create(Relay + "/a/stream");
+      rq.Method = "POST"; rq.SendChunked = true; rq.AllowWriteStreamBuffering = false; rq.Timeout = 15000; rq.ReadWriteTimeout = 20000; rq.KeepAlive = false;
+      rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ServicePoint.Expect100Continue = false;
+      using (var st = rq.GetRequestStream()) {
+        int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty;
+        while (run) {
+          var t0 = DateTime.UtcNow;
+          if (mon != curMon) {
+            curMon = mon; var scr = System.Windows.Forms.Screen.AllScreens;
+            area = curMon >= 0 && curMon < scr.Length ? scr[curMon].Bounds : System.Windows.Forms.SystemInformation.VirtualScreen;
+            sc = Math.Max(1.0, Math.Max(area.Width / 1920.0, area.Height / 1200.0)); fw = (int)(area.Width / sc); fh = (int)(area.Height / sc); pa = null;
+          }
+          Bitmap frame;
+          try {
+            var full = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
+            using (var g = Graphics.FromImage(full)) { g.CopyFromScreen(area.Left, area.Top, 0, 0, area.Size, CopyPixelOperation.SourceCopy); DrawCursor(g, area); }
+            if (sc > 1.0) { frame = new Bitmap(fw, fh, PixelFormat.Format32bppRgb); using (var g = Graphics.FromImage(frame)) { g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear; g.DrawImage(full, 0, 0, fw, fh); } full.Dispose(); }
+            else frame = full;
+          } catch (Exception e) { Err = "capture: " + e.Message; Thread.Sleep(500); continue; }   // locked screen, UAC prompt: wait for the desktop to come back
+          using (frame) {
+            if (ca == null || ca.Length != fw * fh) ca = new int[fw * fh];
+            var bd = frame.LockBits(new Rectangle(0, 0, fw, fh), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+            try { Marshal.Copy(bd.Scan0, ca, 0, fw * fh); } finally { frame.UnlockBits(bd); }
+            bool full_ = key || pa == null || pa.Length != ca.Length || (DateTime.UtcNow - lastKey).TotalSeconds > 10;
+            byte[] tiles = null;
+            if (!full_) {
+              int tw = (fw + 63) / 64, tht = (fh + 63) / 64, nd = 0; var dirty = new bool[tw * tht];
+              for (int ty = 0; ty < tht; ty++) for (int tx = 0; tx < tw; tx++) if (TileDiff(pa, ca, fw, fh, tx * 64, ty * 64)) { dirty[ty * tw + tx] = true; nd++; }
+              if (nd * 2 > tw * tht) full_ = true;
+              else if (nd > 0) {
+                var rects = new List<Rectangle>(); var open = new Dictionary<int, int>();   // (first tile, last tile) of a run -> its rectangle, to grow it down
+                for (int ty = 0; ty < tht; ty++) {
+                  var next = new Dictionary<int, int>();
+                  for (int tx = 0; tx < tw; tx++) {
+                    if (!dirty[ty * tw + tx]) continue;
+                    int x0 = tx; while (tx + 1 < tw && dirty[ty * tw + tx + 1]) tx++;   // a run of changed tiles in this row is one picture...
+                    int k = x0 * 4096 + tx, ri;
+                    if (open.TryGetValue(k, out ri)) { var r0 = rects[ri]; r0.Height += 64; rects[ri] = r0; }   // ...and grows down while the row below changed the same way
+                    else { ri = rects.Count; rects.Add(new Rectangle(x0 * 64, ty * 64, (tx - x0 + 1) * 64, 64)); }
+                    next[k] = ri;
+                  }
+                  open = next;
+                }
+                for (int i = 0; i < rects.Count; i++) { var r = rects[i]; r.Intersect(new Rectangle(0, 0, fw, fh)); rects[i] = r; }
+                using (var m = new MemoryStream()) {
+                  Put16(m, rects.Count);
+                  foreach (var r in rects) using (var part = frame.Clone(r, PixelFormat.Format32bppRgb)) { var j = Jpeg(part, q); Put16(m, r.X); Put16(m, r.Y); Put32(m, j.Length); m.Write(j, 0, j.Length); }
+                  tiles = m.ToArray();
+                }
+              }
+            }
+            var tw0 = DateTime.UtcNow; int sent = 0;
+            if (full_) {
+              var meta = Encoding.UTF8.GetBytes(string.Format(System.Globalization.CultureInfo.InvariantCulture, "{{\"w\":{0},\"h\":{1},\"ox\":{2},\"oy\":{3},\"sc\":{4}}}", fw, fh, area.Left, area.Top, sc));
+              var j = Jpeg(frame, q);
+              using (var m = new MemoryStream()) { Put16(m, meta.Length); m.Write(meta, 0, meta.Length); m.Write(j, 0, j.Length); var b = m.ToArray(); Send(st, 'K', b); sent = b.Length; }
+              key = false; lastKey = DateTime.UtcNow;
+            } else if (tiles != null) { Send(st, 'T', tiles); sent = tiles.Length; }
+            var wms = (DateTime.UtcNow - tw0).TotalMilliseconds;   // a slow link shows up as a slow write: lower the quality, raise it again when it is fast
+            if (sent > 0) { if (wms > 250 && q > 30) q -= 10; else if (wms < 60 && q < 60) q += 5; }
+            var tmp = pa; pa = ca; ca = tmp;
+          }
+          var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(5, 66 - spent));
+        }
+      }
+      try { rq.GetResponse().Close(); } catch { }
     }
   }
 }
@@ -707,6 +816,15 @@ function Zip-Dir($src, $dest) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
     [IO.Compression.ZipFile]::CreateFromDirectory($src, $dest, [IO.Compression.CompressionLevel]::Optimal, $true)
+}
+
+# ---- the live picture for the viewer (F__BUILD__.Live runs on its own thread; the relay turns it on while someone watches)
+function Do-Stream($a) {
+    [F__BUILD__.Live]::Relay = $RELAY; [F__BUILD__.Live]::Token = $script:Token
+    if ($a.on -eq $false) { [F__BUILD__.Live]::Stop(); return @{ text = 'stopped' } }
+    [F__BUILD__.Live]::Start($(if ($null -ne $a.mon) { [int]$a.mon } else { -1 }))
+    if ($a.key) { [F__BUILD__.Live]::Key() }
+    @{ text = 'streaming' + $(if ([F__BUILD__.Live]::Err) { ' (last error: ' + [F__BUILD__.Live]::Err + ')' } else { '' }) }
 }
 
 # ---- the state of the machine in one call
@@ -1429,12 +1547,13 @@ function Cleanup-Children {
     foreach ($c in $Children.Values) { Stop-Tree $c.p }
     if ($script:OverlayProc) { try { $script:OverlayIn.Close(); if (-not $script:OverlayProc.WaitForExit(3000)) { $script:OverlayProc.Kill() } } catch { try { $script:OverlayProc.Kill() } catch { } } }
     try { [void][H.U__BUILD__]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
+    try { [F__BUILD__.Live]::Stop() } catch { }   # iex runs in the user's window: the filming thread must not outlive the session
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
 
 # Light requests (screenshots, sysinfo, file reads) are answered even while a long command runs: the live viewer and the AI's
 # screenshots never freeze behind a 5-minute install or render. Heavy ones wait their turn.
-$LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools', 'tree'
+$LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools', 'tree', 'stream'
 $script:Deferred = New-Object System.Collections.ArrayList
 $script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
 
@@ -1703,7 +1822,7 @@ function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
-    $meta = $name -in 'look', 'hold', 'task_done'
+    $meta = $name -in 'look', 'hold', 'task_done', 'stream'
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
@@ -1716,12 +1835,12 @@ function Process-Command($cmd) {
     $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame; if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
-        if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name)) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
+        if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
         if ($script:Mode -eq 'ask' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op)) { Ask-Permission $name $a }
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; util = 'Do-Util'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name

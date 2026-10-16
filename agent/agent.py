@@ -1073,6 +1073,100 @@ def util(a):
     raise RuntimeError("unknown op " + op)
 
 
+# ---- the live picture for the viewer (like a video call): one long upload of frames, on while someone watches -------------------
+# With ffmpeg: H.264 (x11grab + libx264, zero latency). Without it: full JPEG pictures from the screenshot tool, a few per second.
+LIVE = {"run": False, "mon": -1, "thread": None, "err": "", "proc": None}
+
+
+def _frame(t, payload): return len(payload).to_bytes(4, "big") + t.encode() + payload
+
+
+def _meta(d): b = json.dumps(d).encode(); return len(b).to_bytes(2, "big") + b
+
+
+def _area(mon):
+    mons = monitors()
+    if 0 <= mon < len(mons): return mons[mon]
+    if mons:
+        x0, y0 = min(m[0] for m in mons), min(m[1] for m in mons)
+        return x0, y0, max(m[0] + m[2] for m in mons) - x0, max(m[1] + m[3] for m in mons) - y0
+    return None
+
+
+def _h264_frames(mon):
+    x, y, w, h = _area(mon) or (0, 0, 0, 0)
+    sc = max(1.0, w / 1920.0, h / 1200.0) if w else 1.0
+    ow, oh = (int(w / sc) // 2 * 2, int(h / sc) // 2 * 2) if w else (0, 0)
+    cmd = ["ffmpeg", "-loglevel", "error", "-f", "x11grab", "-draw_mouse", "1", "-framerate", "15"] + (["-video_size", f"{w}x{h}"] if w else []) + \
+          ["-i", f"{os.environ.get('DISPLAY', ':0')}+{x},{y}"] + (["-vf", f"scale={ow}:{oh}"] if w else []) + \
+          ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "baseline",
+           "-x264-params", "keyint=30:aud=1:repeat-headers=1", "-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "1500k", "-f", "h264", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=with_path()); LIVE["proc"] = p
+    try: yield from annexb(p.stdout, {"w": ow, "h": oh, "ox": x, "oy": y, "sc": sc}, lambda: LIVE["run"])
+    finally: p.kill(); LIVE["proc"] = None
+
+
+def annexb(src, meta, alive):
+    """H.264 annex-B bytes -> C frames (decoder settings, from each new SPS) and V frames (one access unit each, split at the AUD)"""
+    buf, au, sent_sps = b"", [], None
+    while alive():
+        chunk = src.read1(65536) if hasattr(src, "read1") else src.read(4096)
+        if not chunk: break
+        buf += chunk
+        starts = [m.start() for m in re.finditer(b"\x00\x00\x01", buf)]
+        for a_, b_ in zip(starts, starts[1:]):   # every complete NAL unit (the last one may still be growing)
+            nal = buf[a_ + 3:b_].rstrip(b"\x00"); kind = nal[0] & 31 if nal else 0
+            if kind == 9 and au:   # an access unit delimiter starts the next picture
+                key = any((n[0] & 31) == 5 for n in au)
+                yield _frame("V", bytes([1 if key else 0]) + b"".join(b"\x00\x00\x00\x01" + n for n in au)); au = []
+            if kind == 7 and nal[1:4] != sent_sps:   # sequence parameters: tell the viewer how to decode
+                sent_sps = nal[1:4]
+                yield _frame("C", _meta(dict(meta, codec="avc1.%02x%02x%02x" % tuple(nal[1:4]))))
+            if nal: au.append(nal)
+        if len(starts) > 1: buf = buf[starts[-1]:]
+
+
+def _jpeg_frames(mon):
+    last = None
+    while LIVE["run"]:
+        t0 = time.time()
+        try: d = screenshot({"view": True, "monitor": mon if mon >= 0 else None, "max_width": 1600, "quality": 60, "prev": last})
+        except Exception as e: LIVE["err"] = str(e); time.sleep(1); continue
+        if not d.get("same"):
+            last = d["h"]
+            yield _frame("K", _meta({"w": 0, "h": 0, "ox": d.get("ox", 0), "oy": d.get("oy", 0), "sc": d.get("sc", 1)}) + d["jpeg"])
+        time.sleep(max(0.05, 0.3 - (time.time() - t0)))
+
+
+def _live_loop():
+    while LIVE["run"]:
+        mon = LIVE["mon"]
+        gen = _h264_frames(mon) if GUI["type"] == "x11" and shutil.which("ffmpeg") else _jpeg_frames(mon)
+        def body():
+            for fr in gen:
+                if not LIVE["run"] or LIVE["mon"] != mon: return
+                yield fr
+        try:
+            req = urllib.request.Request(RELAY + "/a/stream", data=body(), method="POST", headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/octet-stream"})
+            urllib.request.urlopen(req, timeout=30).read()
+        except Exception as e: LIVE["err"] = str(e)
+        finally: gen.close()
+        if LIVE["run"] and LIVE["mon"] == mon: time.sleep(1)
+
+
+def stream(a):
+    if a.get("on") is False:
+        LIVE["run"] = False; p = LIVE["proc"]
+        if p: p.kill()
+        return {"text": "stopped"}
+    mon = int(a["mon"]) if a.get("mon") is not None else -1
+    if mon != LIVE["mon"] and LIVE["proc"]: LIVE["proc"].kill()   # another screen: start over
+    LIVE["mon"] = mon; LIVE["run"] = True
+    if not (LIVE["thread"] and LIVE["thread"].is_alive()):
+        LIVE["thread"] = threading.Thread(target=_live_loop, daemon=True); LIVE["thread"].start()
+    return {"text": "streaming" + (f" (last error: {LIVE['err']})" if LIVE["err"] else "")}
+
+
 def sysinfo(_):
     return {"text": json.dumps({
         "os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(),
@@ -1776,8 +1870,8 @@ def hold(a):
 def task_done(a):
     PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
 TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window,
-             tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util)
-META = {"look", "hold", "task_done"}
+             tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util, stream=stream)
+META = {"look", "hold", "task_done", "stream"}
 
 
 GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
@@ -1799,7 +1893,7 @@ def handle(cmd, mode, token):
     if not quiet_: overlay_send("busy")
     res = {"id": cmd["id"]}
     try:
-        if PAUSED.is_set() and name not in QUIET: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
+        if PAUSED.is_set() and name not in QUIET and name not in META: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
         if mode == "ask" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL):
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:

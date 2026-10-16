@@ -94,6 +94,41 @@ async function aiShot(code, a) {
   if (d && d.h) { s.shotHash = d.h; s.shotKey = key; }
   return d;
 }
+// ---- live stream (like a video call): the agent pushes frames over one long upload, the relay fans them out to the open viewers.
+// A frame is [u32 length][u8 type][payload]: K = full JPEG ([u16 n][meta JSON][jpeg]), T = changed tiles ([u16 count] then [u16 x][u16 y][u32 n][jpeg]),
+// C = H.264 config ([u16 n][meta JSON {codec, w, h, ox, oy, sc}]), V = H.264 access unit ([u8 key][annex-B bytes]), P = ping.
+const LIVE_BACKLOG = 1_500_000;   // bytes waiting for a slow viewer before it skips frames until the next full picture
+function streamCtl(code, s, a) {
+  if (s.noStream) return;
+  call(code, 'stream', a, 10_000, { human: true }).catch((e) => { if (/Unknown tool|unknown tool/.test(e.message)) s.noStream = true; });   // an old agent: viewers fall back to pictures
+}
+function wantKey(code, s) { if (Date.now() - (s.keyAt || 0) > 1000) { s.keyAt = Date.now(); streamCtl(code, s, { on: true, mon: s.liveMon ?? -1, key: true }); } }
+function liveFrame(code, s, fr) {
+  const type = String.fromCharCode(fr[4]);
+  const key = type === 'K' || (type === 'V' && (fr[5] & 1));
+  if (type === 'C') s.lastC = fr;   // a new viewer needs the decoder settings before the next key frame
+  for (const lv of s.live || []) {
+    if (lv.res.writableLength > LIVE_BACKLOG) { lv.waitKey = true; wantKey(code, s); continue; }   // the viewer's link is slower than the picture
+    if (lv.waitKey && !key && type !== 'C' && type !== 'P') continue;
+    if (key) lv.waitKey = false;
+    lv.res.write(fr);
+  }
+}
+function liveEnd(s) { for (const lv of s.live || []) { try { lv.res.end(); } catch { /* gone */ } } s.live?.clear(); try { s.ingest?.destroy(); } catch { /* gone */ } }
+
+// a file in transit, encrypted at rest with its own key, deleted with the session (or after 24 h)
+async function storeFile(req, rawName, code) {
+  const name = String(rawName || 'file').replace(/[^\w.\-]+/g, '_').slice(0, 100) || 'file';
+  const id = crypto.randomBytes(12).toString('hex'), fp = path.join(FILES_DIR, id);
+  let n = 0;
+  const cap = new Transform({ transform(chunk, _e, cb) { n += chunk.length; n > MAX_FILE ? cb(new Error('file too large')) : cb(null, chunk); } });
+  const key = crypto.randomBytes(32), iv = crypto.randomBytes(12), enc = crypto.createCipheriv('aes-256-gcm', key, iv);
+  try { await pipeline(req, cap, enc, fs.createWriteStream(fp, { mode: 0o600 })); }
+  catch (e) { fs.rmSync(fp, { force: true }); throw e; }
+  files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS, code, key, iv, tag: enc.getAuthTag() });
+  return { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n, name };
+}
+
 function makeViewer(c) {
   const token = crypto.randomBytes(18).toString('hex'), ctl = crypto.randomBytes(12).toString('hex');
   viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
@@ -131,7 +166,7 @@ const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
-  if (s.paused && tool !== 'bye' && !(opts.human && tool === 'screenshot')) {   // the live viewer keeps showing the screen while it is paused
+  if (s.paused && tool !== 'bye' && !(opts.human && (tool === 'screenshot' || tool === 'stream'))) {   // the live viewer keeps showing the screen while it is paused
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
   if (takenOver(s) && !opts.human && tool !== 'bye') {
@@ -145,7 +180,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   if (s.mode === 'ask') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
-  if (!args.view) { // live-viewer frames are not "actions"
+  if (!args.view && tool !== 'stream') { // live-viewer frames are not "actions"
     const a = JSON.stringify(args, (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v));
     argStr = a === '{}' ? '' : a.slice(0, 160);
     s.log.push({ t: Date.now(), tool, args: argStr });
@@ -177,7 +212,7 @@ function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
   ended.set(code, Date.now());
-  sessions.delete(code); s.log.length = 0; s.queue.length = 0;
+  sessions.delete(code); s.log.length = 0; s.queue.length = 0; liveEnd(s);
   for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }   // files fetched in this session die with it
   for (const [t, v] of viewers) if (v.code === code) { v.last = null; viewers.delete(t); }                          // so do viewer links and their last frame
   save();
@@ -533,6 +568,7 @@ function buildMcp(fixed) {
       const hint = hintFor(sx, String(session).toUpperCase(), name, a, first, false);
       if (hint) out.content.push({ type: 'text', text: hint });
       if (name === 'sysinfo' && sx && !sx.pitfallsShown) { sx.pitfallsShown = true; const pf = pitfalls(sx); if (pf) out.content.push({ type: 'text', text: pf }); }
+      if (sx?.uploads?.length) { out.content.push({ type: 'text', text: 'The operator put these files on the remote PC from the live view: ' + sx.uploads.splice(0).join('; ') }); }
       if (sx && !sx.viewerShown && name !== 'open_viewer' && name !== 'end_session') {   // the first answer carries the live view: the operator gets it right away
         sx.viewerShown = true; const l = makeViewer(String(session).toUpperCase());
         out.content.push({ type: 'text', text: `LIVE VIEW of this session for the operator: open it in their browser now if you can run commands on their machine (Windows: start "" "${l.control}"; macOS: open; Linux: xdg-open), otherwise give them this link at once: ${l.control}` });
@@ -646,6 +682,11 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 #plan li.done{color:var(--mut);text-decoration:line-through;text-decoration-color:rgba(127,174,143,.5)}#plan li.done:before{content:"\\2713"}
 #plan li.cur{color:var(--fg)}#plan li.cur:before{background:var(--c,var(--g));color:#00150a;box-shadow:0 0 12px var(--c,var(--g))}
 #plan:empty{display:none}
+#files{border-top:1px solid var(--line);padding:0 .9rem .6rem}#files[hidden]{display:none}
+#fbar{display:flex;gap:.35rem;margin-bottom:.35rem}#fbar input{flex:1;min-width:0;padding:.2rem .45rem;font-size:12px}#fbar button{padding:.2rem .55rem}
+#fl{max-height:34vh;overflow:auto;font-size:12px}#fl div{display:flex;gap:.6rem;padding:2px .3rem;border-radius:3px;cursor:pointer;white-space:nowrap}#fl div:hover{background:rgba(56,255,122,.08)}
+#fl b{font-weight:500;color:var(--g);overflow:hidden;text-overflow:ellipsis;flex:1}#fl span{flex:1;overflow:hidden;text-overflow:ellipsis}#fl i{font-style:normal;color:var(--mut)}
+#fmsg{color:var(--mut);font-size:12px;padding-top:.3rem}body.drop #files{outline:2px dashed var(--warn);outline-offset:-2px}
 #log{flex:1;overflow:auto;border-top:1px solid var(--line);padding:.5rem .9rem;font-size:12px}
 #log div{padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#log b{color:var(--g);font-weight:500}#log i{color:#3f6b50;font-style:normal}#log div:before{content:"$ ";color:#3f6b50}
 #kb{position:fixed;left:0;right:0;bottom:0;display:none;gap:.35rem;padding:.5rem .7rem;background:var(--panel2);border-top:1px solid var(--warn);align-items:center;flex-wrap:wrap}
@@ -657,7 +698,9 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 <select id=mon title=screen><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
 <button id=ctl hidden></button></div>
 <div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
-<aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol><div id=log></div></aside></div>
+<aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
+<section id=files hidden><h2 id=hFiles style="padding-left:0"></h2><div id=fbar><button id=fup title=up>..</button><input id=fp spellcheck=false><button id=fgo>&#8635;</button></div><div id=fl></div><div id=fmsg></div></section>
+<div id=log></div></aside></div>
 <div id=kb><label for=txt>$</label><input id=txt autocomplete=off><button id=send></button><button data-k=enter>Enter</button><button data-k=backspace>&#9003;</button><button data-k=tab>Tab</button><button data-k=esc>Esc</button><button data-k=left>&larr;</button><button data-k=up>&uarr;</button><button data-k=down>&darr;</button><button data-k=right>&rarr;</button>${android ? '<button data-k=back>Back</button><button data-k=home>Home</button><button data-k=recents>Recents</button>' : ''}</div>
 <script>
 const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'в эфире',wait:'жду кадр…',end:'сеанс завершён',off:'устройство не на связи',paused:'пауза на устройстве',take:'Управлять самому',give:'Вернуть помощнику',tag:'управляете вы, помощник ждёт',send:'Ввести',ph:'текст: Enter — ввести и нажать Enter',note:'Что делает помощник',noNote:'помощник ещё ничего не написал',plan:'План',over:'вы управляете'}:{live:'live',wait:'waiting for a frame…',end:'session ended',off:'device offline',paused:'paused on the device',take:'Take control',give:'Give back to the helper',tag:'you are driving, the helper waits',send:'Type',ph:'text: Enter types it and presses Enter',note:'What the helper is doing',noNote:'nothing from the helper yet',plan:'Plan',over:'you are driving'};
@@ -666,7 +709,7 @@ $('hNote').textContent=L.note;$('note').dataset.empty=L.noNote;$('hPlan').textCo
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
 let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
-$('mon').onchange=e=>{mon=e.target.value};
+$('mon').onchange=e=>{mon=e.target.value;if(abort)abort.abort()};
 function status(t,cls){st.textContent=t;dot.className=cls||''}
 async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());
  if(r.status===410){ended=true;return}
@@ -678,7 +721,43 @@ async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_
  else{let m='';try{m=(await r.json()).error||''}catch(_){}status(/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait,'bad');await new Promise(x=>setTimeout(x,1200))}}
  catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
 async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}status(L.end,'')}
-lane();setTimeout(lane,350);   // two frames in flight: the agent never waits for the browser, so the picture keeps moving
+// the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
+let abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve();
+const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
+setInterval(()=>{if(gotEver&&!noLive&&frames)status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);
+const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
+function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
+function handle(ty,p){const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
+ if(ty==='K'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n))),img=p.subarray(2+n);
+  chain=chain.then(async()=>{const b=await jpeg(img);size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);b.close();frames++}).catch(()=>{})}
+ else if(ty==='T'){const c=dv.getUint16(0),parts=[];let o=2;
+  for(let i=0;i<c;i++){const n=dv.getUint32(o+4);parts.push([dv.getUint16(o),dv.getUint16(o+2),p.subarray(o+8,o+8+n)]);o+=8+n}
+  chain=chain.then(async()=>{const bs=await Promise.all(parts.map(q=>jpeg(q[2])));bs.forEach((b,i)=>{g.drawImage(b,parts[i][0],parts[i][1]);b.close()});frames++}).catch(()=>{})}
+ else if(ty==='C'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n)));meta={ox:m.ox,oy:m.oy,sc:m.sc};
+  if(!('VideoDecoder' in window)){noLive=true;if(abort)abort.abort();return}   // no WebCodecs in this browser: pictures instead
+  try{if(dec)dec.close()}catch(_){}
+  dec=new VideoDecoder({output:f=>{size(f.displayWidth,f.displayHeight);g.drawImage(f,0,0);f.close();frames++},error:()=>{dec=null}});
+  dec.configure({codec:m.codec,optimizeForLatency:true})}
+ else if(ty==='V'&&dec&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:p[0]&1?'key':'delta',timestamp:Math.round(performance.now()*1000),data:p.subarray(1)}))}
+async function live(){   // -> true if pictures came
+ abort=new AbortController();let got=false;const my=abort;
+ const quiet=setTimeout(()=>{if(!got)my.abort()},7000);   // nothing in 7 s: this agent does not stream
+ try{const r=await fetch(base+'/live'+(mon?'?mon='+mon:''),{signal:my.signal});
+  if(r.status===410){ended=true;return true}
+  if(!r.ok||!r.body)return false;
+  const rd=r.body.getReader();let buf=new Uint8Array(0);
+  for(;;){const x=await rd.read();if(x.done)break;bytes+=x.value.length;
+   const nb=new Uint8Array(buf.length+x.value.length);nb.set(buf);nb.set(x.value,buf.length);buf=nb;
+   while(buf.length>=5){const n=new DataView(buf.buffer,buf.byteOffset).getUint32(0);if(buf.length<5+n)break;
+    const ty=String.fromCharCode(buf[4]),pl=buf.slice(5,5+n);buf=buf.subarray(5+n);
+    if(ty!=='P'){got=true;gotEver=true}handle(ty,pl)}}
+ }catch(e){}finally{clearTimeout(quiet)}
+ return got}
+(async()=>{while(!ended){
+ if(noLive){lane();setTimeout(lane,350);return}   // two frames in flight: the agent never waits for the browser, so the picture keeps moving
+ const ok=await live();if(ended)break;
+ if(!ok&&!gotEver)noLive=true;else if(!ok)await sleep(1000)}
+ status(L.end,'')})();
 const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function info(){while(!ended){try{
  const r=await fetch(base+'/log');if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
@@ -688,6 +767,27 @@ async function info(){while(!ended){try{
   if(!s.online)status(L.off,'bad');else if(s.paused)status(L.paused,'bad')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
 info();
+// files (control link): browse the remote folders, click a file to download it, drop files onto the page to put them in the open folder
+if(CTL){const F=ru?{t:'Файлы',drop:'Перетащите файлы на страницу: они попадут в эту папку',up:'загружаю',ok:'сохранено',get:'готовлю ссылку…'}:{t:'Files',drop:'Drop files onto the page: they land in this folder',up:'uploading',ok:'saved',get:'preparing the link…'};
+ const fl=$('fl'),fp=$('fp'),fm=$('fmsg'),BS=String.fromCharCode(92);let cwd='~';
+ $('files').hidden=false;$('hFiles').textContent=F.t;fm.textContent=F.drop;
+ const join=(d,n)=>{const sp=d.includes(BS)?BS:'/';return d.endsWith(sp)?d+n:d+sp+n};
+ const up=d=>{const sp=d.includes(BS)?BS:'/';let p=d.replace(/[/]+$/,'');if(sp===BS)while(p.endsWith(BS))p=p.slice(0,-1);const i=p.lastIndexOf(sp);if(i<0)return d;p=p.slice(0,i);return p===''?'/':p.endsWith(':')?p+BS:p};
+ async function ls(p){fl.textContent='…';try{const r=await fetch(base+'/ls?path='+encodeURIComponent(p),{headers:{'x-ctl':CTL}}),j=await r.json();if(!r.ok)throw new Error(j.error);
+  const L2=j.text.split(String.fromCharCode(10));cwd=L2[0];fp.value=cwd;fl.innerHTML='';
+  for(const l of L2.slice(1)){const x=l.trim();if(!x)continue;const el=document.createElement('div'),k=x.indexOf('/  (');
+   if(k>0){const n=x.slice(0,k);el.innerHTML='<b></b><i></i>';el.firstChild.textContent=n+'/';el.lastChild.textContent=x.slice(k+3);el.onclick=()=>ls(join(cwd,n))}
+   else{const k2=x.lastIndexOf('  ');const n=k2>0?x.slice(0,k2):x;el.innerHTML='<span></span><i></i>';el.firstChild.textContent=n;el.lastChild.textContent=k2>0?x.slice(k2+2):'';
+    el.onclick=async()=>{fm.textContent=F.get;try{const r=await fetch(base+'/get',{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify({path:join(cwd,n)})}),j=await r.json();const u=(j.text||'').split(' ')[0];if(!r.ok||!u.startsWith('http'))throw new Error(j.error||j.text);fm.textContent=n;location.href=u}catch(e){fm.textContent=String(e.message||e)}}}
+   fl.appendChild(el)}}catch(e){fl.textContent=String(e.message||e)}}
+ $('fup').onclick=()=>ls(up(cwd));$('fgo').onclick=()=>ls(fp.value);fp.addEventListener('keydown',e=>{if(e.key==='Enter')ls(fp.value)});
+ document.addEventListener('dragover',e=>{e.preventDefault();document.body.classList.add('drop')});
+ document.addEventListener('dragleave',e=>{if(!e.relatedTarget)document.body.classList.remove('drop')});
+ document.addEventListener('drop',async e=>{e.preventDefault();document.body.classList.remove('drop');
+  for(const f of e.dataTransfer.files){fm.textContent=F.up+' '+f.name+'…';
+   try{const r=await fetch(base+'/upload?name='+encodeURIComponent(f.name)+'&dir='+encodeURIComponent(cwd),{method:'POST',headers:{'x-ctl':CTL},body:f}),j=await r.json();if(!r.ok)throw new Error(j.error);fm.textContent=F.ok+': '+j.path}catch(e){fm.textContent=String(e.message||e)}}
+  ls(cwd)});
+ ls('~')}
 async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
 function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
 if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
@@ -760,7 +860,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/log|\/input|\/takeover|\/state)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -768,7 +868,34 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
+      if (vw[2] === '/live') {   // a video-like stream; 501 = this agent cannot stream, the page then polls pictures
+        if (s.noStream) return json(res, 501, { error: 'no stream' });
+        const ms = url.searchParams.get('mon'), mon = ms ? Number(ms) : -1; s.liveMon = Number.isInteger(mon) && mon >= 0 && mon < 10 ? mon : -1;
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' });
+        const lv = { res, waitKey: true }; (s.live ??= new Set()).add(lv);
+        if (s.lastC) res.write(s.lastC);
+        s.keyAt = 0; wantKey(v.code, s);
+        const ping = setInterval(() => res.write(Buffer.from([0, 0, 0, 0, 80])), 15_000);   // keeps proxies from closing a quiet stream
+        req.on('close', () => {
+          clearInterval(ping); s.live?.delete(lv);
+          setTimeout(() => { if (!s.live?.size && sessions.get(v.code) === s) streamCtl(v.code, s, { on: false }); }, 15_000);   // nobody watches: the agent stops filming
+        });
+        return;
+      }
       if (vw[2] === '/state') return json(res, 200, { plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
+      if (vw[2] === '/ls' || vw[2] === '/get' || vw[2] === '/upload') {   // files: browse, download, drop a file onto the PC (control link only)
+        if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        try {
+          if (vw[2] === '/ls') return json(res, 200, await call(v.code, 'tree', { path: url.searchParams.get('path') || '~', depth: 1, max: 500 }, 30_000, { human: true }));
+          if (req.method !== 'POST') return json(res, 405, {});
+          if (vw[2] === '/get') { const b = JSON.parse((await body(req, 5000)) || '{}'); return json(res, 200, await call(v.code, 'fetch_file', { path: String(b.path || '') }, 3_700_000, { human: true })); }
+          const f = await storeFile(req, url.searchParams.get('name'), v.code), dir = String(url.searchParams.get('dir') || '');
+          const sep = dir.includes('\\') ? '\\' : '/', dest = dir ? dir.replace(/[\\/]+$/, '') + sep + f.name : f.name;
+          const d = await call(v.code, 'push_file', { url: f.url, path: dest }, 3_700_000, { human: true });
+          (s.uploads ??= []).push(`${dest} (${f.size} bytes)`);   // the AI hears about it with its next answer
+          return json(res, 200, { text: d?.text || 'saved', path: dest });
+        } catch (e) { return json(res, 503, { error: e.message }); }
+      }
       if (vw[2] === '/input' || vw[2] === '/takeover') {   // control: needs the secret from the control link
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 20_000)) || '{}');
@@ -873,6 +1000,23 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         res.on('close', () => { if (s.waiting === res) { s.waiting = null; clearTimeout(s.waitTimer); } });
         return flush(s);
       }
+      if (p === '/a/stream' && req.method === 'POST') {   // the live picture: one long upload, frames forwarded as they come
+        try { s.ingest?.destroy(); } catch { /* gone */ }
+        s.ingest = req; let buf = Buffer.alloc(0);
+        req.on('data', (chunk) => {
+          s.lastSeen = Date.now();
+          buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+          while (buf.length >= 5) {
+            const n = buf.readUInt32BE(0);
+            if (n > 16_000_000) { req.destroy(); return; }
+            if (buf.length < 5 + n) break;
+            liveFrame(code, s, Buffer.from(buf.subarray(0, 5 + n))); buf = buf.subarray(5 + n);
+          }
+        });
+        req.on('error', () => {});
+        req.on('end', () => { if (s.ingest === req) s.ingest = null; json(res, 200, {}); });
+        return;
+      }
       if (p === '/a/result' && req.method === 'POST') {
         let r;
         const ct = req.headers['content-type'] || '';
@@ -891,15 +1035,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         return json(res, 200, {});
       }
       if (p === '/a/file' && req.method === 'POST') {
-        const name = (url.searchParams.get('name') || 'file').replace(/[^\w.\-]+/g, '_').slice(0, 100) || 'file';
-        const id = crypto.randomBytes(12).toString('hex'), fp = path.join(FILES_DIR, id);
-        let n = 0;
-        const cap = new Transform({ transform(chunk, _e, cb) { n += chunk.length; n > MAX_FILE ? cb(new Error('file too large')) : cb(null, chunk); } });
-        const key = crypto.randomBytes(32), iv = crypto.randomBytes(12), enc = crypto.createCipheriv('aes-256-gcm', key, iv);
-        try { await pipeline(req, cap, enc, fs.createWriteStream(fp, { mode: 0o600 })); }
-        catch (e) { fs.rmSync(fp, { force: true }); return json(res, 413, { error: e.message }); }
-        files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS, code, key, iv, tag: enc.getAuthTag() });
-        return json(res, 200, { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n });
+        try { return json(res, 200, await storeFile(req, url.searchParams.get('name'), code)); } catch (e) { return json(res, 413, { error: e.message }); }
       }
       if (p === '/a/state' && req.method === 'POST') {   // the user paused / resumed from the console (Esc menu)
         const st = JSON.parse((await body(req, 2000)) || '{}'); s.paused = !!st.paused;

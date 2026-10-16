@@ -1169,14 +1169,14 @@ namespace A__BUILD__ {
       string wt = ""; int wp = 0; try { wt = win.Current.Name; wp = win.Current.ProcessId; } catch { }
       Cache = new List<AutomationElement>(); StringBuilder sb = new StringBuilder();
       sb.Append("window \"" + Cap(wt, 80) + "\" (" + ProcName(wp) + ")\n");
-      int shown = 0, total = 0; bool first = true;
+      int shown = 0, total = 0, content = 0; bool first = true; double winTop = 0; try { winTop = win.Current.BoundingRectangle.Top; } catch { }
       foreach (Node n in acc) {
         if (first) { first = false; continue; }
         if (!Wanted(n, all)) continue;
         string lab = Label(n);
         if (!string.IsNullOrEmpty(query) && (lab + " " + n.Val + " " + n.Aid).IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
         total++; if (shown >= max) continue;
-        Cache.Add(n.El); shown++;
+        Cache.Add(n.El); shown++; if (!((n.Type == "button" || n.Type == "menuitem" || n.Type == "splitbutton") && n.Y < winTop + 60)) content++;
         sb.Append(shown).Append(' ').Append(n.Type);
         if (lab.Length > 0) sb.Append(" \"").Append(Cap(lab, 70)).Append('"');
         if (!string.IsNullOrEmpty(n.Val)) sb.Append(" =\"").Append(Cap(n.Val, 60)).Append('"');
@@ -1184,7 +1184,7 @@ namespace A__BUILD__ {
         foreach (string f in n.Flags) sb.Append(' ').Append(f);
         sb.Append('\n');
       }
-      if (shown == 0) return sb + "nothing readable here" + (acc.Count <= 1 ? " (the window shows no controls to this agent: a game, a custom-drawn app or an administrator window)" : (string.IsNullOrEmpty(query) ? "" : " matches '" + query + "'")) + ": use screenshot.";
+      if (shown == 0 || (content == 0 && string.IsNullOrEmpty(query))) return sb + "nothing readable here" + (acc.Count <= 1 || shown > 0 ? " (the window shows no controls of its own to this agent: a game, a custom-drawn app or an administrator window)" : (string.IsNullOrEmpty(query) ? "" : " matches '" + query + "'")) + ": use screenshot.";
       if (total > shown) sb.Append("... ").Append(total - shown).Append(" more (use query or max)\n");
       return sb.ToString();
     }
@@ -1268,16 +1268,30 @@ namespace A__BUILD__ {
       return null;
     }
     public static void Focus() { if (Picked != null) Picked.SetFocus(); }
+    public static int[] WinRect(string window) { System.Windows.Rect r = PickWindow(window).Current.BoundingRectangle; return new int[] { (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height }; }
   }
 }
 '@
     } catch { throw 'UI Automation is not available on this PC: use screenshot and click.' }
     $script:UiReady = $true
 }
-function Do-UiTree($a) { Ensure-Ui; @{ text = [A__BUILD__.Ui]::Tree([string]$a.window, [string]$a.query, (Int-Or $a.max 120), [bool]$a.all, [double]$Scale, [int]$script:OriginX, [int]$script:OriginY) } }
+function Do-UiTree($a) {
+    Ensure-Ui
+    $t = [A__BUILD__.Ui]::Tree([string]$a.window, [string]$a.query, (Int-Or $a.max 120), [bool]$a.all, [double]$Scale, [int]$script:OriginX, [int]$script:OriginY)
+    if ($a.ocr -or $t -match 'nothing readable here') { try { $t = ($t -replace ': use screenshot\.\s*$', '.') + "`n" + (Ocr-Tree ([string]$a.window) (Int-Or $a.max 120)) } catch { $t += "`n" + $_.Exception.Message } }
+    @{ text = $t }
+}
 function Do-UiClick($a) {
     Ensure-Ui
-    $p = [A__BUILD__.Ui]::Pick((Int-Or $a.id 0), [string]$a.name, [string]$a.type, [string]$a.window); $cx = [int]$p[1]; $cy = [int]$p[2]
+    try { $p = [A__BUILD__.Ui]::Pick((Int-Or $a.id 0), [string]$a.name, [string]$a.type, [string]$a.window) }
+    catch {
+        if ($_.Exception.Message -notmatch 'No control named' -or -not $a.name -or $a.id) { throw }
+        $o = $null; try { $o = Ocr-Find ([string]$a.name) ([string]$a.window) } catch { if ($_.Exception.Message -match 'Several texts') { throw }; $o = $null }
+        if (-not $o) { throw }
+        $r = Do-Click @{ x = $o.x; y = $o.y; raw = $true; button = $(if ($a.right) { 'right' } else { 'left' }); double = [bool]$a.double }
+        return @{ text = "no control of that name, but the text '$($o.t)' is on the screen (OCR): clicked it; " + $r.text }
+    }
+    $cx = [int]$p[1]; $cy = [int]$p[2]
     $btn = if ($a.right) { 'right' } else { 'left' }
     if ($a.right -or $a.double) { return @{ text = "$($p[0]): " + (Do-Click @{ x = $cx; y = $cy; raw = $true; button = $btn; double = [bool]$a.double }).text } }
     Overlay-Send 'active'; Glide $cx $cy $null; Start-Sleep -Milliseconds 200
@@ -1298,6 +1312,51 @@ function Do-UiSet($a) {
         [void](Do-PressKey @{ keys = 'ctrl+a' }); return @{ text = "$($p[0]): typed (it has no direct value access); " + (Do-TypeText @{ text = [string]$a.value }).text }
     }
     @{ text = "$($p[0]): $r" }
+}
+# ---- OCR: the text of a window that shows no controls (a game, a custom-drawn or administrator window), read from its picture with the OCR engine Windows ships
+function Ensure-Ocr {
+    if ($script:OcrEng) { return }
+    try {
+        Add-Type -AssemblyName System.Runtime.WindowsRuntime, System.Drawing
+        $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+        $null = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
+        $script:AsTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+        $eng = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+    } catch { throw 'OCR is not available on this PC: use screenshot.' }
+    if (-not $eng) { throw 'OCR is not available (no OCR language is installed for this Windows user): use screenshot.' }
+    $script:OcrEng = $eng
+}
+function Await-Op($op, $type) { $t = $script:AsTask.MakeGenericMethod($type).Invoke($null, @($op)); [void]$t.Wait(20000); $t.Result }
+function Ocr-Lines($window) {   # -> lines @{ t; x; y; w; h } in real screen pixels, for the window (default: the one in front)
+    Ensure-Ocr
+    $r = [A__BUILD__.Ui]::WinRect($window); $vs = [Windows.Forms.SystemInformation]::VirtualScreen
+    $x = [Math]::Max($r[0], $vs.Left); $y = [Math]::Max($r[1], $vs.Top); $w = [Math]::Min($r[0] + $r[2], $vs.Right) - $x; $h = [Math]::Min($r[1] + $r[3], $vs.Bottom) - $y
+    if ($w -lt 8 -or $h -lt 8) { return @() }
+    $bmp = New-Object Drawing.Bitmap $w, $h; $g = [Drawing.Graphics]::FromImage($bmp); $g.CopyFromScreen($x, $y, 0, 0, $bmp.Size); $g.Dispose()
+    $ms = New-Object IO.MemoryStream; $bmp.Save($ms, [Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose(); $ms.Position = 0
+    $ras = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($ms)
+    $dec = Await-Op ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($ras)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $sb = Await-Op ($dec.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $res = Await-Op ($script:OcrEng.RecognizeAsync($sb)) ([Windows.Media.Ocr.OcrResult])
+    foreach ($ln in $res.Lines) {
+        $x0 = 1e9; $y0 = 1e9; $x1 = 0; $y1 = 0
+        foreach ($wd in $ln.Words) { $b = $wd.BoundingRect; $x0 = [Math]::Min($x0, $b.X); $y0 = [Math]::Min($y0, $b.Y); $x1 = [Math]::Max($x1, $b.X + $b.Width); $y1 = [Math]::Max($y1, $b.Y + $b.Height) }
+        @{ t = [string]$ln.Text; x = [int]($x + $x0); y = [int]($y + $y0); w = [int]($x1 - $x0); h = [int]($y1 - $y0) }
+    }
+}
+function Ocr-Tree($window, $max) {
+    $o = @(Ocr-Lines $window); if ($o.Count -eq 0) { return "OCR found no text either: use screenshot." }
+    $lines = foreach ($l in ($o | Select-Object -First $max)) { 'ocr "' + (Cut $l.t 70) + '" @' + [int](($l.x + $l.w / 2 - $script:OriginX) / $Scale) + ',' + [int](($l.y + $l.h / 2 - $script:OriginY) / $Scale) }
+    "text read from the picture (OCR; click {x,y} or ui_click {name:`"text`"} presses it):`n" + ($lines -join "`n")
+}
+function Ocr-Find($name, $window) {   # -> the one line holding the text (centre in real pixels), $null when none; throws when it is ambiguous
+    $o = @(Ocr-Lines $window); if ($o.Count -eq 0) { return $null }
+    $ex = @($o | Where-Object { $_.t.Trim() -ieq $name }); $hit = @(if ($ex.Count -ge 1) { $ex } else { $o | Where-Object { $_.t -like "*$name*" } })
+    if ($hit.Count -eq 0) { return $null }
+    if ($hit.Count -gt 1) { throw ("Several texts on the screen match '$name': " + (($hit | Select-Object -First 6 | ForEach-Object { '"' + (Cut $_.t 40) + '" at ' + [int](($_.x + $_.w / 2 - $script:OriginX) / $Scale) + ',' + [int](($_.y + $_.h / 2 - $script:OriginY) / $Scale) }) -join '; ') + '. Use click {x,y} on the one you mean.') }
+    @{ t = $hit[0].t; x = [int]($hit[0].x + $hit[0].w / 2); y = [int]($hit[0].y + $hit[0].h / 2) }
 }
 function Do-FocusWindow($a) {
     $wins = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | Select-Object Id, ProcessName, MainWindowTitle, MainWindowHandle)

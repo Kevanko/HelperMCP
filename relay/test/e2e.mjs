@@ -217,6 +217,24 @@ if (useps) {
   assert.match(txt(await tool('ui_click', { session: code, id: Number(agId) })), /toggled \(now on\)/);
   const bad = await raw('ui_click', { session: code, name: 'no-such-control-xyz', window: 'HM UI Test' }); assert.ok(bad.isError && /No control named/.test(txt(bad)), 'a missing control says so'); console.log('ui_tree / ui_click / ui_set ok');
   form.kill();
+  // a window that draws its own text (no controls for UI Automation: like a game): ui_tree falls back to reading the picture (OCR), ui_click presses the text
+  const ocrFile = path.join(tmp, 'ocrform.ps1');
+  fs.writeFileSync(ocrFile, '﻿' + ['Add-Type -AssemblyName System.Windows.Forms, System.Drawing',
+    "$f = New-Object Windows.Forms.Form; $f.Text = 'HM OCR Test'; $f.Width = 560; $f.Height = 320; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+    '$p = New-Object Windows.Forms.Panel; $p.Dock = "Fill"; $p.BackColor = [Drawing.Color]::White',
+    "$p.Add_Paint({ param($s, $e) $e.Graphics.TextRenderingHint = 'AntiAlias'; $e.Graphics.DrawString('Launch rocket', (New-Object Drawing.Font('Arial', 32)), [Drawing.Brushes]::Black, 40, 80) })",
+    "$p.Add_MouseClick({ $f.Text = 'HM OCR clicked' })",
+    '$f.Controls.Add($p); [void]$f.ShowDialog()'].join('\n'));
+  const oform = spawn('powershell', ['-NoProfile', '-STA', '-File', ocrFile]); kids.push(oform);
+  let ot = ''; for (let i = 0; i < 30 && !/^window "HM OCR Test"/.test(ot); i++) { await new Promise((x) => setTimeout(x, 1000)); ot = txt(await raw('ui_tree', { session: code, window: 'HM OCR Test' })); }
+  if (/OCR is not available/.test(ot)) console.log('ocr skipped: no OCR language on this machine');
+  else {
+    assert.match(ot, /nothing readable here/, 'a self-drawn window has no controls: ' + ot); assert.match(ot, /ocr "Launch rocket/i, 'OCR reads the drawn text: ' + ot);
+    const oc = txt(await tool('ui_click', { session: code, name: 'launch rocket', window: 'HM OCR Test' })); assert.match(oc, /\(OCR\): clicked it/, oc);
+    await new Promise((x) => setTimeout(x, 600)); assert.match(txt(await tool('ui_tree', { session: code, window: 'HM OCR clicked' })), /^window "HM OCR clicked"/, 'the click on the OCR text reached the window');
+    console.log('ui_tree OCR fallback ok');
+  }
+  oform.kill();
 } else {   // Linux: AT-SPI needs a desktop session; on a headless runner the answer must be a clear message that points to screenshot, not a hang or a crash
   const lt = await raw('ui_tree', { session: code });
   assert.match(txt(lt), /^window "|nothing readable|No window|No such window|session bus|AT-SPI is not available/, 'ui_tree answers on Linux: ' + txt(lt));

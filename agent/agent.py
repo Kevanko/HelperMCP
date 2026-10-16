@@ -1076,6 +1076,7 @@ def util(a):
 
 # ---- the live picture for the viewer (like a video call): one long upload of frames, on while someone watches -------------------
 # With ffmpeg: H.264 (x11grab + libx264, zero latency). Without it: full JPEG pictures from the screenshot tool, a few per second.
+SYS_AT = [0.0]
 LIVE = {"run": False, "mon": -1, "thread": None, "err": "", "proc": None}
 
 
@@ -1103,7 +1104,7 @@ def _h264_frames(mon):
           ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt", "yuv420p", "-profile:v", "baseline",
            "-x264-params", "keyint=30:aud=1:repeat-headers=1", "-b:v", "2500k", "-maxrate", "3000k", "-bufsize", "1500k", "-f", "h264", "-"]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=with_path()); LIVE["proc"] = p
-    try: yield from annexb(p.stdout, {"w": ow, "h": oh, "ox": x, "oy": y, "sc": sc}, lambda: LIVE["run"])
+    try: yield from annexb(p.stdout, dict({"w": ow, "h": oh, "ox": x, "oy": y, "sc": sc}, **_mons_json(mon)), lambda: LIVE["run"])
     finally: p.kill(); LIVE["proc"] = None
 
 
@@ -1122,9 +1123,52 @@ def annexb(src, meta, alive):
                 yield _frame("V", bytes([1 if key else 0]) + b"".join(b"\x00\x00\x00\x01" + n for n in au)); au = []
             if kind == 7 and nal[1:4] != sent_sps:   # sequence parameters: tell the viewer how to decode
                 sent_sps = nal[1:4]
-                yield _frame("C", _meta(dict(meta, codec="avc1.%02x%02x%02x" % tuple(nal[1:4]))))
+                yield _frame("C", _meta(dict(meta, codec="avc1.%02x%02x%02x" % tuple(nal[1:4]))))   # (the monitor map rides in meta)
+                if time.time() - SYS_AT[0] >= 2: SYS_AT[0] = time.time(); yield _frame("S", sys_snap().encode())
             if nal: au.append(nal)
         if len(starts) > 1: buf = buf[starts[-1]:]
+
+
+_SNAP = {"t": 0.0, "cpu": None, "procs": {}, "info": {}}
+
+
+def sys_snap(top=10):
+    """the live System panel: cpu %, ram, busiest + biggest processes; read from /proc, CPU % from the change since the previous call"""
+    def stat():
+        a = open("/proc/stat").readline().split()[1:]; v = list(map(int, a)); return sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+    tot, idle = stat(); now = time.time(); hz = os.sysconf("SC_CLK_TCK"); ncpu = os.cpu_count() or 1
+    cpu = 0
+    if _SNAP["cpu"]: cpu = round(100 * (1 - (idle - _SNAP["cpu"][1]) / max(1, tot - _SNAP["cpu"][0])))
+    mem = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.split(":")[0] in ("MemTotal", "MemAvailable")}
+    rows, cur, dt = [], {}, max(0.001, now - _SNAP["t"]) * hz * ncpu if _SNAP["t"] else 0
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            f = open(f"/proc/{pid}/stat").read(); name = f[f.index("(") + 1:f.rindex(")")]; r = f[f.rindex(")") + 2:].split()
+            ticks = int(r[11]) + int(r[12]); rss = int(r[21]) * os.sysconf("SC_PAGE_SIZE"); cur[pid] = ticks
+            c = 100 * (ticks - _SNAP["procs"][pid]) / dt if dt and pid in _SNAP["procs"] else 0
+            rows.append((int(pid), name, c, rss))
+        except Exception: pass
+    _SNAP.update(t=now, cpu=(tot, idle), procs=cur)
+    pick, seen = [], set()
+    for r in sorted(rows, key=lambda x: -x[2]):
+        if len(pick) >= top or r[2] < 0.5: break
+        seen.add(r[0]); pick.append(r)
+    for r in sorted(rows, key=lambda x: -x[3]):
+        if len(pick) >= top + 4: break
+        if r[0] not in seen: seen.add(r[0]); pick.append(r)
+    out = []
+    for pid, name, c, rss in pick:
+        i = _SNAP["info"].get(pid)
+        if i is None:
+            try: path = os.readlink(f"/proc/{pid}/exe")
+            except OSError: path = ""
+            i = _SNAP["info"][pid] = (path, "!" if path.startswith(("/tmp/", "/dev/shm/", "/var/tmp/")) or path.endswith(" (deleted)") else "")
+        out.append([pid, name, round(c, 1), rss, "", i[0], i[1]])
+    return json.dumps({"cpu": cpu, "mem": round(100 * (1 - mem["MemAvailable"] / mem["MemTotal"])), "ramFree": mem["MemAvailable"], "ramTotal": mem["MemTotal"], "n": len(rows), "p": out})
+
+
+def _mons_json(cur):
+    return {"mon": cur, "mons": [[x, y, w, h, 1 if i == 0 else 0] for i, (x, y, w, h) in enumerate(monitors())]}
 
 
 def _jpeg_frames(mon):
@@ -1135,7 +1179,8 @@ def _jpeg_frames(mon):
         except Exception as e: LIVE["err"] = str(e); time.sleep(1); continue
         if not d.get("same"):
             last = d["h"]
-            yield _frame("K", _meta({"w": 0, "h": 0, "ox": d.get("ox", 0), "oy": d.get("oy", 0), "sc": d.get("sc", 1)}) + d["jpeg"])
+            yield _frame("K", _meta(dict({"w": 0, "h": 0, "ox": d.get("ox", 0), "oy": d.get("oy", 0), "sc": d.get("sc", 1)}, **_mons_json(mon))) + d["jpeg"])
+        if time.time() - SYS_AT[0] >= 2: SYS_AT[0] = time.time(); yield _frame("S", sys_snap().encode())
         time.sleep(max(0.05, 0.3 - (time.time() - t0)))
 
 

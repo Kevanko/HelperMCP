@@ -102,6 +102,7 @@ To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=http
 - **Weak connections.** Screenshots are raw JPEG and shrink on slow links, unchanged screens aren't sent, big output is gzipped.
 - **Live stream.** The view is a real stream, not a slideshow: Windows sends only the screen tiles that change, Linux with `ffmpeg` sends H.264 (the browser decodes it with WebCodecs), and it steps quality to the link. Behind nginx add `proxy_buffering off; proxy_request_buffering off;` for the `/v/` and `/a/` paths; Caddy needs nothing.
 - **Files in the live view.** On the control link a Files panel browses the remote folders, downloads a file with a click, and drops files from your computer straight onto the open folder on the friend's PC.
+- **System panel and monitors.** Next to the picture a live panel shows CPU, RAM and the busiest processes (publisher, path, `!` on anything suspicious); on the control link each row has an end-process button. The top bar draws a map of the PC's real monitors with their resolutions: click one, or press `1`–`9` (`0` = all screens).
 - **Zoom the preview.** Ctrl + mouse wheel zooms the live picture toward the cursor, drag pans, and a 1:1 button resets — the coordinates you click stay exact while zoomed.
 - **Linux.** Mouse and keyboard need X11 ("Ubuntu on Xorg"). On Wayland, screenshots, commands, files and browsers still work.
 - **Mistake log.** Missed taps and redone actions are saved with context (`misses` tool) so you can spot patterns.

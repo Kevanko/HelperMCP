@@ -306,6 +306,42 @@ namespace F__BUILD__ {
     public static int MemLoad() { var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) }; GlobalMemoryStatusEx(ref m); return (int)m.dwMemoryLoad; }
 
     [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+    // the live "System" panel: called every 2 s by the stream thread; CPU % per process comes from the change since the previous call (no sleeping)
+    static Dictionary<int, TimeSpan> sPrev; static DateTime sT; static long sI, sK, sU; static readonly Dictionary<int, string[]> sInfo = new Dictionary<int, string[]>();
+    static string J(string x) { var b = new System.Text.StringBuilder("\""); foreach (char c in x ?? "") { if (c == '"' || c == '\\') b.Append('\\').Append(c); else if (c < 32) b.AppendFormat("\\u{0:x4}", (int)c); else b.Append(c); } return b.Append('"').ToString(); }
+    public static string Snap(int top) {
+      long i, k, u; GetSystemTimes(out i, out k, out u); var now = DateTime.UtcNow; double cpu = 0;
+      if (sT != default(DateTime)) { double tot = (k - sK) + (u - sU), idle = i - sI; cpu = tot <= 0 ? 0 : Math.Round((tot - idle) / tot * 100.0); }
+      double dt = sT == default(DateTime) ? 0 : (now - sT).TotalMilliseconds * Environment.ProcessorCount;
+      sI = i; sK = k; sU = u;
+      var cur = new Dictionary<int, TimeSpan>(); var rows = new List<double[]>(); var names = new Dictionary<int, string>();
+      foreach (var p in System.Diagnostics.Process.GetProcesses()) {
+        try { var t = p.TotalProcessorTime; cur[p.Id] = t; TimeSpan a; double c = dt > 0 && sPrev != null && sPrev.TryGetValue(p.Id, out a) ? Math.Max(0, (t - a).TotalMilliseconds / dt * 100.0) : 0; rows.Add(new double[] { p.Id, c, p.WorkingSet64 }); names[p.Id] = p.ProcessName; }
+        catch { } finally { p.Dispose(); }
+      }
+      sPrev = cur; sT = now;
+      var byCpu = new List<double[]>(rows); byCpu.Sort((x, y) => y[1].CompareTo(x[1]));
+      var byMem = new List<double[]>(rows); byMem.Sort((x, y) => y[2].CompareTo(x[2]));
+      var pick = new List<double[]>(); var seen = new HashSet<int>();
+      foreach (var r in byCpu) { if (pick.Count >= top || r[1] < 0.5) break; if (seen.Add((int)r[0])) pick.Add(r); }   // what is busy now...
+      foreach (var r in byMem) { if (pick.Count >= top + 4) break; if (seen.Add((int)r[0])) pick.Add(r); }            // ...and what holds the most memory
+      if (sInfo.Count > 3000) sInfo.Clear();
+      var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) }; GlobalMemoryStatusEx(ref m);
+      var inv = System.Globalization.CultureInfo.InvariantCulture; var sb = new System.Text.StringBuilder();
+      sb.AppendFormat(inv, "{{\"cpu\":{0},\"mem\":{1},\"ramFree\":{2},\"ramTotal\":{3},\"n\":{4},\"p\":[", cpu, m.dwMemoryLoad, m.ullAvailPhys, m.ullTotalPhys, rows.Count);
+      for (int n = 0; n < pick.Count; n++) {
+        int pid = (int)pick[n][0]; string[] f;
+        if (!sInfo.TryGetValue(pid, out f)) {   // the exe path and the publisher once per process, not every 2 s
+          string path = PathOf(pid), company = "";
+          if (path.Length > 0) { try { company = (System.Diagnostics.FileVersionInfo.GetVersionInfo(path).CompanyName ?? "").Trim(); } catch { } }
+          f = new[] { path, company, Looks(path, company) ? "!" : "" }; sInfo[pid] = f;
+        }
+        if (n > 0) sb.Append(',');
+        sb.AppendFormat(inv, "[{0},{1},{2:0.0},{3},{4},{5},{6}]", pid, J(names[pid]), pick[n][1], (long)pick[n][2], J(f[1]), J(f[0]), J(f[2]));
+      }
+      return sb.Append("]}").ToString();
+    }
+
     public static double CpuLoad(int ms) {   // whole-machine CPU busy %, sampled over ms (kernel time already includes idle)
       long i0, k0, u0, i1, k1, u1; GetSystemTimes(out i0, out k0, out u0); System.Threading.Thread.Sleep(ms); GetSystemTimes(out i1, out k1, out u1);
       double tot = (k1 - k0) + (u1 - u0), idle = i1 - i0; return tot <= 0 ? 0 : Math.Round((tot - idle) / tot * 100.0, 0);
@@ -320,8 +356,11 @@ namespace F__BUILD__ {
       if (string.IsNullOrEmpty(path)) return false;   // a protected system process, not suspicious by itself
       string p = path.ToLowerInvariant();
       foreach (var s in Shady) if (p.Contains(s)) return true;
-      return string.IsNullOrEmpty(company) && !p.StartsWith("c:\\windows\\") && p.IndexOf("\\program files") < 0;   // unsigned and not a normal install
+      if (!string.IsNullOrEmpty(company)) return false;
+      foreach (var ok in Normal) if (p.Contains(ok)) return false;
+      return true;   // no publisher and not in a normal install place (ponytail: a name check, not Authenticode; WinVerifyTrust if it must be exact)
     }
+    static readonly string[] Normal = { "c:\\windows\\", "\\program files", "\\steamapps\\", "\\steamlibrary\\", "\\epic games\\", "\\riot games\\", "\\games\\", "\\windowsapps\\" };   // games often ship without a publisher name
 
     public static string Procs(int top, int sampleMs, bool all) {
       var cpu0 = new Dictionary<int, TimeSpan>(); var t0 = DateTime.UtcNow;
@@ -376,6 +415,11 @@ namespace F__BUILD__ {
     public static void Key() { key = true; }
     public static bool Running { get { return th != null && th.IsAlive && run; } }
 
+    static string Mons() {   // [[x,y,w,h,primary], ...] in the order the monitor numbers use
+      var sb = new StringBuilder("["); var scr = System.Windows.Forms.Screen.AllScreens;
+      for (int i = 0; i < scr.Length; i++) { var b = scr[i].Bounds; if (i > 0) sb.Append(','); sb.Append('[').Append(b.X).Append(',').Append(b.Y).Append(',').Append(b.Width).Append(',').Append(b.Height).Append(',').Append(scr[i].Primary ? 1 : 0).Append(']'); }
+      return sb.Append(']').ToString();
+    }
     static void Loop() { while (run) { try { Session(); } catch (Exception e) { Err = e.Message; } if (run) Thread.Sleep(1000); } }
 
     static ImageCodecInfo Jpg = Array.Find(ImageCodecInfo.GetImageEncoders(), c => c.MimeType == "image/jpeg");
@@ -409,6 +453,7 @@ namespace F__BUILD__ {
       rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ServicePoint.Expect100Continue = false;
       using (var st = rq.GetRequestStream()) {
         int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty;
+        try { Sys.Snap(10); } catch { } var lastSys = DateTime.UtcNow;   // primes the CPU counters
         while (run) {
           var t0 = DateTime.UtcNow;
           if (mon != curMon) {
@@ -457,7 +502,7 @@ namespace F__BUILD__ {
             }
             var tw0 = DateTime.UtcNow; int sent = 0;
             if (full_) {
-              var meta = Encoding.UTF8.GetBytes(string.Format(System.Globalization.CultureInfo.InvariantCulture, "{{\"w\":{0},\"h\":{1},\"ox\":{2},\"oy\":{3},\"sc\":{4}}}", fw, fh, area.Left, area.Top, sc));
+              var meta = Encoding.UTF8.GetBytes(string.Format(System.Globalization.CultureInfo.InvariantCulture, "{{\"w\":{0},\"h\":{1},\"ox\":{2},\"oy\":{3},\"sc\":{4},\"mon\":{5},\"mons\":{6}}}", fw, fh, area.Left, area.Top, sc, curMon, Mons()));
               var j = Jpeg(frame, q);
               using (var m = new MemoryStream()) { Put16(m, meta.Length); m.Write(meta, 0, meta.Length); m.Write(j, 0, j.Length); var b = m.ToArray(); Send(st, 'K', b); sent = b.Length; }
               key = false; lastKey = DateTime.UtcNow;
@@ -466,6 +511,7 @@ namespace F__BUILD__ {
             if (sent > 0) { if (wms > 250 && q > 30) q -= 10; else if (wms < 60 && q < 60) q += 5; }
             var tmp = pa; pa = ca; ca = tmp;
           }
+          if ((DateTime.UtcNow - lastSys).TotalMilliseconds >= 2000) { lastSys = DateTime.UtcNow; try { Send(st, 'S', Encoding.UTF8.GetBytes(Sys.Snap(10))); } catch (IOException) { throw; } catch { } }   // the live System panel
           var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(5, 66 - spent));
         }
       }

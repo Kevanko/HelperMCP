@@ -107,6 +107,7 @@ function liveFrame(code, s, fr) {
   const type = String.fromCharCode(fr[4]);
   const key = type === 'K' || (type === 'V' && (fr[5] & 1));
   if (type === 'C') s.lastC = fr;   // a new viewer needs the decoder settings before the next key frame
+  if (type === 'S') { s.lastS = fr; for (const lv of s.live || []) if (lv.res.writableLength < LIVE_BACKLOG) lv.res.write(fr); return; }
   for (const lv of s.live || []) {
     if (lv.res.writableLength > LIVE_BACKLOG) { lv.waitKey = true; wantKey(code, s); continue; }   // the viewer's link is slower than the picture
     if (lv.waitKey && !key && type !== 'C' && type !== 'P') continue;
@@ -683,6 +684,13 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 #plan li.done{color:var(--mut);text-decoration:line-through;text-decoration-color:rgba(127,174,143,.5)}#plan li.done:before{content:"\\2713"}
 #plan li.cur{color:var(--fg)}#plan li.cur:before{background:var(--c,var(--g));color:#00150a;box-shadow:0 0 12px var(--c,var(--g))}
 #plan:empty{display:none}
+#sys{border-top:1px solid var(--line);padding:0 .9rem .5rem}#sys[hidden]{display:none}
+.bar{height:6px;border-radius:3px;background:#0b2415;overflow:hidden;margin:.15rem 0 .4rem}.bar i{display:block;height:100%;background:var(--g);transition:width .5s}.bar i.hot{background:var(--hot)}
+#sg{display:flex;justify-content:space-between;color:var(--mut);font-size:12px}#sg b{color:var(--fg);font-weight:500}
+#sp{font-size:12px;max-height:30vh;overflow:auto}#sp div{display:grid;grid-template-columns:3.4rem 4.6rem 1fr auto;gap:.4rem;padding:1px 0;align-items:center}#sp div:hover{background:rgba(56,255,122,.06)}
+#sp span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#sp .w{color:var(--hot)}#sp .x{padding:0 .4rem;border-color:var(--line);color:var(--mut)}#sp .x:hover{color:var(--hot);border-color:var(--hot)}
+#mons{display:flex;gap:.3rem;align-items:center}#mons button{padding:.15rem .4rem;line-height:1.1;font-size:11px;display:flex;flex-direction:column;align-items:center;gap:1px}
+#mons button.on{border-color:var(--g);box-shadow:0 0 10px rgba(56,255,122,.25);color:var(--g)}#mons button u{display:block;border:1px solid currentColor;text-decoration:none;opacity:.8}
 #files{border-top:1px solid var(--line);padding:0 .9rem .6rem}#files[hidden]{display:none}
 #fbar{display:flex;gap:.35rem;margin-bottom:.35rem}#fbar input{flex:1;min-width:0;padding:.2rem .45rem;font-size:12px}#fbar button{padding:.2rem .55rem}
 #fl{max-height:34vh;overflow:auto;font-size:12px}#fl div{display:flex;gap:.6rem;padding:2px .3rem;border-radius:3px;cursor:pointer;white-space:nowrap}#fl div:hover{background:rgba(56,255,122,.08)}
@@ -696,10 +704,11 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 <div id=top><span id=dot></span><span id=st>…</span><span id=who>${esc(who)}</span>
-<select id=mon title=screen><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
+<div id=mons></div>
 <button id=zr title="1:1" style="display:none">1:1</button><button id=ctl hidden></button></div>
 <div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
 <aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
+<section id=sys hidden><h2 id=hSys style="padding-left:0"></h2><div id=sg></div><div class=bar><i id=bc></i></div><div class=bar><i id=bm></i></div><div id=sp></div></section>
 <section id=files hidden><h2 id=hFiles style="padding-left:0"></h2><div id=fbar><button id=fup title=up>..</button><input id=fp spellcheck=false><button id=fgo>&#8635;</button></div><div id=fl></div><div id=fmsg></div></section>
 <div id=log></div></aside></div>
 <div id=kb><label for=txt>$</label><input id=txt autocomplete=off><button id=send></button><button data-k=enter>Enter</button><button data-k=backspace>&#9003;</button><button data-k=tab>Tab</button><button data-k=esc>Esc</button><button data-k=left>&larr;</button><button data-k=up>&uarr;</button><button data-k=down>&darr;</button><button data-k=right>&rarr;</button>${android ? '<button data-k=back>Back</button><button data-k=home>Home</button><button data-k=recents>Recents</button>' : ''}</div>
@@ -710,7 +719,7 @@ $('hNote').textContent=L.note;$('note').dataset.empty=L.noNote;$('hPlan').textCo
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
 let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
-$('mon').onchange=e=>{mon=e.target.value;if(abort)abort.abort()};
+
 function status(t,cls){st.textContent=t;dot.className=cls||''}
 async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());
  if(r.status===410){ended=true;return}
@@ -728,8 +737,34 @@ const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
 setInterval(()=>{if(gotEver&&!noLive&&frames)status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);
 const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
 function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
+const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(1)+'G':n>=1048576?Math.round(n/1048576)+'M':Math.round(n/1024)+'K';
+function sysPanel(j){$('sys').hidden=false;$('hSys').textContent=ru?'Система':'System';
+ $('sg').innerHTML='<span>CPU <b>'+j.cpu+'%</b></span><span>RAM <b>'+j.mem+'%</b> ('+fmtB(j.ramTotal-j.ramFree)+' / '+fmtB(j.ramTotal)+')</span><span>'+j.n+'</span>';
+ const c=$('bc'),m=$('bm');c.style.width=j.cpu+'%';c.className=j.cpu>85?'hot':'';m.style.width=j.mem+'%';m.className=j.mem>90?'hot':'';
+ const sp=$('sp');sp.textContent='';
+ for(const r of j.p){const d=document.createElement('div'),a=document.createElement('span'),b=document.createElement('span'),n=document.createElement('span');
+  a.textContent=r[2].toFixed(1)+'%';b.textContent=fmtB(r[3]);n.textContent=r[1]+(r[4]?'  ['+r[4]+']':'');n.title=r[5]||'';if(r[6]==='!')n.className='w',n.textContent='! '+n.textContent;
+  d.append(a,b,n);
+  if(CTL&&r[0]>4){const x=document.createElement('button');x.className='x';x.textContent='\u00d7';x.title=ru?'завершить процесс':'end process';
+   x.onclick=async()=>{if(!confirm((ru?'Завершить ':'End ')+r[1]+' (pid '+r[0]+')?'))return;x.disabled=true;
+    try{const q=await fetch(base+'/kill',{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify({pid:r[0]})});if(!q.ok)throw 0;d.style.opacity=.3}catch(e){x.disabled=false}};d.append(x)}
+  else d.append(document.createElement('span'));
+  sp.append(d)}}
+let mapKey='';
+function monMap(ms,cur){const k=JSON.stringify(ms)+cur;if(k===mapKey)return;mapKey=k;const box=$('mons');box.textContent='';
+ const mk=(v,label,el)=>{const b=document.createElement('button');b.className=String(v)===String(cur)?'on':'';b.title=label;b.append(el);const t=document.createElement('span');t.textContent=label;b.append(t);b.onclick=()=>pick(v);box.append(b)};
+ const minx=Math.min(...ms.map(x=>x[0])),miny=Math.min(...ms.map(x=>x[1])),W=Math.max(...ms.map(x=>x[0]+x[2]))-minx,H=Math.max(...ms.map(x=>x[1]+x[3]))-miny,s=34/Math.max(W,H*1.6);
+ const all=document.createElement('u');all.style.cssText='position:relative;width:'+Math.round(W*s)+'px;height:'+Math.round(H*s)+'px';
+ ms.forEach(x=>{const u=document.createElement('u');u.style.cssText='position:absolute;left:'+Math.round((x[0]-minx)*s)+'px;top:'+Math.round((x[1]-miny)*s)+'px;width:'+Math.max(4,Math.round(x[2]*s))+'px;height:'+Math.max(4,Math.round(x[3]*s))+'px';all.append(u)});
+ mk(-1,ru?'все':'all',all);
+ ms.forEach((x,i)=>{const u=document.createElement('u');u.style.cssText='width:'+Math.max(10,Math.round(x[2]*s*1.6))+'px;height:'+Math.max(7,Math.round(x[3]*s*1.6))+'px';mk(i,(i+1)+' '+x[2]+'\u00d7'+x[3]+(x[4]?'\u2605':''),u)})}
+function pick(v){mon=v<0?'':String(v);if(abort)abort.abort()}
+addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||control)return;if(!/^[0-9]$/.test(e.key))return;
+ const n=+e.key,ms=window.__mons||[];if(n===0)pick(-1);else if(n<=ms.length)pick(n-1)});
 function handle(ty,p){const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
+ if(ty==='S'){try{sysPanel(JSON.parse(td.decode(p)))}catch(_){}return}
  if(ty==='K'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n))),img=p.subarray(2+n);
+  if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
   chain=chain.then(async()=>{const b=await jpeg(img);size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);b.close();frames++}).catch(()=>{})}
  else if(ty==='T'){const c=dv.getUint16(0),parts=[];let o=2;
   for(let i=0;i<c;i++){const n=dv.getUint32(o+4);parts.push([dv.getUint16(o),dv.getUint16(o+2),p.subarray(o+8,o+8+n)]);o+=8+n}
@@ -871,7 +906,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -885,6 +920,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' });
         const lv = { res, waitKey: true }; (s.live ??= new Set()).add(lv);
         if (s.lastC) res.write(s.lastC);
+        if (s.lastS) res.write(s.lastS);
         s.keyAt = 0; wantKey(v.code, s);
         const ping = setInterval(() => res.write(Buffer.from([0, 0, 0, 0, 80])), 15_000);   // keeps proxies from closing a quiet stream
         req.on('close', () => {
@@ -894,6 +930,13 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         return;
       }
       if (vw[2] === '/state') return json(res, 200, { plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
+      if (vw[2] === '/kill') {   // end a process from the System panel (control link only)
+        if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        const b = JSON.parse((await body(req, 2000)) || '{}'), pid = Math.round(Number(b.pid));
+        if (!Number.isInteger(pid) || pid < 5) return json(res, 400, { error: 'bad pid' });
+        try { const d = await call(v.code, 'util', { op: 'kill', name: String(pid) }, 30_000, { human: true }); s.events.push({ t: Date.now(), type: 'killed', data: { pid, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'killed' }); }
+        catch (e) { return json(res, 503, { error: e.message }); }
+      }
       if (vw[2] === '/ls' || vw[2] === '/get' || vw[2] === '/upload') {   // files: browse, download, drop a file onto the PC (control link only)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         try {

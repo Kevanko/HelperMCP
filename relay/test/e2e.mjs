@@ -255,6 +255,13 @@ assert.ok(Buffer.from(await (await fetch(gj.text.split(' ')[0])).arrayBuffer()).
 const uj = await (await fetch(vurl + '/upload?name=' + encodeURIComponent('от оператора.txt') + '&dir=' + encodeURIComponent(tmp), { method: 'POST', headers: ctl, body: 'hello from the viewer' })).json();
 assert.ok(uj.path && fs.readFileSync(uj.path, 'utf8') === 'hello from the viewer', 'upload lands on the PC: ' + JSON.stringify(uj));
 assert.match((await tool('sysinfo', { session: code })).content.map((c) => c.text).join(' '), /The operator put these files on the remote PC/); console.log('viewer files ok');
+const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 60000)']); kids.push(victim);
+await new Promise((x) => setTimeout(x, 400));
+assert.equal((await fetch(vurl + '/kill', { method: 'POST', body: JSON.stringify({ pid: victim.pid }) })).status, 403, 'view-only link cannot end processes');
+const kj = await fetch(vurl + '/kill', { method: 'POST', headers: { ...ctl, 'content-type': 'application/json' }, body: JSON.stringify({ pid: victim.pid }) });
+assert.equal(kj.status, 200, 'control link ends a process: ' + await kj.text());
+await new Promise((x) => setTimeout(x, 800));
+assert.throws(() => process.kill(victim.pid, 0), /ESRCH|kill/, 'the process is gone'); console.log('viewer kill ok');
 
 // stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)
 const pidFile = path.join(tmp, 'grandchild.pid');
@@ -312,12 +319,15 @@ if (process.env.GUI) {
   while (Date.now() - t0 < 9000) {
     const { value, done } = await rd.read(); if (done) break;
     lbuf = Buffer.concat([lbuf, Buffer.from(value)]);
-    while (lbuf.length >= 5) { const n = lbuf.readUInt32BE(0); if (lbuf.length < 5 + n) break; seen.push({ ty: String.fromCharCode(lbuf[4]), n, t: Date.now() - t0 }); lbuf = lbuf.subarray(5 + n); }
+    while (lbuf.length >= 5) { const n = lbuf.readUInt32BE(0); if (lbuf.length < 5 + n) break; seen.push({ ty: String.fromCharCode(lbuf[4]), n, t: Date.now() - t0 }); if (lbuf[4] === 83 && !globalThis.__snap) globalThis.__snap = JSON.parse(lbuf.subarray(5, 5 + n).toString('utf8')); lbuf = lbuf.subarray(5 + n); }
   }
   ac.abort(); await mover;
   const firstK = seen.find((f) => f.ty === 'K')?.t, tiles = seen.filter((f) => f.ty === 'T');
   assert.ok(firstK !== undefined && firstK < 3000, 'a full picture arrives within 3 s: ' + JSON.stringify(seen.slice(0, 5)));
   assert.ok(tiles.length >= 3, 'changed tiles stream while the pointer moves: ' + JSON.stringify(seen.slice(0, 20)));
+  const snap = globalThis.__snap; assert.ok(snap && snap.p.length && snap.p.every((r) => r.length === 7 && typeof r[1] === 'string' && typeof r[2] === 'number' && typeof r[3] === 'number' && (r[6] === '' || r[6] === '!')), 'System snapshot rows are [pid, name, cpu, mem, publisher, path, flag]: ' + JSON.stringify(snap?.p?.[0]));
+  assert.ok(snap.mem >= 0 && snap.ramTotal > 0 && snap.n > 0, 'snapshot totals');
+  assert.ok(seen.some((f) => f.ty === 'S'), 'the live System panel snapshot arrives with the stream: ' + JSON.stringify(seen.map((f) => f.ty).join('')));
   console.log(`live stream ok (first picture after ${firstK} ms, ${seen.filter((f) => f.ty === 'K').length} full + ${tiles.length} tile frames, ${Math.round(seen.reduce((a, f) => a + f.n, 0) / 1024)} KB in 9 s)`);
 }
 

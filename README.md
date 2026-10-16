@@ -59,6 +59,7 @@ They open it, run the line for their system and send you the code. Tell your AI:
 | `helpermcp config` | change domain / IP / port step by step |
 | `helpermcp key` | new operator key |
 | `helpermcp update` | update to the latest version |
+| `helpermcp admin` / `admin reset` | the admin panel link and login; a new password |
 | `helpermcp report [days]` | what the AI did and where it failed: errors grouped by cause with the call to replay, slow calls, repeated sequences, outages and route switches |
 | `helpermcp logs` / `restart` | logs, restart |
 
@@ -75,6 +76,10 @@ They open it, run the line for their system and send you the code. Tell your AI:
 - **They stay in charge.** By default every action asks `Y / A(lways) / N`. **Esc** pauses or ends the session.
 - **It survives real life.** Lost internet, VPN switch, reboot: the session comes back with the same code.
 
+## The live view: System and Files
+
+On a control link the top bar has **System** and **Files**. System: every process (CPU, memory, publisher, path; click one for its path, command line, parent chain, signature, SHA-256, autostart entries and connections, end it, open its folder, check the hash on VirusTotal), services (start / stop / restart), startup (Run keys, startup folders, logon / boot tasks, Winlogon / IFEO / AppInit tricks, flagged when the file is missing or in a temp folder), performance (CPU and every core, RAM, commit, disk and network throughput), every disk, every network adapter with a per-adapter relay test, a health check (update and Store services, policies, activation, Defender, firewall, pending reboot, hosts, proxy, devices) and every custom policy with what it does. Files: drives, preview without downloading (text, hex, picture, zip contents), copy / cut / paste, new folder or file, rename, delete (Recycle Bin), upload by button or drop, download, search by name or text. The same data is one call for the AI: `system {sections:[...]}`, `fsop`.
+
 ## What your AI gets
 
 - **Eyes and hands:** a live stream of the screen, screenshots, mouse, keyboard, commands.
@@ -86,6 +91,12 @@ They open it, run the line for their system and send you the code. Tell your AI:
 - **Long jobs:** installs and renders don't time out, the AI collects the result later.
 
 The AI opens a **live view** for you right away: a view-only link to share and a control link to click, type and take over, then hand back.
+
+## Admin panel
+
+`https://your-server/admin` lists every connected session (device, state, mode, last seen, IP, what the AI did last), opens any of them in the live viewer with the control link, ends a session, changes the glow colour and the task text, and shows the action report. The install script prints the link, the login and a generated password **once** (the password is stored only as a scrypt hash); `helpermcp admin` shows the link and login again, `helpermcp admin reset` makes a new password.
+
+It is hardened: cookie sessions (HttpOnly, SameSite=Strict, Secure over HTTPS, 30 min idle / 8 h absolute), a CSRF header on every change plus an Origin check, five wrong passwords lock the address for 15 minutes (the same work is done for a wrong login as for a wrong password), a strict CSP that allows scripts only from the server itself, no operator key anywhere in the page, every admin action in the action log. Put the server behind a domain with HTTPS (`helpermcp domain <name>`) before using it over the internet; `ADMIN_DISABLE=1` switches the panel off.
 
 ## A link that holds
 

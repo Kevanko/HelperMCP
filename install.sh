@@ -102,7 +102,7 @@ DIR="$DIR"
 cd "\$DIR" || exit 1
 tty=-T; [ -t 1 ] && tty=""
 case "\${1:-status}" in
-  status|panel|connect|link|report|help|-h|--help) [ "\${1:-}" = -h ] || [ "\${1:-}" = --help ] && set -- help
+  status|panel|connect|link|report|admin|help|-h|--help) [ "\${1:-}" = -h ] || [ "\${1:-}" = --help ] && set -- help
     exec docker compose exec \$tty -e HM_LANG="\${LC_ALL:-\${LANG:-}}" helpermcp node relay/cli.mjs "\${@:-status}" ;;
   domain) [ -n "\${2:-}" ] || { echo "usage: helpermcp domain help.example.com   (to drop the domain: helpermcp config)"; exit 1; }
     exec bash "\$DIR/install.sh" --reconfigure --yes --domain "\$2" ;;
@@ -119,6 +119,7 @@ chmod 755 "$BIN"
 echo
 echo "${G}================ HelperMCP ================${Z}"
 docker compose exec -T -e HM_LANG="${LC_ALL:-${LANG:-}}" helpermcp node relay/cli.mjs connect || true
+docker compose exec -T -e HM_LANG="${LC_ALL:-${LANG:-}}" helpermcp node relay/cli.mjs admin --install || true
 echo
 say "${M}Панель:${Z} ${G}helpermcp${Z}   ${M}все команды:${Z} ${G}helpermcp help${Z}   ${M}ссылка для друга:${Z} ${G}helpermcp link${Z}   ${M}домен:${Z} ${G}helpermcp domain help.example.com${Z}"     "${M}Panel:${Z} ${G}helpermcp${Z}   ${M}all commands:${Z} ${G}helpermcp help${Z}   ${M}friend link:${Z} ${G}helpermcp link${Z}   ${M}domain:${Z} ${G}helpermcp domain help.example.com${Z}"
 echo "${G}===========================================${Z}"

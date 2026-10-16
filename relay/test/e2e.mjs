@@ -16,10 +16,11 @@ const kids = [];
 const stop = () => kids.forEach((k) => k.kill());
 process.on('exit', stop);
 
-const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`), ACT = path.join(os.tmpdir(), `hm-actions-${PORT}.jsonl`);
+const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`), ACT = path.join(os.tmpdir(), `hm-actions-${PORT}.jsonl`), ADMIN_DIR = path.join(os.tmpdir(), `hm-admin-${PORT}`);
+fs.rmSync(ADMIN_DIR, { recursive: true, force: true });
 fs.rmSync(STATE, { force: true }); fs.rmSync(ACT, { force: true });
 const startRelay = async () => {
-  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', TEST_FAKE_LATENCY_MS: process.env.GUI ? '2500' : '0', STATE_FILE: STATE, ACT_FILE: ACT }, stdio: 'inherit' });
+  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', TEST_FAKE_LATENCY_MS: process.env.GUI ? '2500' : '0', STATE_FILE: STATE, ACT_FILE: ACT, ADMIN_DIR }, stdio: 'inherit' });
   kids.push(r);
   for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((x) => setTimeout(x, 100)); }
   return r;
@@ -315,6 +316,46 @@ if (useps) {   // Windows collectors: services, startup, performance, policies, 
 }
 else { const t = txt(await tool('system', { session: code, sections: ['health', 'perf', 'startup'] })); assert.match(t, /== health check/); assert.match(t, /== performance/); assert.match(t, /== startup/); }
 console.log('file operations + previews + system tabs ok');
+// a person sets the glow colour and the task text from the viewer
+assert.equal((await fetch(vurl + '/look', { method: 'POST', body: '{"color":"#ff0000"}' })).status, 403, 'view-only cannot change the look');
+assert.equal((await fetch(vurl + '/look', { method: 'POST', headers: { ...ctl, 'content-type': 'application/json' }, body: '{"color":"red"}' })).status, 400, 'a bad colour is refused');
+assert.equal((await fetch(vurl + '/look', { method: 'POST', headers: { ...ctl, 'content-type': 'application/json' }, body: JSON.stringify({ color: '#ff8800', note: 'Checking the update service' }) })).status, 200);
+const lst = await (await fetch(vurl + '/state')).json(); assert.equal(lst.look.color, '#ff8800'); assert.equal(lst.look.note, 'Checking the update service'); assert.equal(lst.color, '#ff8800', 'the viewer follows the picked colour');
+console.log('look controls ok');
+
+
+// the admin panel: login, cookie session, CSRF, lockout, sessions list, open a viewer, end, password change
+{
+  const { createAdmin } = await import(pathToFileURL(path.join(root, 'relay/admin.mjs')).href);
+  const A = (p, o) => fetch(BASE + '/admin/api/' + p, o), page2 = await fetch(BASE + '/admin');
+  assert.equal(page2.status, 200); const csp = page2.headers.get('content-security-policy'); assert.ok(csp.includes("script-src 'self'") && !csp.includes('unsafe-inline'), 'the admin page allows no inline script');
+  assert.equal((await fetch(BASE + '/admin/assets/admin.js')).status, 200);
+  assert.equal((await A('sessions')).status, 401, 'no cookie, no data');
+  assert.equal((await A('login', { method: 'POST', body: '{"user":"x","pass":"y"}' })).status, 503, 'no admin account yet');
+  const cred = createAdmin(ADMIN_DIR);
+  const login = (u, pw) => A('login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: u, pass: pw }) });
+  assert.equal((await login(cred.user, 'wrong-password')).status, 401);
+  assert.equal((await login('nobody', cred.password)).status, 401);
+  const ok = await login(cred.user, cred.password); assert.equal(ok.status, 200);
+  const ck = /hm_admin=[0-9a-f]{64}/.exec(ok.headers.get('set-cookie') || '')?.[0]; assert.ok(ck && /HttpOnly/.test(ok.headers.get('set-cookie')) && /SameSite=Strict/.test(ok.headers.get('set-cookie')), 'cookie is HttpOnly + SameSite=Strict');
+  const { csrf } = await ok.json(), H = { cookie: ck, 'x-csrf': csrf, 'content-type': 'application/json' };
+  const list = await (await A('sessions', { headers: { cookie: ck } })).json(); assert.ok(list.some((x) => x.code === code && x.online), 'the session list shows the connected PC');
+  assert.equal((await A('open', { method: 'POST', headers: { cookie: ck, 'content-type': 'application/json' }, body: JSON.stringify({ code }) })).status, 403, 'a POST without the CSRF header is refused');
+  assert.equal((await A('open', { method: 'POST', headers: { ...H, origin: 'http://evil.example' }, body: JSON.stringify({ code }) })).status, 403, 'a foreign Origin is refused');
+  const op = await (await A('open', { method: 'POST', headers: H, body: JSON.stringify({ code }) })).json(); assert.ok(/\/v\/[0-9a-f]+#c=[0-9a-f]+$/.test(op.control), 'open gives a control link');
+  assert.match((await (await A('report?days=1', { headers: { cookie: ck } })).json()).text, /calls|Nothing in the log/);
+  assert.equal((await A('password', { method: 'POST', headers: H, body: JSON.stringify({ old: 'nope', new: 'a-long-new-password' }) })).status, 401);
+  assert.equal((await A('password', { method: 'POST', headers: H, body: JSON.stringify({ old: cred.password, new: 'a-long-new-password' }) })).status, 200);
+  assert.equal((await A('sessions', { headers: { cookie: ck } })).status, 401, 'changing the password signs everyone out');
+  const ok2 = await login(cred.user, 'a-long-new-password'); assert.equal(ok2.status, 200);
+  const ck2 = /hm_admin=[0-9a-f]{64}/.exec(ok2.headers.get('set-cookie'))[0]; assert.equal((await A('logout', { method: 'POST', headers: { cookie: ck2, 'x-csrf': (await ok2.json()).csrf } })).status, 200);
+  assert.equal((await A('sessions', { headers: { cookie: ck2 } })).status, 401, 'after sign-out the cookie is dead');
+  for (let i = 0; i < 5; i++) await login(cred.user, 'bad-' + i);
+  assert.equal((await login(cred.user, 'a-long-new-password')).status, 429, 'five wrong passwords lock the address, even for the right one');
+  const au = fs.readFileSync(ACT, 'utf8'); assert.ok(au.includes('admin_login_failed') && au.includes('admin_open') && !au.includes(cred.password) && !au.includes('a-long-new-password'), 'admin actions are logged, passwords never');
+  console.log('admin panel ok');
+}
+
 
 
 // stopping an MCP server must kill the whole process tree (uvx/npx run the real server as a grandchild)

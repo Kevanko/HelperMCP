@@ -85,6 +85,8 @@ function helpText() {
     row('connect codex-win', 'команда для Codex (Windows)', 'the Codex command (Windows)'),
     row('connect other', 'URL и заголовок для любого клиента', 'URL and header for any client'),
     row('connect prompt', 'текст, чтобы ИИ подключился сам', 'a prompt so your AI connects itself'),
+    row('admin', 'веб-панель администратора: ссылка, логин, пароль', 'the web admin panel: link, login, password'),
+    row('admin reset', 'новый пароль администратора', 'a new admin password'),
     row('report [days]', 'журнал действий ИИ: ошибки, медленные вызовы, повторы, сбои сети', 'the AI action log: errors, slow calls, repeats, network failures'),
     row('domain <name>', 'задать домен, HTTPS включится сам', 'set a domain, HTTPS turns on by itself'),
     row('config', 'сменить домен / IP / порт по шагам', 'change domain / IP / port step by step'),
@@ -129,6 +131,19 @@ function aiPrompt() {
 
 const cmd = process.argv[2] || 'status';
 if (cmd === 'help') { console.log(helpText()); process.exit(0); }
+if (cmd === 'admin') {   // admin [reset|--install]: the login for the web panel is made here and shown once
+  const { createAdmin, readAdmin } = await import('./admin.mjs'), nodePath = await import('node:path');
+  const dir = process.env.ADMIN_DIR || (process.env.STATE_FILE ? nodePath.dirname(process.env.STATE_FILE) : '/data'), one = readAdmin(dir), arg = process.argv[3];
+  let st = null; try { st = await get('/admin/status'); } catch { /* server not answering: print the path anyway */ }
+  const base = (PUBLIC || (st && st.public_url) || `http${TLS ? 's' : ''}://localhost:${PORT}`).replace(/\/$/, '');
+  const line = (k, v) => M(pad(k, 10)) + v;
+  if (!one || arg === 'reset') {
+    const c = createAdmin(dir, !!one && arg !== 'reset');
+    console.log([G(t('Админ-панель', 'Admin panel')) + '   ' + base + '/admin', line(t('логин', 'login'), G(c.user)), line(t('пароль', 'password'), G(c.password)),
+      O(t('Пароль показан один раз и нигде не хранится в открытом виде. Забыли: helpermcp admin reset', 'Shown once and never stored in clear. Lost it: helpermcp admin reset'))].join('\n'));
+  } else if (arg !== '--install') console.log([G(t('Админ-панель', 'Admin panel')) + '   ' + base + '/admin', line(t('логин', 'login'), one.user), D(t('Пароль скрыт. Новый: helpermcp admin reset', 'The password is hidden. A new one: helpermcp admin reset'))].join('\n'));
+  process.exit(0);
+}
 if (cmd === 'report') {
   const { load, report } = await import('./report.mjs'); const f = process.env.ACT_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/[^/\\]*$/, 'actions.jsonl') : '/data/actions.jsonl'), days = Number(process.argv[3] || 7), misses = [];
   try { for (const l of (await import('node:fs')).readFileSync(f.replace(/actions\.jsonl$/, 'misses.jsonl'), 'utf8').split('\n')) if (l) misses.push(JSON.parse(l)); } catch { /* none */ }

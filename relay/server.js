@@ -7,6 +7,8 @@ import QRCode from 'qrcode';
 import zlib from 'node:zlib';
 import os from 'node:os';
 import { pipeline } from 'node:stream/promises';
+import { makeAdminHandler } from './admin.mjs';
+import { load as loadActs, report as buildReport } from './report.mjs';
 import { Transform } from 'node:stream';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,7 +110,15 @@ function evPush(s, ev) { s.events.push(ev); actEvent(s, ev); }
 function lookOf(s) {
   const st = s.plan && s.plan.stages[s.plan.current];
   const note = [st ? `${s.plan.current + 1}/${s.plan.stages.length} ${st.title}` : '', s.note || ''].filter(Boolean).join(': ');
-  return { color: (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };
+  return { color: s.lookForce || (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };   // a colour picked by a person wins over the plan's
+}
+// a person changes the glow colour or the task text from the viewer / the admin panel
+async function humanLook(code, color, note) {
+  const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
+  if (color !== undefined && color !== '') { if (!/^#[0-9a-f]{6}$/i.test(color)) throw new Error('bad colour (use #RRGGBB)'); s.lookForce = color.toLowerCase(); }
+  if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').slice(0, 90); s.lastNoteAt = 0; }
+  evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', by: 'operator' } }); save();
+  return pushLook(String(code).toUpperCase(), s);
 }
 async function pushLook(code, s) {
   const l = lookOf(s);
@@ -163,10 +173,10 @@ async function storeFile(req, rawName, code) {
   return { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n, name };
 }
 
-function makeViewer(c) {
+function makeViewer(c, base = lastBase) {
   const token = crypto.randomBytes(18).toString('hex'), ctl = crypto.randomBytes(12).toString('hex');
   viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
-  return { watch: `${lastBase}/v/${token}`, control: `${lastBase}/v/${token}#c=${ctl}` };
+  return { watch: `${base}/v/${token}`, control: `${base}/v/${token}#c=${ctl}` };
 }
 const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
@@ -901,13 +911,27 @@ const byToken = (req) => {
   return [];
 };
 
+// ---- the admin panel (/admin): see admin.mjs
+const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
+const adminHandle = makeAdminHandler({
+  look: humanLook, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
+  status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => Date.now() - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size } }),
+  report: (days) => {
+    const f = ACT_FILE; if (!f) return 'The action log is off (no data directory).';
+    const misses = []; try { for (const l of fs.readFileSync(MISS_FILE, 'utf8').split(String.fromCharCode(10))) if (l) misses.push(JSON.parse(l)); } catch { /* none */ }
+    const ev = loadActs(f, days); return ev.length ? buildReport(ev, { misses }) : 'Nothing in the log for this period yet.';
+  },
+});
 async function handler(req, res) {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
   try {
     res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('referrer-policy', 'no-referrer'); res.setHeader('strict-transport-security', 'max-age=31536000');
     res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; connect-src 'self'; frame-ancestors 'none'");
+    if (await adminHandle(req, res, url)) return;
     if (p === '/health') return text(res, 200, 'ok');
+    if (p === '/favicon.ico') { res.writeHead(204); return res.end(); }
     if (p === '/assets/panels.js' || p === '/assets/panels.css') {   // the viewer's System / Files drawer
       const f = path.join(here, p.slice(8));
       try { res.writeHead(200, { 'content-type': p.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' }); return res.end(fs.readFileSync(f)); }
@@ -951,7 +975,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act|\/look)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -974,7 +998,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         });
         return;
       }
-      if (vw[2] === '/state') return json(res, 200, { plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
+      if (vw[2] === '/state') return json(res, 200, { look: { color: s.lookForce || s.lookColor || '', note: s.note || '' }, plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
       if (vw[2] === '/kill') {   // end a process from the System panel (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}'), pid = Math.round(Number(b.pid));
@@ -1009,6 +1033,11 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
           if (act === 'system') { const secs = (Array.isArray(b.sections) ? b.sections : []).filter((x) => /^(overview|disks|processes|network|services|apps|startup|health|policy|perf|connections|drivers|events)$/.test(x)).slice(0, 4); const d = await call(v.code, 'system', { sections: secs.length ? secs : ['overview'], top: 30 }, 90_000, { human: true }); return json(res, 200, { text: d?.text || '' }); }
           return json(res, 400, { error: 'unknown action' });
         } catch (e) { return json(res, 503, { error: e.message }); }
+      }
+      if (vw[2] === '/look') {   // glow colour and the task text (control link only)
+        if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
+        const b = JSON.parse((await body(req, 2000)) || '{}');
+        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note) }); } catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (vw[2] === '/sysdata') {   // the System tabs: JSON from the agent (control link only: command lines and startup entries are not for view-only guests)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });

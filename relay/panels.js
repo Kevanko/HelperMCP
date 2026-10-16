@@ -370,6 +370,13 @@
     cfg = c; if (!cfg.CTL) return;
     try { const s = await (await fetch(cfg.base + '/state')).json(); os = s.os || ''; } catch (_) { /* default: Windows */ }
     win = /windows/i.test(os) || !os;
+    // the glow colour and the task text, set by a person (the helper's own note stays editable by the helper)
+    try {
+      const lk = (await (await fetch(cfg.base + '/state')).json()).look || {}, col = el('input', { type: 'color', value: lk.color || '#38ff7a', title: T('glow colour', 'цвет свечения'), style: 'width:2.2rem;padding:0;height:1.8rem' }), txt = el('input', { type: 'text', value: lk.note || '', maxlength: 90, placeholder: T('task text shown on the screen', 'текст задачи на экране'), style: 'flex:1;min-width:0' }), st = el('span', { class: 'mut' });
+      const apply = async () => { st.textContent = '…'; try { await post('/look', { color: col.value, note: txt.value }); st.textContent = T('applied', 'применено'); } catch (e) { st.textContent = e.message; } };
+      txt.addEventListener('keydown', (e) => { if (e.key === 'Enter') apply(); });
+      const h = $('hNote'); if (h) h.after(el('div', { style: 'display:flex;gap:.35rem;align-items:center;padding:0 .9rem .5rem' }, col, txt, el('button', { text: T('Apply', 'Применить'), onclick: apply }), st));
+    } catch (_) { /* optional */ }
     drawer = el('div', { id: 'dr', hidden: true }); tabsEl = el('div', { id: 'drt' }); body = el('div', { id: 'drb' });
     drawer.append(el('div', { id: 'drh' }, tabsEl, el('button', { text: '✕', title: 'Esc', onclick: P.close })), body); document.body.append(drawer); buildTabs();
     const top = $('top'), mk = (id, label, tab) => { const x = el('button', { id, text: label, onclick: () => { if (!drawer.hidden && P.tab === tab) P.close(); else P.open(tab); } }); top.insertBefore(x, $('zr')); };

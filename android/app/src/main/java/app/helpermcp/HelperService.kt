@@ -124,7 +124,7 @@ class HelperService : AccessibilityService() {
 
     private fun register(relay: String, resume: String?): JSONObject {
         val body = JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("host", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("user", "android").put("mode", if (askMode) "ask" else "full").put("persist", true)   // a network loss must not end the session: the relay keeps it and the helper is told to wait_online, not to stop
+            .put("user", "android").put("mode", if (askMode) "confirm" else "auto").put("persist", true)   // a network loss must not end the session: the relay keeps it and the helper is told to wait_online, not to stop; no "unattended" mode here: Android always needs a fresh MediaProjection consent tap
         if (resume != null) body.put("resume", resume)
         val (st, data) = Net.req(relay, "POST", "/a/register", null, body.toString().toByteArray(), timeoutMs = 20000)
         if (st != 200) throw RuntimeException("register: HTTP $st")

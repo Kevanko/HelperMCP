@@ -36,6 +36,7 @@ if (!OPERATOR_KEY) {
 }
 
 const sessions = new Map(); // code -> session
+const devices = new Map(); // sha(device_id) -> code: a permanent identity per install, like an AnyDesk/RustDesk ID
 const STATE_FILE = process.env.STATE_FILE || '';   // e.g. /data/state.json; empty = keep everything in memory only
 const sha = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');   // agent tokens are stored hashed
 // the state file is encrypted (AES-256-GCM, key derived from OPERATOR_KEY): a copy of data/ alone reveals nothing, and it only holds live sessions
@@ -55,6 +56,7 @@ function save() {
       const out = {
         sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
+        devices: [...devices].map(([dh, code]) => ({ dh, code })),
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
@@ -199,6 +201,8 @@ const newCode = () => {
   const s = [...b].map((x) => ALPHABET[x % ALPHABET.length]).join('');
   return `${s.slice(0, 4)}-${s.slice(4)}`;
 };
+// confirm: ask before every action. auto: no questions (the default). unattended: like auto, plus only the admin panel can end it; 'ask'/'full' are what old agents still send
+const normMode = (m) => (m === 'confirm' || m === 'unattended' ? m : m === 'ask' ? 'confirm' : 'auto');
 const safeEq = (a, b) => {
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
   return x.length === y.length && crypto.timingSafeEqual(x, y);
@@ -221,7 +225,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
   // in "ask" mode a human must click through prompts, give them time
-  if (s.mode === 'ask') timeoutMs += 120_000;
+  if (s.mode === 'confirm') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
   if (!args.view && tool !== 'stream') { // live-viewer frames are not "actions"
@@ -914,7 +918,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, call, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => Date.now() - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1134,16 +1138,19 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const old = want && sessions.get(want);
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
-        old.lastSeen = Date.now(); old.ip = ip; old.mode = info.mode === 'ask' ? 'ask' : 'full'; old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
+        old.lastSeen = Date.now(); old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true });
       }
+      const dh = info.device_id ? sha(String(info.device_id).slice(0, 300)) : null;   // a persistent per-install identity (like an AnyDesk/RustDesk ID): the same device always gets the same code back
       let code = want && !old ? want : null;   // same code after a server reset
+      if (!code && dh && devices.has(dh)) code = devices.get(dh);
       if (!code) do code = newCode(); while (sessions.has(code));
+      if (dh) { devices.set(dh, code); save(); }
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
-        th: sha(token), ip, mode: info.mode === 'ask' ? 'ask' : 'full', created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
+        th: sha(token), ip, mode: normMode(info.mode), created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
       });
       sessions.set(code, s); save();
@@ -1230,6 +1237,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     const st = JSON.parse(unseal(fs.readFileSync(STATE_FILE)));
     for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
+    for (const x of st.devices || []) devices.set(x.dh, x.code);
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }
 }

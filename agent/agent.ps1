@@ -865,7 +865,7 @@ using System; using System.Collections.Concurrent; using System.Threading; using
 namespace K__BUILD__ {
   public static class Keys {   // one reader for the keyboard: Esc opens a menu (pause / continue / end), the other keys answer the questions
     public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>();
-    public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk;      // Esc = the user confirmed the end
+    public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk, Unattended;      // Esc = the user confirmed the end; Unattended = mode 3, Esc pauses instead of opening the end menu
     public static string Relay, Token, MenuRun, MenuPaused, ConfirmEnd, StPaused, StRestore, Continuing;
     public static System.IO.StreamWriter Overlay;
     static string C(string code, string s) { return VT ? "\u001b[" + code + "m" + s + "\u001b[0m" : s; }
@@ -908,7 +908,7 @@ namespace K__BUILD__ {
       }
     }
     public static void Start() {
-      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) Menu(); else Q.Enqueue(k.Key); } } catch { } });
+      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) { if (Unattended) SetPaused(!Paused); else Menu(); } else Q.Enqueue(k.Key); } } catch { } });
       t.IsBackground = true; t.Start();
     }
   }
@@ -1157,6 +1157,15 @@ function Do-TaskDone($a) {
     $script:Phase = 'done'; Overlay-Send 'state done'
     if ($script:Persist) { try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }; Write-AgentLog 'task done: autostart removed (a reboot will not bring the console back)' }   # a finished job should not reappear after the PC restarts; a new command re-arms it (below)
     Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' }
+}
+function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
+    $m = Norm-Mode $a.mode; if (-not $m) { throw "unknown mode '$($a.mode)'" }
+    $script:Mode = $m; [K__BUILD__.Keys]::Unattended = ($m -eq 'unattended')
+    if ($script:Persist) { Save-Session $script:Code $script:Token $m; if (-not $env:HELPER_NO_AUTOSTART) { Install-Autostart } }
+    Write-AgentLog "mode changed to $m (by the administrator)"
+    Write-Host ('  ' + (T 'Администратор сменил режим на ' 'The administrator switched the mode to ') + $m) -ForegroundColor Yellow
+    Draw-Header $script:Code $false; Show-Status
+    @{ text = $m }
 }
 function Do-PressKey($a) {
     $kc = $null; try { $kc = [V__BUILD__.Caret]::Get() } catch { }; $kr = [V__BUILD__.Probe]::FgRect(); $am = Arrow-Mask; $pb = Probe-Take $kr (@(Caret-Mask $kc) + $am)
@@ -2359,7 +2368,7 @@ function Cleanup-Children {
 # screenshots never freeze behind a 5-minute install or render. Heavy ones wait their turn.
 $LightTools = 'screenshot', 'watch', 'sysinfo', 'list_dir', 'read_file', 'mcp_tools', 'tree', 'stream'
 $script:Deferred = New-Object System.Collections.ArrayList
-$script:Token = $null; $script:Mode = 'full'; $script:LastPump = [DateTime]::MinValue
+$script:Token = $null; $script:Mode = 'auto'; $script:Code = $null; $script:LastPump = [DateTime]::MinValue
 
 # ---- the friend's console: a pinned header with the session code (copied to the clipboard), Esc ends the session at any moment, a soft chime and a flashing window
 # when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
@@ -2434,6 +2443,16 @@ function Write-AgentLog($m) {
     } catch { }
 }
 function Get-BootTime { try { [int][DateTimeOffset]::new((Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeSeconds() } catch { 0 } }
+function Get-DeviceId {   # a permanent per-install identity (like an AnyDesk/RustDesk ID): the relay then hands back the same code every time, not a new random one
+    $f = Join-Path $StateDir 'device.json'
+    try { $d = Get-Content $f -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json; if ($d.id) { return $d.id } } catch { }
+    $id = ([guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N'))
+    try { [void](New-Item $StateDir -ItemType Directory -Force); @{ id = $id } | ConvertTo-Json | Set-Content $f -Encoding UTF8 } catch { }
+    return $id
+}
+function Norm-Mode($m) {   # confirm: ask before every action. auto: no questions (the default). unattended: like auto, plus Esc only pauses (the admin panel ends it); old agents said 'ask'/'full'
+    switch ($m) { 'confirm' { 'confirm' } 'auto' { 'auto' } 'unattended' { 'unattended' } 'ask' { 'confirm' } 'full' { 'auto' } default { $null } }
+}
 function Save-Session($code, $token, $mode) {   # the token is encrypted for this Windows user (DPAPI): the file is useless on another account or PC
     try {
         [void](New-Item $StateDir -ItemType Directory -Force)
@@ -2557,9 +2576,9 @@ function Draw-Header($code, $copied) {
         $k::Top('Remote Help'),
         $k::CodeRow('Session code', $code, $(if ($copied) { ([string][char]0x2713) + ' copied to the clipboard' } else { '' })),
         $k::Row('Tell this code to the person who is helping you.', '33'),
-        $k::Row(('Mode: ' + $(if ($script:Mode -eq 'full') { 'full access' } else { 'ask before every action' }) + '   |   Server: ' + $relayHost), '2;33'),
+        $k::Row(('Mode: ' + $(switch ($script:Mode) { 'unattended' { 'unattended access' } 'auto' { 'auto, no questions' } default { 'ask before every action' } }) + '   |   Server: ' + $relayHost), '2;33'),
         $k::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })),
-        $k::Row('Press Esc at any time to pause or end the session.', '33'),
+        $k::Row($(if ($script:Mode -eq 'unattended') { 'Press Esc at any time to pause. Only the administrator ends this session.' } else { 'Press Esc at any time to pause or end the session.' }), '33'),
         $k::Bottom())
     foreach ($l in $lines) { if ($script:VT) { [Console]::WriteLine($l) } else { Write-Host $l -ForegroundColor Yellow } }
     $script:HdrDrawn = $true
@@ -2639,7 +2658,7 @@ function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
-    $meta = $name -in 'look', 'hold', 'task_done', 'stream'
+    $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode'
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
@@ -2655,11 +2674,11 @@ function Process-Command($cmd) {
     try {
         Check-Esc
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
-        if ($script:Mode -eq 'ask' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
+        if ($script:Mode -eq 'confirm' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name
@@ -2697,7 +2716,7 @@ function Net-State($st) {
 }
 
 function Register-Agent($mode, $resume, $resumeToken, $note) {
-    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note }
+    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId) }
     if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
@@ -2705,15 +2724,15 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
 
 function Start-Helper {
     $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
-    $mode = $env:HELPER_MODE
-    if ($saved -and $saved.mode -in 'ask', 'full') { $mode = $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
-    elseif ($mode -ne 'ask' -and $mode -ne 'full') {
-        $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ' 'Mode: [1] ask before every action (recommended)  [2] full access')
-        $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
+    $mode = Norm-Mode $env:HELPER_MODE
+    if ($saved -and (Norm-Mode $saved.mode)) { $mode = Norm-Mode $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
+    elseif (-not $mode) {
+        $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов' 'Mode: [1] ask before every action (recommended)  [2] auto, no questions')
+        $mode = if ($ans.Trim() -eq '2') { 'auto' } else { 'confirm' }
     }
-    $script:Mode = $mode
+    $script:Mode = $mode; [K__BUILD__.Keys]::Unattended = ($mode -eq 'unattended')
     try { [F__BUILD__.Route]::Init($RELAY, $(try { (Get-Content (Join-Path $StateDir 'route.txt') -ErrorAction Stop | Select-Object -First 1) } catch { '' }), (Join-Path $StateDir 'route.block')); [Net.WebRequest]::DefaultWebProxy = [F__BUILD__.Route]::Proxy } catch { Write-AgentLog "route layer: $_" }   # the link to the relay survives a VPN, zapret or a dead default route
-    if ($saved) { $script:Mode = $mode = $saved.mode; $script:Persist = $true }
+    if ($saved) { $script:Mode = $mode = (Norm-Mode $saved.mode); [K__BUILD__.Keys]::Unattended = ($mode -eq 'unattended'); $script:Persist = $true }
     elseif ($env:HELPER_PERSIST -in '0', '1') { $script:Persist = ($env:HELPER_PERSIST -eq '1') }   # tests / an explicit opt-out only: otherwise the session is always kept (internet loss, reboots), like the mode question used to default
     else { $script:Persist = $true }
     $note = ''
@@ -2723,7 +2742,7 @@ function Start-Helper {
         try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
         catch { Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…')); Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
     }
-    $token = $r.token; $script:Token = $token; $code = $r.code
+    $token = $r.token; $script:Token = $token; $code = $script:Code = $r.code
     if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } elseif (-not $env:HELPER_NO_AUTOSTART) { try { $af = Join-Path $StateDir 'agent.ps1'; if (-not (Test-Path $af) -or ((Get-Date) - (Get-Item $af).LastWriteTime).TotalHours -gt 24) { Install-Autostart } } catch { } } }
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
@@ -2752,7 +2771,7 @@ function Start-Helper {
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); $script:FinalEnd = $true; return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
-                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
+                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }

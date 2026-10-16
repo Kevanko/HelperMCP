@@ -35,6 +35,9 @@
       case 'linux': filled('M8 .9c1 0 1.8.9 1.8 2.1 0 .8-.3 1.3-.6 1.8.9.6 1.7 1.6 2.1 2.8.5 1.5.3 2.9-.1 3.9.4.3.6.7.6 1.2 0 .9-1.4 1.5-2.4 1.9-1.2.5-2.6.6-3.6.3-1-.3-2.4-.4-3.6-.9-1-.4-2.4-1-2.4-1.9 0-.5.2-.9.6-1.2-.4-1-.6-2.4-.1-3.9.4-1.2 1.2-2.2 2.1-2.8-.3-.5-.6-1-.6-1.8C6.2 1.8 7 .9 8 .9z M6.3 7.3a.6.6 0 1 0 0-1.2.6.6 0 0 0 0 1.2z M9.7 7.3a.6.6 0 1 0 0-1.2.6.6 0 0 0 0 1.2z'); break;
       case 'android': filled('M4.3 6.6h7.4v4.6a1 1 0 0 1-1 1h-.3v1.6a.9.9 0 0 1-1.8 0v-1.6H7.8v1.6a.9.9 0 0 1-1.8 0v-1.6h-.3a1 1 0 0 1-1-1V6.6z M3 6.6a1 1 0 1 0-1.9 0M14.9 6.6a1 1 0 1 0-1.9 0 M5.6 5.8c0-1.6 1.1-2.8 2.4-2.8s2.4 1.2 2.4 2.8M6.2 2.3l-.7-1.1M9.8 2.3l.7-1.1 M6.5 5.6h.01 M9.5 5.6h.01'); break;
       case 'device': filled('M2 2.5h12a1 1 0 0 1 1 1V10a1 1 0 0 1-1 1H9.5v1.7h1.8a.6.6 0 0 1 0 1.1H4.7a.6.6 0 0 1 0-1.1h1.8V11H2a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z M2.5 3.5h11V9h-11z'); break;
+      case 'help': outline('M8 14.5a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13z M6.2 6.2a1.8 1.8 0 0 1 3.5.5c0 1.2-1.7 1.3-1.7 2.6 M8 11.4h.01'); break;
+      case 'check': outline('M8 14.5a6.5 6.5 0 1 0 0-13 6.5 6.5 0 0 0 0 13z M5.3 8.2l1.8 1.8 3.6-3.8'); break;
+      case 'shield': outline('M8 1.5 13.5 3.6V7.5c0 3.5-2.3 5.9-5.5 7-3.2-1.1-5.5-3.5-5.5-7V3.6z M5.6 8l1.8 1.8 3.1-3.5'); break;
     }
     return s;
   }
@@ -76,6 +79,18 @@
     const body = el('div', { class: 'look' }, el('div', { class: 'row' }, el('label', { text: 'Glow colour' }), el('div', { class: 'sws' }, sw, pick)), el('div', { class: 'row' }, el('label', { text: 'Task text' }), note, cnt), el('div', { class: 'row' }, el('label', { text: 'Preview' }), pv));
     return modal('Look of ' + s.code, body, { ok: 'Apply', onok: async () => { await call('look', { code: s.code, ...(picked ? { color: col } : {}), note: note.value }); return true; } });
   }
+  const MODES = [
+    ['confirm', 'help', 'Confirm', 'The console asks before every action.'],
+    ['auto', 'check', 'Auto', 'No questions. The console stays open; Esc pauses or ends the session. The default.'],
+    ['unattended', 'shield', 'Unattended', 'No questions, no console needed. Esc only pauses the AI; only the admin panel ends the session.'],
+  ];
+  async function modeBox(s) {
+    let picked = s.mode;
+    const opts = MODES.map(([v, ic, t, d]) => el('button', { type: 'button', class: 'modeopt' + (v === picked ? ' sel' : ''), onclick: () => { picked = v; show(); } }, icon(ic, 18), el('div', null, el('b', { text: t }), el('span', { text: d }))));
+    const show = () => opts.forEach((b, i) => b.classList.toggle('sel', MODES[i][0] === picked));
+    const body = el('div', { class: 'modes' }, opts);
+    return modal('Access mode for ' + s.code, body, { ok: 'Apply', onok: async () => { if (picked !== s.mode) await call('mode', { code: s.code, mode: picked }); return true; } });
+  }
 
   function login(msg) {
     clearInterval(timer);
@@ -108,7 +123,8 @@
               el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null),
               el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os }), s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool + (r.args ? ' ' + r.args.slice(0, 40) : '')).join(' · ') }) : null),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
-              el('td', { text: s.mode }), el('td', { text: ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
+              el('td', null, el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
+              el('td', { text: ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
               el('td', { class: 'ac' }, el('div', { class: 'acts' }, el('button', { class: 'go', title: 'open the live view', onclick: async () => { try { const j = await call('open', { code: s.code }); window.open(j.control, '_blank', 'noopener'); } catch (e) { guard(e); } } }, label('open', 'Open')),
                 el('button', { title: 'glow colour and task text', onclick: () => lookBox(s).catch(guard) }, label('eye', 'Look')),
                 el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End')))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));

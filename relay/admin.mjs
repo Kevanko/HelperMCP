@@ -106,6 +106,16 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
       try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b.color, b.note) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
     }
+    if (api === 'mode') {   // confirm / auto / unattended, pushed to the live agent; never reachable by the AI
+      const code = String(b.code || '').toUpperCase(), mode = String(b.mode || '');
+      if (!['confirm', 'auto', 'unattended'].includes(mode)) { send(res, 400, { error: 'unknown mode' }); return true; }
+      if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      try {
+        const r = await d.call(code, 'set_mode', { mode }, 15_000, { human: true });
+        const s = d.sessions.get(code); if (s) { s.mode = mode; d.save(); }   // the agent applied it; keep the relay's own record in step
+        d.audit('admin_mode', { code, mode }); send(res, 200, { text: r?.text || mode });
+      } catch (e) { send(res, 400, { error: e.message }); } return true;
+    }
     if (api === 'end') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
       d.drop(code, 'The session was ended by the administrator. STOP: do not retry, tell the operator.'); d.audit('admin_end', { code }); send(res, 200, {}); return true;

@@ -50,3 +50,9 @@ td.pv,th:first-child{width:1%;padding-right:.2rem}
 .tile img{width:100%;height:100%;object-fit:cover;display:block}
 .tile .badge{position:absolute;right:-2px;bottom:-2px;width:15px;height:15px;border-radius:4px;background:var(--bg);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--g)}
 .tile .ic-camera-off,.tile>.ic-android{width:20px;height:20px}
+/* access-mode picker */
+.modebtn{background:transparent;font-size:12px;padding:.3rem .6rem}
+.modes{display:flex;flex-direction:column;gap:.5rem}
+.modeopt{display:flex;align-items:center;gap:.7rem;text-align:left;width:100%;padding:.6rem .8rem;background:var(--panel2);border:1px solid var(--line)}
+.modeopt b{display:block;color:var(--fg);font-weight:600}.modeopt span{display:block;color:var(--mut);font-size:12px;margin-top:.1rem}
+.modeopt.sel{border-color:var(--g);box-shadow:0 0 10px rgba(56,255,122,.15)}.modeopt.sel b{color:var(--g)}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HelperMCP agent for Linux. Python 3 stdlib only (GTK via python3-gi is used if present, for the overlay).
 Run: python3 <(curl -fsSL RELAY/p)"""
-import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, math, random, locale, os, platform, queue, shutil, signal, socket
+import base64, ctypes, ctypes.util, getpass, gzip, hashlib, json, math, random, locale, os, platform, queue, shutil, signal, socket, uuid
 import re, subprocess, sys, tarfile, tempfile, threading, time
 import urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -25,8 +25,8 @@ T = {
     "persist_q": ("Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]: ", "Keep this session through internet loss and reboots (the code stays the same)? [Y/n]: "),
     "overlay_paused": ("Пауза", "Paused"), "resuming": ("Продолжаю прошлый сеанс", "Resuming the previous session"),
     "ready": ("Подключено. Жду действий.", "Connected. Waiting for actions."),
-    "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ: ",
-             "Mode: [1] ask before every action (recommended)  [2] full access: "),
+    "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов: ",
+             "Mode: [1] ask before every action (recommended)  [2] auto, no questions: "),
     "allow": ("Разрешить: ", "Allow: "),
     "keys": ("да", "yes"), "always": ("всегда", "always"), "no": ("нет", "no"), "endk": ("завершить сеанс", "end the session"), "until": ("до конца сеанса", "until the session ends"),
     "ok1": ("разрешено", "allowed"), "ok2": ("дальше без вопросов", "no more questions for"), "den": ("отклонено", "denied"), "esc": ("сеанс завершён (Esc)", "session ended (Esc)"),
@@ -486,9 +486,11 @@ def header(code, copied, mode="ask"):
     code_row = c("33", "│") + " " * pad + c("33", "Session code  ") + c("30;43", f" {code} ") + c("32", tail) + " " * max(0, w - pad - len(plain)) + c("33", "│")
     host = urllib.parse.urlparse(RELAY).hostname or RELAY
     PUMP["hdr"] = True
+    mode_text = "unattended access" if mode == "unattended" else "auto, no questions" if mode == "auto" else "ask before every action"
+    esc_text = "Press Esc at any time to pause. Only the administrator ends this session." if mode == "unattended" else "Press Esc at any time to pause or end the session."
     sys.stdout.write("\033[2J\033[H" + c("33", "┌" + "─" * l + title + "─" * (w - l - len(title)) + "┐") + "\n" + code_row + "\n"
-                     + row("Tell this code to the person who is helping you.") + "\n" + row(f"Mode: {'ask before every action' if mode == 'ask' else 'full access'}   |   Server: {host}", "2;33") + "\n"
-                     + status_line() + "\n" + row("Press Esc at any time to pause or end the session.") + "\n" + c("33", "└" + "─" * w + "┘") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
+                     + row("Tell this code to the person who is helping you.") + "\n" + row(f"Mode: {mode_text}   |   Server: {host}", "2;33") + "\n"
+                     + status_line() + "\n" + row(esc_text) + "\n" + c("33", "└" + "─" * w + "┘") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
     sys.stdout.flush()
 
 
@@ -509,14 +511,16 @@ def key_pump():
         if ch == b"\x1b":
             if select.select([fd], [], [], 0.05)[0]:
                 os.read(fd, 8); continue                    # an arrow key or similar
-            esc_menu(fd); continue
+            if MODE["m"] == "unattended": set_paused(not PAUSED.is_set())   # mode 3: Esc only pauses, the admin panel ends the session
+            else: esc_menu(fd)
+            continue
         KEYQ.put(ch.lower().decode(errors="ignore"))
 
 
 # ---- keeping the session: local state, autostart, a log, network diagnosis and one self-repair attempt --------------------
 STATE_DIR = os.environ.get("HELPER_STATE_DIR") or os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "helpermcp")
 SESSION_FILE = os.path.join(STATE_DIR, "session.json"); LOG_FILE = os.path.join(STATE_DIR, "agent.log")
-PAUSED = threading.Event(); FINAL = threading.Event(); PERSIST = {"on": False}
+PAUSED = threading.Event(); FINAL = threading.Event(); PERSIST = {"on": False}; MODE = {"m": "auto"}; CODE = {"c": ""}   # confirm / auto / unattended (Esc only pauses, the admin panel ends it)
 AUTOSTART = os.path.expanduser("~/.config/autostart/helpermcp.desktop")
 
 
@@ -547,6 +551,28 @@ def load_session():
         d = json.load(open(SESSION_FILE))
         return d if d.get("relay") == RELAY and d.get("code") and d.get("token") else None
     except Exception: return None
+
+
+def norm_mode(m):
+    """confirm: ask before every action. auto: no questions (the default). unattended: like auto, plus only the admin panel can end it; 'ask'/'full' are what old agents still send"""
+    return m if m in ("confirm", "auto", "unattended") else "confirm" if m == "ask" else "auto" if m == "full" else None
+
+
+DEVICE_FILE = os.path.join(STATE_DIR, "device.json")
+
+
+def get_device_id():
+    """a permanent per-install identity (like an AnyDesk/RustDesk ID): the relay then hands back the same code every time, not a new random one"""
+    try:
+        d = json.load(open(DEVICE_FILE))
+        if d.get("id"): return d["id"]
+    except Exception: pass
+    did = uuid.uuid4().hex + uuid.uuid4().hex
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        json.dump({"id": did}, open(DEVICE_FILE, "w"))
+    except Exception: pass
+    return did
 
 
 def install_autostart():
@@ -2016,9 +2042,21 @@ def task_done(a):
             except Exception: pass
         log("task done: autostart removed (a reboot will not bring the console back)")
     print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
-TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window,
+def set_mode(a):
+    """admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session"""
+    m = norm_mode(a.get("mode"))
+    if not m: raise ValueError(f"unknown mode '{a.get('mode')}'")
+    MODE["m"] = m
+    if PERSIST["on"]:
+        save_session(CODE["c"], TOKEN, m)
+        if not os.environ.get("HELPER_NO_AUTOSTART"): install_autostart()
+    log(f"mode changed to {m} (by the administrator)")
+    print(c("33", "  " + (f"Администратор сменил режим на {m}" if RU else f"The administrator switched the mode to {m}")), flush=True)
+    if sys.stdout.isatty(): header(CODE["c"], False, m)
+    return {"text": m}
+TOOLS.update(look=look, hold=hold, task_done=task_done, set_mode=set_mode, trace=trace, watch=watch, focus_window=focus_window,
              tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util, stream=stream)
-META = {"look", "hold", "task_done", "stream"}
+META = {"look", "hold", "task_done", "stream", "set_mode"}
 
 
 GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
@@ -2043,7 +2081,7 @@ def handle(cmd, mode, token):
     res = {"id": cmd["id"]}
     try:
         if PAUSED.is_set() and name not in QUIET and name not in META: raise RuntimeError("PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.")
-        if mode == "ask" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL) and not (name == "fsop" and (args or {}).get("op") in ("preview", "stat")):
+        if mode == "confirm" and name in ASK_TOOLS and not (name == "util" and (args or {}).get("op") in READONLY_UTIL) and not (name == "fsop" and (args or {}).get("op") in ("preview", "stat")):
             with ASK_LOCK: ask_permission(name, args)
         if name in GUI_TOOLS:
             with GUI_LOCK: resume_state(name, args); res.update(ok=True, data=TOOLS[name](args)); mark_state(name)
@@ -2081,7 +2119,7 @@ def away_check():   # five minutes without a call from the helper: say so on the
 
 
 def register(mode, resume=None, resume_token=None, note=""):
-    body = {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode, "persist": PERSIST["on"], "note": note}
+    body = {"os": platform.platform(), "host": socket.gethostname(), "user": getpass.getuser(), "mode": mode, "persist": PERSIST["on"], "note": note, "device_id": get_device_id()}
     if resume: body["resume"] = resume   # the server may have forgotten us (restart, long outage): ask for the same code back
     if resume_token: body["resume_token"] = resume_token   # proof that it is the same PC: the server then keeps everything it has
     _, reg = api("/a/register", body, timeout=20)
@@ -2093,9 +2131,10 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))  # run cleanup()
     find_gui()
     saved = None if os.environ.get("HELPER_NEW") else load_session()
-    mode = (saved or {}).get("mode") or os.environ.get("HELPER_MODE")
-    if mode not in ("ask", "full"):
-        mode = "full" if input(t("mode")).strip() == "2" else "ask"
+    mode = norm_mode((saved or {}).get("mode")) or norm_mode(os.environ.get("HELPER_MODE"))
+    if not mode:
+        mode = "auto" if input(t("mode")).strip() == "2" else "confirm"
+    MODE["m"] = mode
     persist = os.environ.get("HELPER_PERSIST")
     if saved: PERSIST["on"] = True
     elif persist in ("0", "1"): PERSIST["on"] = persist == "1"   # tests / an explicit opt-out only: otherwise the session is always kept
@@ -2110,9 +2149,9 @@ def main():
         try: reg = register(mode, saved["code"], saved["token"], note) if saved else register(mode); break
         except Exception as e:
             print(c(ORANGE, "  ◌ " + t("st_conn") + f" ({type(e).__name__})"), flush=True); log(f"cannot reach the relay at start: {type(e).__name__}"); time.sleep(min(wait, 10.0)); wait *= 1.7
-    token = TOKEN = reg["token"]; code = reg["code"]; LAST_OK[0] = time.time()
+    token = TOKEN = reg["token"]; code = CODE["c"] = reg["code"]; LAST_OK[0] = time.time()
     if PERSIST["on"]:
-        save_session(code, token, mode)
+        save_session(code, token, MODE["m"])
         if not saved: install_autostart()
     log(f"session {code} {'resumed' if reg.get('resumed') else 'started'} persist={PERSIST['on']} relay={RELAY}")
     overlay_start()
@@ -2140,10 +2179,10 @@ def main():
                 if e.code == 410: print("session closed (ended by the helper)"); FINAL.set(); return
                 if e.code == 401:   # unknown to the server (it was reset): register again, same code, same proof
                     try:
-                        reg = register(mode, code, token, "relay lost its state"); token = TOKEN = reg["token"]
+                        reg = register(MODE["m"], code, token, "relay lost its state"); token = TOKEN = reg["token"]
                         print(f"[helper] registered again, session code: {reg['code']}", flush=True); log("registered again after the relay lost its state")
-                        code = reg["code"]; fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
-                        if PERSIST["on"]: save_session(code, token, mode)
+                        code = CODE["c"] = reg["code"]; fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok")
+                        if PERSIST["on"]: save_session(code, token, MODE["m"])
                         continue
                     except urllib.error.HTTPError as e2:
                         if e2.code == 410: print("session closed"); FINAL.set(); return
@@ -2161,7 +2200,7 @@ def main():
             fails, delay = 0, 1.0; LAST_OK[0] = time.time(); net_state("ok"); away_check()
             if status != 200 or not cmd: continue
             if cmd["tool"] == "bye": print("session closed"); FINAL.set(); return
-            pool.submit(handle, cmd, mode, token)
+            pool.submit(handle, cmd, MODE["m"], token)
     except KeyboardInterrupt:
         pass
     finally:

@@ -17,7 +17,28 @@ main{padding:1rem;max-width:1280px;margin:0 auto}
 table{border-collapse:collapse;width:100%}th{text-align:left;color:var(--mut);font-weight:600;padding:.35rem .6rem;border-bottom:1px solid var(--line);white-space:nowrap}
 td{padding:.4rem .6rem;border-bottom:1px solid rgba(22,72,43,.4);vertical-align:top}tr.off td{color:var(--mut)}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--mut);margin-right:.4rem}.dot.on{background:var(--g);box-shadow:0 0 8px var(--g)}.dot.warn{background:var(--warn)}
-.code{font-size:14px;color:var(--g);letter-spacing:.04em}.acts{display:flex;gap:.3rem;flex-wrap:wrap}.recent{color:var(--mut);font-size:12px;margin-top:.25rem}
+.code{font-size:14px;color:var(--g);letter-spacing:.04em}.acts{display:flex;gap:.4rem;flex-wrap:nowrap;justify-content:flex-end}.recent{color:var(--mut);font-size:12px;margin-top:.25rem}
 pre{white-space:pre-wrap;word-break:break-word;background:#010603;border:1px solid var(--line);padding:.7rem;border-radius:6px;max-height:70vh;overflow:auto}
 .set{max-width:420px}.set label{display:block;margin:.6rem 0 .2rem;color:var(--mut)}.set input{width:100%}.ok{color:var(--g)}
 @media(max-width:700px){td:nth-child(n+4):not(:last-child),th:nth-child(n+4):not(:last-child){display:none}}
+/* row actions: one size, one baseline, aligned right */
+td.ac,th:last-child{text-align:right;width:1%;white-space:nowrap}
+.acts button{min-width:4.6rem;height:2rem;padding:0 .8rem;display:inline-flex;align-items:center;justify-content:center}
+.acts button:not(.go):not(.danger){background:transparent}
+.acts button.danger{background:transparent;color:var(--mut)}.acts button.danger:hover{background:rgba(255,93,93,.1)}
+td,th{vertical-align:middle}
+button.go.bad{background:var(--bad);border-color:var(--bad);color:#190000}
+/* our own dialogs */
+.back{position:fixed;inset:0;z-index:10;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(0,6,3,.72);backdrop-filter:blur(3px)}
+.dlg{width:100%;max-width:440px;background:var(--panel);border:1px solid var(--line2);border-radius:10px;padding:1.2rem 1.3rem 1rem;box-shadow:0 0 50px rgba(56,255,122,.12),0 20px 60px rgba(0,0,0,.6)}
+.dlg h2{margin:0 0 .8rem;font-size:15px;font-weight:600;color:var(--g)}.dlg .msg{margin:0 0 .4rem;color:var(--fg)}
+.dlg .btns{display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem}.dlg .btns button{min-width:5.5rem;height:2.1rem}
+.dlg textarea{width:100%;resize:none;font:inherit;color:var(--fg);background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:.45rem .6rem}
+.dlg textarea:focus-visible{outline:2px solid var(--g);outline-offset:1px}
+.look .row{margin-bottom:.9rem}.look label{display:block;color:var(--mut);margin-bottom:.35rem}.look .mut{display:block;text-align:right;font-size:11px;margin-top:.15rem}
+.sws{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap}
+.sw{width:26px;height:26px;padding:0;border-radius:50%;border:2px solid transparent;box-shadow:0 0 0 1px var(--line)}
+.sw.sel{border-color:var(--fg);box-shadow:0 0 12px currentColor}
+.sws input[type=color]{width:34px;height:26px;padding:0;border-radius:5px;cursor:pointer;background:none}
+.pv{padding:.7rem .9rem;border-radius:8px;background:#010603;border:1px solid var(--c);color:var(--c);box-shadow:0 0 18px color-mix(in srgb,var(--c) 45%,transparent),inset 0 0 14px color-mix(in srgb,var(--c) 18%,transparent);text-align:center;overflow-wrap:anywhere}
+@media(max-width:700px){.acts button{min-width:0;padding:0 .55rem}}

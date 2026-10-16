@@ -26,7 +26,8 @@ const file = path.join(SDIR, 'a.py'); fs.writeFileSync(file, src);
 const TOKEN_FILE = path.join(SDIR, 'token.txt');
 const killAgent = (a) => { if (PS) spawnSync('taskkill', ['/PID', String(a.pid), '/T', '/F']); else a.kill('SIGKILL'); };
 let agentOut = '';
-const startAgent = () => { const env = { ...process.env, HELPER_MODE: 'full', HELPER_PERSIST: '1', HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_TOKEN_FILE: TOKEN_FILE };
+const startAgent = (again = false) => { const env = { ...process.env, ...(again ? {} : { HELPER_MODE: 'full', HELPER_PERSIST: '1' }),   // a restart after a reboot gets no hints: the saved session alone must decide, and nothing may be asked
+    HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_TOKEN_FILE: TOKEN_FILE };
   const a = PS ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env }) : spawn('python3', [file], { env }); kids.push(a); a.stdout.on('data', (d) => (agentOut += d)); a.stderr.on('data', (d) => (agentOut += d)); return a; };
 
 let client = new Client({ name: 'keep', version: '0' });
@@ -56,7 +57,7 @@ const off = await call('run', { session: code, command: 'echo x' }); assert.ok(o
 console.log('agent killed: session kept offline ok');
 
 // it comes back by itself: same code, nothing to re-send
-agent = startAgent();
+agent = startAgent(true);
 await waitFor(async () => (await sessions()).find((x) => x.code === code)?.online, 'agent back online', 20000);
 assert.equal((await sessions()).length, 1, 'no second session was created');
 assert.match((await call('run', { session: code, command: 'echo two' })).text, /two/);

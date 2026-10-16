@@ -69,9 +69,41 @@ function recordMiss(s, code, kind, info) {
       trail: s.log.slice(-8).map((l) => ({ ago_s: Math.round((Date.now() - l.t) / 1000), tool: l.tool, args: redact(l.args) })) };
     fs.appendFileSync(MISS_FILE, JSON.stringify(e) + '\n', { mode: 0o600 });
     if (fs.statSync(MISS_FILE).size > 2_000_000) { const L = fs.readFileSync(MISS_FILE, 'utf8').trim().split('\n'); fs.writeFileSync(MISS_FILE, L.slice(-500).join('\n') + '\n', { mode: 0o600 }); }
-    s.events.push({ t: Date.now(), type: 'miss', data: { kind, ...info } });
+    evPush(s, { t: Date.now(), type: 'miss', data: { kind, ...info } });
   } catch (e) { console.error('miss log failed:', e.message); }
 }
+// ---- the action log: every call (tool, arguments, result, time, errors) and what the agents report (outages, route switches, resumes) is appended to
+// data/actions.jsonl and kept, so the failures can be read, reproduced and fixed later (helpermcp report). Typed text, file contents and values are
+// never written down (only their length), obvious secrets are masked, results are cut short.
+const ACT_FILE = process.env.ACT_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'actions.jsonl') : '');
+const ACT_MAX = Number(process.env.ACT_MAX_BYTES || 20_000_000);
+const HIDE = /("(?:text|content|value|old|new|stdin|body)"\s*:\s*")((?:[^"\\]|\\.)*)(")/g;
+const SECRET = /((?:pass(?:word|wd)?|token|secret|api[_-]?key|authorization|bearer)["'\s:=]+)([^\s"',;]{4,})/gi;
+const SHOW_OUT = new Set(['run', 'util', 'start_process', 'edit_file', 'push_file', 'fetch_file', 'write_file', 'system', 'sysinfo']);
+function actWrite(e) {
+  if (!ACT_FILE) return;
+  try {
+    fs.appendFileSync(ACT_FILE, JSON.stringify(e) + '\n', { mode: 0o600 });
+    if (Math.random() < 0.02 && fs.statSync(ACT_FILE).size > ACT_MAX) { fs.renameSync(ACT_FILE, ACT_FILE + '.1'); }   // one older file is kept
+  } catch (err) { console.error('action log failed:', err.message); }
+}
+const sidOf = (s) => (s.sid ??= crypto.randomBytes(3).toString('hex'));
+const devOf = (s) => `${s.info?.host || ''}|${s.info?.os || ''}`;
+function actCall(s, tool, args, ok, t0, res) {
+  try {
+    const a = JSON.stringify(args || {}, (k, v) => (k === 'session' ? undefined : typeof v === 'string' && v.length > 300 ? v.slice(0, 300) + '…' : v))
+      .replace(HIDE, (_m, p1, v, q) => `${p1}<${v.length} chars>${q}`).replace(SECRET, '$1<hidden>').slice(0, 700);
+    const text = ok ? String((res && res.text) ?? '') : String(res || '');
+    const e = { t: new Date(t0).toISOString(), sid: sidOf(s), dev: devOf(s), tool, a: a === '{}' ? '' : a, ok, ms: Date.now() - t0, n: ok ? text.length || (res && res.jpeg ? res.jpeg.length : 0) : undefined };
+    if (!ok) e.err = text.replace(SECRET, '$1<hidden>').slice(0, 500);
+    else if (SHOW_OUT.has(tool)) e.out = text.replace(SECRET, '$1<hidden>').slice(0, 240);
+    actWrite(e);
+  } catch { /* logging must never break a call */ }
+}
+function actEvent(s, ev) {
+  try { actWrite({ t: new Date(ev.t || Date.now()).toISOString(), sid: sidOf(s), dev: devOf(s), kind: 'event', type: ev.type, data: JSON.stringify(ev.data ?? ev.note ?? '').replace(SECRET, '$1<hidden>').slice(0, 900) }); } catch { /* optional */ }
+}
+function evPush(s, ev) { s.events.push(ev); actEvent(s, ev); }
 // what the label shows: the current stage (its colour, "2/5 title") and the note
 function lookOf(s) {
   const st = s.plan && s.plan.stages[s.plan.current];
@@ -187,8 +219,8 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     s.log.push({ t: Date.now(), tool, args: argStr });
     if (s.log.length > 60) s.log.shift();
   }
-  const id = crypto.randomUUID();
-  return new Promise((resolve, reject) => {
+  const id = crypto.randomUUID(), t0 = Date.now();
+  const pr = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       s.pending.delete(id); s.queue = s.queue.filter((q) => q.id !== id);   // a caller that gave up must not have its command run later
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
@@ -197,6 +229,8 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     s.queue.push({ id, tool, args });
     flush(s);
   });
+  if (!args.view && tool !== 'stream' && tool !== 'bye') pr.then((d) => actCall(s, tool, args, true, t0, d), (e) => actCall(s, tool, args, false, t0, e.message));
+  return pr;
 }
 
 function flush(s) {
@@ -317,7 +351,7 @@ const tools = [
       const stages = (a.stages || []).slice(0, 12).map((x) => ({ title: String(x.title || '').replace(/\s+/g, ' ').slice(0, 60), color: hex(x.color) })).filter((x) => x.title);
       if (!stages.length) throw new Error('stages must have at least one title');
       s.plan = { stages, current: Math.max(0, Math.min(stages.length - 1, Number(a.current) || 0)), at: Date.now(), done: [] };
-      s.events.push({ t: Date.now(), type: 'plan', data: { stages: stages.map((x) => x.title) } }); save();
+      evPush(s, { t: Date.now(), type: 'plan', data: { stages: stages.map((x) => x.title) } }); save();
       return { text: await pushLook(c, s) };
     } },
   { name: 'set_look', session: true,
@@ -332,7 +366,7 @@ const tools = [
         if (n !== s.plan.current) { if (!s.plan.done.includes(s.plan.current) && n > s.plan.current) s.plan.done.push(s.plan.current); s.plan.current = n; s.plan.at = now; }
       }
       if (a.color && !s.lookColor && /^#?[0-9a-f]{6}$/i.test(a.color)) s.lookColor = '#' + String(a.color).replace('#', '');   // the colour is fixed after the first time
-      s.events.push({ t: now, type: 'look', data: { note: s.note || '', stage: s.plan ? s.plan.current : null } }); save();
+      evPush(s, { t: now, type: 'look', data: { note: s.note || '', stage: s.plan ? s.plan.current : null } }); save();
       return { text: await pushLook(c, s) };
     } },
   { name: 'hold', session: true,
@@ -340,7 +374,7 @@ const tools = [
     props: { reason: str('why you stop'), back_in_minutes: { type: 'integer', minimum: 1, maximum: 1440, description: 'when you expect to continue' } },
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
-      s.events.push({ t: Date.now(), type: 'hold', data: { reason: String(a.reason || '').slice(0, 200), back_in_minutes: a.back_in_minutes || null } });
+      evPush(s, { t: Date.now(), type: 'hold', data: { reason: String(a.reason || '').slice(0, 200), back_in_minutes: a.back_in_minutes || null } });
       await call(c, 'hold', {}).catch((e) => { if (!/Unknown tool|not available/i.test(e.message)) throw e; });
       return { text: 'on hold: the session stays open and the screen awake; your next action continues' };
     } },
@@ -349,7 +383,7 @@ const tools = [
     props: { summary: str('one line of what was done') },
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
-      s.events.push({ t: Date.now(), type: 'done', data: { summary: String(a.summary || '').slice(0, 200) } });
+      evPush(s, { t: Date.now(), type: 'done', data: { summary: String(a.summary || '').slice(0, 200) } });
       await call(c, 'task_done', {}).catch((e) => { if (!/Unknown tool|not available/i.test(e.message)) throw e; });
       return { text: 'marked as finished' };
     } },
@@ -398,8 +432,8 @@ const tools = [
     props: { path: str('Folder'), depth: { type: 'integer', minimum: 1, maximum: 6, description: 'default 2' }, pattern: str('only files matching this glob, e.g. *.log'), max: { type: 'integer', minimum: 10, maximum: 3000, description: 'lines, default 300' } }, required: ['path'] },
   { name: 'find', agent: true, ms: (a) => 60_000, description: 'Find files by name (glob) and/or by content (regex, case-insensitive): answers path (and size) or path:line: text. Skips .git / node_modules, binary files and files over 5 MB when searching content.',
     props: { path: str('Folder to search'), name: str('file name glob, e.g. *.json or config*'), text: str('regex to search inside files'), max: { type: 'integer', minimum: 1, maximum: 1000, description: 'results, default 100' }, depth: { type: 'integer', minimum: 1, maximum: 50 } }, required: ['path'] },
-  { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (adapters, IP, gateway, DNS), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
-    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
+  { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (EVERY adapter: type, speed, IP, gateway, DNS, MAC, which one is the default route and which one the agent uses), reach (tests each adapter against the relay, lists VPN / DPI-bypass / proxy programs and network filter drivers, proxies, hosts file), connections (TCP connections per process), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
+    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events', 'reach', 'connections'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
   { name: 'util', agent: true, ms: (a) => (/install|download|zip/.test(a.op) ? 1_900_000 : 120_000),
     description: 'Ready-made, tested operations: right on the first try, no quoting. op: apps (search installed programs: name), install / uninstall (winget / apt id or name), kill (name or pid, whole process tree), service (name, value=start|stop|restart|status), env_get (name; empty = all), env_set (name, value; user scope), path_add (path; user PATH, no setx truncation), reg_get / reg_set (path = HKCU\\..., name, value), open (url or path with the default app), clipboard_get / clipboard_set (value), dns_flush, net_test (host, port: DNS + TCP check), ports (name = port number: who listens), download (url -> path, resumes), zip (path -> dest), unzip (path -> dest), shortcut (path = target, dest = .lnk file).',
     props: { op: { type: 'string', enum: ['apps', 'install', 'uninstall', 'kill', 'service', 'env_get', 'env_set', 'path_add', 'reg_get', 'reg_set', 'open', 'clipboard_get', 'clipboard_set', 'dns_flush', 'net_test', 'ports', 'download', 'zip', 'unzip', 'shortcut'] },
@@ -518,7 +552,7 @@ Workflow for any task:
 15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.
 16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.
 17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
-17a. Slow PC / what eats CPU, RAM or disk / anything malicious: ONE call to system {sections:["processes"]} lists every process with its real CPU %, memory, the exe path and who signed it, and marks with ! anything run from a temp or download folder or unsigned outside the normal install dirs. system {} also gives disks, network and startup; add "drivers" and "services". Kill a bad one with util {op:"kill"} and delete its file. sysinfo and system cost tens of ms now: prefer them to a handful of run commands.
+17a. Slow PC / what eats CPU, RAM or disk / anything malicious: ONE call to system {sections:["processes"]} lists every process with its real CPU %, memory, the exe path and who signed it, and marks with ! anything run from a temp or download folder or unsigned outside the normal install dirs. system {} also gives disks, network and startup; add "drivers" and "services". Kill a bad one with util {op:"kill"} and delete its file. sysinfo and system cost tens of ms now: prefer them to a handful of run commands. Network problems on a PC (cuts, slow, a VPN / zapret / proxy in the way): system {sections:["reach"]} lists every adapter with its type, IP, gateway, DNS, which one is the default route, which one the agent talks through, whether each reaches the relay, plus the VPN / DPI-bypass programs, network filter drivers, proxies and hosts entries; {sections:["connections"]} shows who talks to whom. The agent keeps its own link alive by itself (it moves to another adapter when the current route dies, VPN adapters last) and logs every switch.
 18. No quoting traps: to start a program with arguments use run {command: "program", args: [...]} (no shell, each argument arrives exactly as given). For a longer script use write_file, then run the file. A failed command may come back with a HINT line: follow it instead of retrying the same thing.`;
 
 function buildMcp(fixed) {
@@ -934,7 +968,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}'), pid = Math.round(Number(b.pid));
         if (!Number.isInteger(pid) || pid < 5) return json(res, 400, { error: 'bad pid' });
-        try { const d = await call(v.code, 'util', { op: 'kill', name: String(pid) }, 30_000, { human: true }); s.events.push({ t: Date.now(), type: 'killed', data: { pid, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'killed' }); }
+        try { const d = await call(v.code, 'util', { op: 'kill', name: String(pid) }, 30_000, { human: true }); evPush(s, { t: Date.now(), type: 'killed', data: { pid, by: 'operator (live view)' } }); return json(res, 200, { text: d?.text || 'killed' }); }
         catch (e) { return json(res, 503, { error: e.message }); }
       }
       if (vw[2] === '/ls' || vw[2] === '/get' || vw[2] === '/upload') {   // files: browse, download, drop a file onto the PC (control link only)
@@ -953,7 +987,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (vw[2] === '/input' || vw[2] === '/takeover') {   // control: needs the secret from the control link
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 20_000)) || '{}');
-        if (vw[2] === '/takeover') { s.takeover = b.on ? Date.now() : 0; s.events.push({ t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on }); }
+        if (vw[2] === '/takeover') { s.takeover = b.on ? Date.now() : 0; evPush(s, { t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on }); }
         v.n = (v.n || 0) + 1; const now = Date.now(); if (now - (v.nt || 0) > 1000) { v.nt = now; v.n = 1; } if (v.n > 25) return json(res, 429, { error: 'too fast' });
         s.takeover = now;   // any input keeps the hand-over alive
         const num = (x) => Math.round(Number(x)), ok = (...xs) => xs.every((x) => Number.isFinite(x) && Math.abs(x) < 100000);
@@ -1026,7 +1060,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
         old.lastSeen = Date.now(); old.ip = ip; old.mode = info.mode === 'ask' ? 'ask' : 'full'; old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
-        old.events.push({ t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
+        evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true });
       }
@@ -1093,17 +1127,17 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       }
       if (p === '/a/state' && req.method === 'POST') {   // the user paused / resumed from the console (Esc menu)
         const st = JSON.parse((await body(req, 2000)) || '{}'); s.paused = !!st.paused;
-        s.events.push({ t: Date.now(), type: s.paused ? 'paused' : 'continued' }); save(); return json(res, 200, {});
+        evPush(s, { t: Date.now(), type: s.paused ? 'paused' : 'continued' }); save(); return json(res, 200, {});
       }
       if (p === '/a/event' && req.method === 'POST') {   // what the agent saw: outages, repairs, reboots
         const ev = JSON.parse((await body(req, 20_000)) || '{}');
-        s.events.push({ t: Date.now(), type: String(ev.type || 'event').slice(0, 40), data: JSON.parse(JSON.stringify(ev, (k, v) => (typeof v === 'string' ? v.slice(0, 3500) : v))) });
+        evPush(s, { t: Date.now(), type: String(ev.type || 'event').slice(0, 40), data: JSON.parse(JSON.stringify(ev, (k, v) => (typeof v === 'string' ? v.slice(0, 3500) : v))) });
         if (s.events.length > 40) s.events.splice(0, s.events.length - 40); save(); return json(res, 200, {});
       }
       if (p === '/a/bye') {
         const b = JSON.parse((await body(req, 2000)) || '{}');
         if (s.persist && !b.final) {   // the window closed / the PC is going down but the user did not end the session: keep it for the PC to come back
-          console.log(`- ${code} left (kept)`); s.lastSeen = 0; s.events.push({ t: Date.now(), type: 'agent_left' });
+          console.log(`- ${code} left (kept)`); s.lastSeen = 0; evPush(s, { t: Date.now(), type: 'agent_left' });
           for (const pd of s.pending.values()) { clearTimeout(pd.timer); pd.reject(new Error('The agent went away (reboot or closed window). The session is kept: use wait_online.')); } s.pending.clear(); save();
           return json(res, 200, {});
         }

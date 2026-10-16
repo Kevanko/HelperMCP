@@ -177,7 +177,7 @@ function Probe-Report($before, $after, $what, $moved) {   # -> a short line for 
 # Files without the PowerShell pipeline (it is slow on big folders): tree, find, line ranges, exact edits; and argument quoting by the Windows rules.
 Add-Type -ReferencedAssemblies System.Drawing, System.Windows.Forms -TypeDefinition @"
 using System; using System.IO; using System.Text; using System.Text.RegularExpressions; using System.Collections.Generic; using System.Diagnostics; using System.Runtime.InteropServices;
-using System.Drawing; using System.Drawing.Imaging; using System.Net; using System.Threading;
+using System.Drawing; using System.Drawing.Imaging; using System.Net; using System.Net.Sockets; using System.Net.NetworkInformation; using System.Threading;
 namespace F__BUILD__ {
   public static class Fs {
     static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "__pycache__", "`$Recycle.Bin", "System Volume Information" };
@@ -516,6 +516,243 @@ namespace F__BUILD__ {
         }
       }
       try { rq.GetResponse().Close(); } catch { }
+    }
+  }
+
+  // The link to the relay. Every request to the relay goes through a tiny local CONNECT proxy that can leave through a chosen network adapter
+  // (IP_UNICAST_IF), so a VPN, a DPI-bypass tool (zapret / WinDivert) or a broken default route cannot take the helper down. A watchdog asks the relay
+  // for /health every few seconds; when that fails, every route is tried in parallel and the first healthy one wins (physical adapters first, the
+  // default route next, a system proxy next, VPN adapters last). It only ever moves to a route that has just worked.
+  // ponytail: IPv4 only, https relays only; plain-http relays (tests, LAN) keep the normal connection
+  public static class Route {
+    [DllImport("iphlpapi.dll")] static extern int GetBestInterface(uint dest, out int index);
+    static readonly Regex VpnRx = new Regex("TAP-|TUN|WireGuard|Wintun|VPN|Meta Tunnel|Tailscale|ZeroTier|Hamachi|Cisco|Fortinet|NordLynx|Clash|sing-box|Amnezia|Outline|WARP|Proton|Mullvad|OpenVPN|Radmin|PANGP|GlobalProtect|Npcap", RegexOptions.IgnoreCase);
+    static readonly Regex VirtRx = new Regex("Hyper-V|VirtualBox|VMware|vEthernet|WSL|Virtual Adapter|Bluetooth|Teredo|ISATAP|6to4|Pseudo", RegexOptions.IgnoreCase);
+    public class Ad { public int If; public string Name = "", Desc = "", Kind = "", Mac = "", Ips = "", Gw = "", Dns = ""; public bool Up, Vpn, Virt, Eth, Dhcp; public long Speed; public int Ms = -2; }
+    class Cand { public string Key, Name; public int If; public bool Vpn, Sys; }
+    class Hop { public string Key; public int If; public int Port; public TcpListener L; public readonly List<Socket> Conns = new List<Socket>(); }
+
+    static readonly Dictionary<string, Hop> hops = new Dictionary<string, Hop>();
+    static readonly object lk = new object();
+    static readonly System.Collections.Concurrent.ConcurrentQueue<string> ev = new System.Collections.Concurrent.ConcurrentQueue<string>();
+    static readonly List<string> hist = new List<string>();
+    static readonly AutoResetEvent wake = new AutoResetEvent(false);
+    static readonly IWebProxy sp = WebRequest.GetSystemWebProxy();
+    static Uri relay; static string host, lastIp, blockFile; static int port; static volatile bool on, forced;
+    static volatile Hop cur; static Cand curC; static DateTime lastOk = DateTime.MinValue, since = DateTime.UtcNow; static int switches;
+    public static readonly IWebProxy Proxy = new RP();
+
+    class RP : IWebProxy {
+      public ICredentials Credentials { get; set; }
+      public Uri GetProxy(Uri u) { var h = cur; if (on && h != null && u.Host == host) return new Uri("http://127.0.0.1:" + h.Port); return sp.GetProxy(u); }
+      public bool IsBypassed(Uri u) { if (on && cur != null && u.Host == host) return false; return sp.IsBypassed(u); }
+    }
+
+    static void Emit(string type, string msg) {
+      ev.Enqueue(type + "|" + msg);
+      lock (lk) { hist.Add(DateTime.Now.ToString("HH:mm:ss") + " " + msg); if (hist.Count > 12) hist.RemoveAt(0); }
+    }
+    public static string[] Drain() { var l = new List<string>(); string s; while (ev.TryDequeue(out s)) l.Add(s); return l.ToArray(); }
+    public static void Ok() { lastOk = DateTime.UtcNow; }
+    public static void Failed() { forced = true; wake.Set(); }
+
+    public static string Key() { var c = curC; return c != null ? c.Key : ""; }
+    public static void Init(string url, string savedKey, string block) {
+      try {
+        relay = new Uri(url); host = relay.Host; port = relay.Port; blockFile = block;   // block: a test hook, a file naming the routes (def, sys, if14 ...) that must fail while it exists
+        if (relay.Scheme != "https" || Environment.GetEnvironmentVariable("HELPER_ROUTE") == "0") return;
+        var ord = Order(); if (ord.Count == 0) return;
+        var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time: no search after a reboot
+        on = true; Switch(first, "start", false); forced = true;
+        new Thread(Watch) { IsBackground = true, Priority = ThreadPriority.AboveNormal }.Start();
+      } catch (Exception e) { on = false; Emit("route", "route layer off: " + e.Message); }
+    }
+
+    static List<Ad> Ads() {
+      var l = new List<Ad>();
+      foreach (var ni in NetworkInterface.GetAllNetworkInterfaces()) {
+        if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+        try {
+          var ip = ni.GetIPProperties(); var v4 = ip.GetIPv4Properties();
+          var a = new Ad { If = v4 != null ? v4.Index : 0, Name = ni.Name, Desc = ni.Description, Up = ni.OperationalStatus == OperationalStatus.Up, Speed = ni.Speed, Dhcp = v4 != null && v4.IsDhcpEnabled };
+          a.Mac = BitConverter.ToString(ni.GetPhysicalAddress().GetAddressBytes());
+          var ips = new List<string>(); foreach (var u in ip.UnicastAddresses) if (u.Address.AddressFamily == AddressFamily.InterNetwork) ips.Add(u.Address + "/" + u.PrefixLength);
+          a.Ips = string.Join(", ", ips.ToArray());
+          var gws = new List<string>(); foreach (var g in ip.GatewayAddresses) if (g.Address.AddressFamily == AddressFamily.InterNetwork && !g.Address.Equals(IPAddress.Any)) gws.Add(g.Address.ToString());
+          a.Gw = string.Join(", ", gws.ToArray());
+          var dns = new List<string>(); foreach (var d in ip.DnsAddresses) if (d.AddressFamily == AddressFamily.InterNetwork) dns.Add(d.ToString());
+          a.Dns = string.Join(", ", dns.ToArray());
+          string dd = ni.Description + " " + ni.Name; var nt = ni.NetworkInterfaceType.ToString();
+          a.Vpn = VpnRx.IsMatch(dd) || ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel || ni.NetworkInterfaceType == NetworkInterfaceType.Ppp;
+          a.Virt = !a.Vpn && VirtRx.IsMatch(dd);
+          a.Eth = nt.Contains("Ethernet");
+          a.Kind = a.Vpn ? "VPN/tunnel" : a.Virt ? "virtual" : ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ? "Wi-Fi" : a.Eth ? "Ethernet" : nt;
+          l.Add(a);
+        } catch { }
+      }
+      return l;
+    }
+
+    static string RelayIp() {
+      if (lastIp != null) return lastIp;
+      try { foreach (var a in Dns.GetHostAddresses(host)) if (a.AddressFamily == AddressFamily.InterNetwork) { lastIp = a.ToString(); break; } } catch { }
+      return lastIp;
+    }
+
+    // physical adapters (Ethernet before Wi-Fi), the default route, the system proxy, then VPN adapters; when the default route already leaves through a physical adapter it goes first
+    static List<Cand> Order() {
+      var ads = Ads(); var phys = new List<Ad>(); var vpns = new List<Ad>();
+      foreach (var a in ads) { if (!a.Up || a.If <= 0) continue; if (a.Vpn) vpns.Add(a); else if (!a.Virt && a.Gw.Length > 0) phys.Add(a); }
+      phys.Sort((x, y) => x.Eth != y.Eth ? (x.Eth ? -1 : 1) : y.Speed.CompareTo(x.Speed));
+      bool defVpn = false; try { var ip = RelayIp(); int bi; if (ip != null && GetBestInterface(BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0), out bi) == 0) foreach (var a in ads) if (a.If == bi && a.Vpn) defVpn = true; } catch { }
+      var def = new Cand { Key = "def", Name = "default route", If = 0 };
+      var l = new List<Cand>(); if (!defVpn) l.Add(def);
+      foreach (var a in phys) l.Add(new Cand { Key = "if" + a.If, Name = a.Name + " (" + a.Kind + ")", If = a.If });
+      if (defVpn) l.Add(def);
+      try { var u = new Uri("https://" + host + ":" + port + "/"); if (!sp.IsBypassed(u)) l.Add(new Cand { Key = "sys", Name = "system proxy", Sys = true }); } catch { }
+      foreach (var a in vpns) l.Add(new Cand { Key = "if" + a.If, Name = a.Name + " (VPN)", If = a.If, Vpn = true });
+      return l;
+    }
+
+    static Hop HopFor(Cand c) {
+      lock (lk) {
+        Hop h; if (hops.TryGetValue(c.Key, out h)) return h;
+        var l = new TcpListener(IPAddress.Loopback, 0); l.Start(); h = new Hop { Key = c.Key, If = c.If, L = l, Port = ((IPEndPoint)l.LocalEndpoint).Port }; hops[c.Key] = h;
+        var hh = h; new Thread(() => { while (true) { Socket s; try { s = hh.L.AcceptSocket(); } catch { return; } ThreadPool.QueueUserWorkItem(_ => Handle(hh, s)); } }) { IsBackground = true }.Start();
+        return h;
+      }
+    }
+
+    static bool HasEnd(byte[] b, int n) { for (int i = 3; i < n; i++) if (b[i] == 10 && b[i - 1] == 13 && b[i - 2] == 10 && b[i - 3] == 13) return true; return false; }
+    static void Say(Socket c, string s) { try { c.Send(Encoding.ASCII.GetBytes(s)); } catch { } }
+
+    static Socket Dial(Hop h, string th, int tp) {
+      try { if (blockFile != null && File.Exists(blockFile) && File.ReadAllText(blockFile).Contains(h.Key)) throw new Exception("blocked by the test hook"); } catch (IOException) { }
+      var ips = new List<IPAddress>();
+      if (lastIp != null) ips.Add(IPAddress.Parse(lastIp));
+      try { foreach (var a in Dns.GetHostAddresses(th)) if (a.AddressFamily == AddressFamily.InterNetwork && !ips.Contains(a)) ips.Add(a); } catch { }
+      Exception last = new Exception("no address for " + th);
+      foreach (var ip in ips) {
+        Socket s = null;
+        try {
+          s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp); s.NoDelay = true;
+          if (h.If > 0) s.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, IPAddress.HostToNetworkOrder(h.If));   // IP_UNICAST_IF: leave through this adapter whatever the routing table says
+          try { var ka = new byte[12]; BitConverter.GetBytes(1u).CopyTo(ka, 0); BitConverter.GetBytes(15000u).CopyTo(ka, 4); BitConverter.GetBytes(5000u).CopyTo(ka, 8); s.IOControl(IOControlCode.KeepAliveValues, ka, null); } catch { }
+          var ar = s.BeginConnect(ip, tp, null, null);
+          if (!ar.AsyncWaitHandle.WaitOne(4000)) { s.Close(); last = new Exception("connect timeout " + ip); continue; }
+          s.EndConnect(ar); return s;
+        } catch (Exception e) { last = e; try { if (s != null) s.Close(); } catch { } }
+      }
+      throw last;
+    }
+
+    static void Pump(Socket a, Socket b) {
+      var buf = new byte[32768];
+      try { while (true) { int r = a.Receive(buf); if (r <= 0) break; int off = 0; while (off < r) off += b.Send(buf, off, r - off, SocketFlags.None); } } catch { }
+      try { b.Shutdown(SocketShutdown.Send); } catch { }
+    }
+
+    static void Handle(Hop h, Socket c) {
+      Socket u = null;
+      try {
+        c.ReceiveTimeout = 5000; var buf = new byte[8192]; int n = 0;
+        while (n < buf.Length) { int r = c.Receive(buf, n, buf.Length - n, SocketFlags.None); if (r <= 0) return; n += r; if (HasEnd(buf, n)) break; }
+        var line = Encoding.ASCII.GetString(buf, 0, Math.Min(n, 400)).Split('\n')[0].Trim(); var p = line.Split(' ');
+        if (p.Length < 2 || p[0] != "CONNECT") { Say(c, "HTTP/1.1 405 Method Not Allowed\r\n\r\n"); return; }
+        int ci = p[1].LastIndexOf(':'); string th = p[1].Substring(0, ci); int tp = int.Parse(p[1].Substring(ci + 1));
+        if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || tp != port) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }   // not an open proxy: the relay and nothing else
+        u = Dial(h, th, tp); try { lastIp = ((IPEndPoint)u.RemoteEndPoint).Address.ToString(); } catch { }
+        Say(c, "HTTP/1.1 200 Connection established\r\n\r\n"); c.ReceiveTimeout = 0;
+        lock (h.Conns) { h.Conns.Add(c); h.Conns.Add(u); }
+        var uu = u; new Thread(() => Pump(uu, c)) { IsBackground = true }.Start(); Pump(c, u);
+      } catch { Say(c, "HTTP/1.1 502 Bad Gateway\r\n\r\n"); }
+      finally {
+        lock (h.Conns) { h.Conns.Remove(c); if (u != null) h.Conns.Remove(u); }
+        try { c.Close(); } catch { } try { if (u != null) u.Close(); } catch { }
+      }
+    }
+
+    static void CloseAll(Hop h) { lock (h.Conns) { foreach (var s in h.Conns.ToArray()) { try { s.Close(); } catch { } } h.Conns.Clear(); } }   // the old route may be a black hole: break what is stuck on it now
+
+    static int Probe(Cand c, int ms) {
+      try {
+        var rq = (HttpWebRequest)WebRequest.Create("https://" + host + ":" + port + "/health");
+        rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        using (var r = (HttpWebResponse)rq.GetResponse()) return (int)r.StatusCode == 200 ? (int)Math.Max(1, sw.ElapsedMilliseconds) : -1;
+      } catch { return -1; }
+    }
+
+    static int[] ProbeAll(List<Cand> l, int ms) {
+      var res = new int[l.Count]; var ts = new List<Thread>();
+      for (int i = 0; i < l.Count; i++) { int k = i; var t = new Thread(() => { res[k] = Probe(l[k], ms); }) { IsBackground = true }; ts.Add(t); t.Start(); }
+      foreach (var t in ts) t.Join(ms + 1500);
+      return res;
+    }
+
+    static void Switch(Cand c, string why, bool tell) {
+      Hop old; Cand oc;
+      lock (lk) { old = cur; oc = curC; curC = c; cur = c.Sys ? null : HopFor(c); since = DateTime.UtcNow; switches++; }
+      if (old != null && old != cur) CloseAll(old);
+      lastOk = DateTime.UtcNow;
+      if (tell) Emit("route", why + ": " + (oc != null ? oc.Name : "?") + " -> " + c.Name);
+    }
+
+    static void Watch() {
+      DateTime better = DateTime.UtcNow; DateTime failTold = DateTime.MinValue;
+      while (true) {
+        wake.WaitOne(4000);
+        bool f = forced; forced = false;
+        if (!f && (DateTime.UtcNow - lastOk).TotalSeconds < 4) continue;
+        var c = curC;
+        if (c != null && Probe(c, 3500) > 0) {
+          lastOk = DateTime.UtcNow;
+          if ((DateTime.UtcNow - better).TotalSeconds > 90) { better = DateTime.UtcNow; TryBetter(); }
+          continue;
+        }
+        try {
+          var ord = Order(); var res = ProbeAll(ord, 4000); Cand pick = null;
+          for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
+          if (pick != null) Switch(pick, "relay unreachable", true);
+          else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) sb.Append(ord[i].Name).Append(" FAIL; "); Emit("route", "no route reaches the relay: " + sb); }
+        } catch (Exception e) { Emit("route", "route check failed: " + e.Message); }
+      }
+    }
+
+    static void TryBetter() {   // back to a more preferred route once it works again
+      try {
+        var ord = Order(); var c = curC; int at = ord.Count; for (int i = 0; i < ord.Count; i++) if (c != null && ord[i].Key == c.Key) at = i;
+        if (at == 0 || at >= ord.Count) return;
+        var better = ord.GetRange(0, at); var res = ProbeAll(better, 3500);
+        for (int i = 0; i < better.Count; i++) if (res[i] > 0) { Switch(better[i], "preferred route works again", true); return; }
+      } catch { }
+    }
+
+    public static string Status() { lock (lk) { return on ? "via " + (curC != null ? curC.Name : "?") + " since " + since.ToLocalTime().ToString("HH:mm:ss") + ", " + (switches - 1) + " switch(es)" : "normal connection (route layer off)"; } }
+
+    // every adapter, with a relay check through each one that is up and has a gateway
+    public static string Report(bool probe) {
+      var ads = Ads(); int best = -1;
+      try { var ip = RelayIp(); int bi; if (ip != null && GetBestInterface(BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0), out bi) == 0) best = bi; } catch { }
+      if (probe && relay != null && relay.Scheme == "https") {
+        var cs = new List<Cand>(); var who = new List<Ad>();
+        foreach (var a in ads) if (a.Up && a.If > 0 && (a.Gw.Length > 0 || a.Vpn)) { cs.Add(new Cand { Key = "if" + a.If, Name = a.Name, If = a.If }); who.Add(a); }
+        var res = ProbeAll(cs, 4000); for (int i = 0; i < who.Count; i++) who[i].Ms = res[i];
+      }
+      var sb = new StringBuilder();
+      sb.Append("agent link: ").Append(Status()).Append('\n');
+      foreach (var a in ads) {
+        sb.Append(a.Name).Append(" [").Append(a.Up ? "Up" : "Down").Append("] ").Append(a.Kind);
+        if (a.Up && a.Speed > 0 && a.Speed < 100000000000L) sb.Append(' ').Append(a.Speed >= 1000000000 ? (a.Speed / 1000000000.0).ToString("0.#") + " Gbit/s" : (a.Speed / 1000000) + " Mbit/s");
+        if (a.Ips.Length > 0) sb.Append("; ip ").Append(a.Ips); if (a.Gw.Length > 0) sb.Append("; gw ").Append(a.Gw); if (a.Dns.Length > 0) sb.Append("; dns ").Append(a.Dns);
+        if (a.Up) sb.Append(a.Dhcp ? "; dhcp" : "; static"); sb.Append("; mac ").Append(a.Mac);
+        if (a.If == best) sb.Append("; DEFAULT ROUTE to the internet");
+        if (curC != null && !curC.Sys && curC.If == a.If && on) sb.Append("; AGENT USES THIS");
+        if (a.Ms > 0) sb.Append("; relay ok ").Append(a.Ms).Append(" ms"); else if (a.Ms == -1) sb.Append("; relay FAIL");
+        sb.Append('\n');
+      }
+      lock (lk) { if (hist.Count > 0) { sb.Append("route log:\n"); foreach (var h in hist) sb.Append("  ").Append(h).Append('\n'); } }
+      return sb.ToString().TrimEnd();
     }
   }
 }
@@ -975,13 +1212,37 @@ function Do-System($a) {
                     Line ([F__BUILD__.Sys]::Procs($top, 200, $false))
                 }
                 'network' {
-                    Sec 'network'
-                    [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' } | ForEach-Object {
-                        $ipp = $_.GetIPProperties(); $v4 = @($ipp.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.Address.ToString() })
-                        if ($v4.Count) { Line ("{0}: ip {1}; gw {2}; dns {3}" -f $_.Name, ($v4 -join ', '), (@($ipp.GatewayAddresses | ForEach-Object { $_.Address.ToString() }) -join ', '), (@($ipp.DnsAddresses | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.ToString() }) -join ', ')) }
-                    }
+                    Sec 'network: every adapter (system {sections:["reach"]} also tests each against the relay)'
+                    Line ([F__BUILD__.Route]::Report($false))
                     $px = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
                     if ($px.ProxyEnable) { Line "proxy: $($px.ProxyServer)" }
+                    if ($px.AutoConfigURL) { Line "proxy auto-config: $($px.AutoConfigURL)" }
+                }
+                'reach' {
+                    Sec 'reach: which adapter gets through to the relay, what may be in the way'
+                    Line ([F__BUILD__.Route]::Report($true))
+                    $tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $NetToolsRx } | Sort-Object ProcessName | ForEach-Object { "$($_.ProcessName)($($_.Id))" })
+                    Line ("VPN / DPI-bypass / proxy / sniffer programs running: " + $(if ($tools.Count) { $tools -join ', ' } else { 'none' }))
+                    $svc = @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services' -Name -ErrorAction SilentlyContinue | Where-Object { $_ -match '^(WinDivert|npcap|npf|wintun|tap0901|NordLynx|WireGuard|Tailscale|ZeroTier|hamachi|Netfilter|nfsdk|SingBox|WARP|TunnelBear|Cisco|Fortinet|Amnezia)' })
+                    Line ("network filter drivers / services installed: " + $(if ($svc.Count) { $svc -join ', ' } else { 'none' }))
+                    if ($px = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue) { Line ("WinINET proxy: " + $(if ($px.ProxyEnable) { $px.ProxyServer } else { 'off' }) + $(if ($px.AutoConfigURL) { "; PAC $($px.AutoConfigURL)" } else { '' })) }
+                    Line ("WinHTTP proxy: " + ((netsh winhttp show proxy 2>$null) -join ' ' -replace '\s+', ' ').Trim())
+                    $hf = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+                    $he = @(Get-Content $hf -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*[0-9a-fA-F:.]+\s+\S+' -and $_ -notmatch '^\s*#' -and $_ -notmatch '\slocalhost\s*$' })
+                    Line ("hosts file: " + $(if ($he.Count) { "$($he.Count) custom entries: " + ((($he | Select-Object -First 6) | ForEach-Object { $_.Trim() }) -join ' | ') } else { 'no custom entries' }))
+                }
+                'connections' {
+                    Sec 'TCP connections by process (a process talking to many hosts, or to odd ports, is worth a look)'
+                    $names = @{}; foreach ($p in [Diagnostics.Process]::GetProcesses()) { $names[$p.Id] = $p.ProcessName }
+                    $by = @{}
+                    foreach ($l in (netstat -ano -p tcp 2>$null)) {
+                        if ($l -match '^\s*TCP\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+)') {
+                            $id = [int]$Matches[4]; if (-not $by.ContainsKey($id)) { $by[$id] = @{ est = 0; lis = 0; rem = New-Object Collections.Generic.List[string] } }
+                            if ($Matches[3] -eq 'ESTABLISHED') { $by[$id].est++; $r = $Matches[2]; if ($r -notmatch '^(127\.|\[::1\]|0\.0\.0\.0)' -and $by[$id].rem.Count -lt 4 -and -not $by[$id].rem.Contains($r)) { $by[$id].rem.Add($r) } }
+                            elseif ($Matches[3] -eq 'LISTENING') { $by[$id].lis++ }
+                        }
+                    }
+                    foreach ($e in ($by.GetEnumerator() | Sort-Object { $_.Value.est } -Descending | Select-Object -First $top)) { Line ("{0}({1}): {2} established, {3} listening  {4}" -f $names[$e.Key], $e.Key, $e.Value.est, $e.Value.lis, ($e.Value.rem -join ', ')) }
                 }
                 'drivers' {
                     Sec 'third-party / unsigned kernel drivers (running); Microsoft ones are hidden'
@@ -1801,6 +2062,7 @@ function Forget-Session {
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
+$NetToolsRx = '^(winws|zapret|goodbyedpi|clash|mihomo|verge|v2ray|xray|sing-box|nekoray|nekobox|v2rayn|hiddify|openvpn|wireguard|wg|tailscale|zerotier|hamachi|nordvpn|expressvpn|protonvpn|warp-svc|cloudflared|amnezia|outline|shadowsocks|windscribe|surfshark|forticlient|vpnui|pangps|fiddler|charles|mitmproxy|wireshark|dumpcap|privoxy|proxifier|netmod|psiphon|lantern)'
 function Diagnose-Net {   # what exactly is wrong right now: adapters, route, gateway, internet, DNS, the relay itself
     $u = [Uri]$RELAY; $d = [ordered]@{}
     try { $ad = @(Get-NetAdapter -ErrorAction Stop | Select-Object Name, Status, InterfaceDescription, LinkSpeed); $d.adapters = ($ad | ForEach-Object { "$($_.Name) [$($_.Status)] $($_.InterfaceDescription) $($_.LinkSpeed)" }) -join '; ' } catch { $ad = @(); $d.adapters = "unavailable: $_" }
@@ -1811,6 +2073,7 @@ function Diagnose-Net {   # what exactly is wrong right now: adapters, route, ga
     $d.ping_internet = Test-Ping '1.1.1.1'
     try { [void][Net.Dns]::GetHostAddresses($u.Host); $d.dns_ok = $true } catch { $d.dns_ok = $false; $d.dns_error = "$($_.Exception.InnerException.Message)" }
     try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect($u.Host, $u.Port, $null, $null); $d.relay_tcp = ($iar.AsyncWaitHandle.WaitOne(3000) -and $c.Connected); $c.Close() } catch { $d.relay_tcp = $false; $d.relay_error = "$($_.Exception.Message)" }
+    try { $d.route = [F__BUILD__.Route]::Status(); $d.tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $NetToolsRx } | ForEach-Object { $_.ProcessName } | Sort-Object -Unique) -join ',' } catch { }
     $d.class = if (-not $d.links_up.Count) { 'no_link' } elseif ($d.gateway -and $d.ping_gateway -eq $false) { 'lan_down' } elseif (-not $d.ping_internet) { 'isp_down' } elseif (-not $d.dns_ok) { 'dns' } elseif (-not $d.relay_tcp) { if ($d.vpn.Count) { 'relay_unreachable_vpn' } else { 'relay_unreachable' } } else { 'http_or_tls' }
     $d
 }
@@ -1835,9 +2098,17 @@ function Outage-Tick {   # after every failed poll: diagnose after ~4 s, repair 
     $el = ($now - $script:Out.t0).TotalSeconds
     if ($el -ge 4 -and -not $script:Out.diag) {
         $script:Out.diag = Diagnose-Net; $d = $script:Out.diag
-        Write-AgentLog ("diagnosis: class=$($d.class) gateway=$($d.gateway) ping_gw=$($d.ping_gateway) ping_inet=$($d.ping_internet) dns=$($d.dns_ok) relay_tcp=$($d.relay_tcp) vpn=$(@($d.vpn) -join ',')`n$($d.adapters)")
+        Write-AgentLog ("diagnosis: class=$($d.class) gateway=$($d.gateway) ping_gw=$($d.ping_gateway) ping_inet=$($d.ping_internet) dns=$($d.dns_ok) relay_tcp=$($d.relay_tcp) vpn=$(@($d.vpn) -join ',') route=$($d.route) tools=$($d.tools)`n$($d.adapters)")
     }
     if ($el -ge 10 -and $script:Out.diag -and -not $script:Out.healed) { $script:Out.healed = $true; $script:Out.acts = @(Heal-Net $script:Out.diag); Write-AgentLog ('repair attempt: ' + ($script:Out.acts -join ' | ')) }
+}
+$script:RouteQ = New-Object Collections.ArrayList; $script:RouteKey = ''
+function Route-Events {   # route switches seen by the watchdog: into the local log at once, to the relay as soon as it is reachable
+    try {
+        foreach ($e in [F__BUILD__.Route]::Drain()) { $t, $m = $e -split '\|', 2; Write-AgentLog "route: $m"; [void]$script:RouteQ.Add(@($t, $m)); if ($t -eq 'route') { Write-Orange ('  ' + [char]0x21C4 + ' ' + $m) } }
+        $k = [F__BUILD__.Route]::Key(); if ($k -and $k -ne $script:RouteKey) { $script:RouteKey = $k; try { [void](New-Item $StateDir -ItemType Directory -Force); Set-Content -Path (Join-Path $StateDir 'route.txt') -Value $k -Encoding ASCII } catch { } }
+        if ($script:Net -eq 'ok' -and $script:Token) { while ($script:RouteQ.Count) { $q = $script:RouteQ[0]; try { [void](Api '/a/event' @{ type = $q[0]; msg = $q[1] } $script:Token 6) } catch { break }; $script:RouteQ.RemoveAt(0) } }
+    } catch { }
 }
 function Outage-Over {
     if (-not $script:Out.t0) { return }
@@ -2024,13 +2295,15 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
 }
 
 function Start-Helper {
+    $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
     $mode = $env:HELPER_MODE
-    if ($mode -ne 'ask' -and $mode -ne 'full') {
+    if ($saved -and $saved.mode -in 'ask', 'full') { $mode = $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
+    elseif ($mode -ne 'ask' -and $mode -ne 'full') {
         $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] полный доступ' 'Mode: [1] ask before every action (recommended)  [2] full access')
         $mode = if ($ans.Trim() -eq '2') { 'full' } else { 'ask' }
     }
     $script:Mode = $mode
-    $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
+    try { [F__BUILD__.Route]::Init($RELAY, $(try { (Get-Content (Join-Path $StateDir 'route.txt') -ErrorAction Stop | Select-Object -First 1) } catch { '' }), (Join-Path $StateDir 'route.block')); [Net.WebRequest]::DefaultWebProxy = [F__BUILD__.Route]::Proxy } catch { Write-AgentLog "route layer: $_" }   # the link to the relay survives a VPN, zapret or a dead default route
     if ($saved) { $script:Mode = $mode = $saved.mode; $script:Persist = $true }
     elseif ($env:HELPER_PERSIST -in '0', '1') { $script:Persist = ($env:HELPER_PERSIST -eq '1') }
     elseif (-not [Console]::IsInputRedirected) { $script:Persist = ((Read-Host (T 'Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]' 'Keep this session through internet loss and reboots (the code stays the same)? [Y/n]')).Trim().ToLower() -notin 'n', 'no', 'н', 'нет') }
@@ -2042,7 +2315,7 @@ function Start-Helper {
         catch { Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…')); Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
     }
     $token = $r.token; $script:Token = $token; $code = $r.code
-    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } }
+    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } elseif (-not $env:HELPER_NO_AUTOSTART) { try { $af = Join-Path $StateDir 'agent.ps1'; if (-not (Test-Path $af) -or ((Get-Date) - (Get-Item $af).LastWriteTime).TotalHours -gt 24) { Install-Autostart } } catch { } } }
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
@@ -2075,18 +2348,19 @@ function Start-Helper {
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }
                     }
-                    $failed = $true
+                    $failed = $true; try { [F__BUILD__.Route]::Failed() } catch { }
                 }
                 if ($failed) {   # no internet, DNS, VPN switch, TLS, timeouts ... keep trying with backoff
                     $fails++
                     if ($fails -ge 2) { Net-State 'lost' }
                     Outage-Tick
                     try { [Net.ServicePointManager]::FindServicePoint([Uri]$RELAY).CloseConnectionGroup('') | Out-Null } catch { }   # drop connections that died with the old route
-                    Start-Sleep -Milliseconds ([int]([Math]::Min($delay, 10.0) * 1000 * (0.8 + 0.4 * (Get-Random -Maximum 1.0))))
-                    $delay = $delay * 1.7; continue
+                    Route-Events
+                    Start-Sleep -Milliseconds $(if ($fails -le 3) { 400 } else { [int]([Math]::Min($delay, 10.0) * 1000 * (0.8 + 0.4 * (Get-Random -Maximum 1.0))) })   # a route switch heals in a second or two: look again soon
+                    if ($fails -gt 3) { $delay = $delay * 1.7 }; continue
                 }
                 if ($fails) { Outage-Over }
-                $fails = 0; $delay = 1.0; Net-State 'ok'
+                $fails = 0; $delay = 1.0; Net-State 'ok'; try { [F__BUILD__.Route]::Ok() } catch { }; Route-Events
                 if ($script:OperatorSeen -and $script:Phase -eq 'ok' -and ([DateTime]::UtcNow - $script:LastOp).TotalMinutes -ge 5) { $script:Phase = 'away'; Overlay-Send 'state away'; Show-Status }
                 if ($resp.StatusCode -ne 200 -or -not $resp.Content) { continue }
                 $cmd = $resp.Content | ConvertFrom-Json

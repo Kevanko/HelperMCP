@@ -85,6 +85,7 @@ function helpText() {
     row('connect codex-win', 'команда для Codex (Windows)', 'the Codex command (Windows)'),
     row('connect other', 'URL и заголовок для любого клиента', 'URL and header for any client'),
     row('connect prompt', 'текст, чтобы ИИ подключился сам', 'a prompt so your AI connects itself'),
+    row('report [days]', 'журнал действий ИИ: ошибки, медленные вызовы, повторы, сбои сети', 'the AI action log: errors, slow calls, repeats, network failures'),
     row('domain <name>', 'задать домен, HTTPS включится сам', 'set a domain, HTTPS turns on by itself'),
     row('config', 'сменить домен / IP / порт по шагам', 'change domain / IP / port step by step'),
     row('key', 'новый ключ (старый перестанет работать)', 'new key (the old one stops working)'),
@@ -128,6 +129,11 @@ function aiPrompt() {
 
 const cmd = process.argv[2] || 'status';
 if (cmd === 'help') { console.log(helpText()); process.exit(0); }
+if (cmd === 'report') {
+  const { load, report } = await import('./report.mjs'); const f = process.env.ACT_FILE || (process.env.STATE_FILE ? process.env.STATE_FILE.replace(/[^/\\]*$/, 'actions.jsonl') : '/data/actions.jsonl'), days = Number(process.argv[3] || 7), misses = [];
+  try { for (const l of (await import('node:fs')).readFileSync(f.replace(/actions\.jsonl$/, 'misses.jsonl'), 'utf8').split('\n')) if (l) misses.push(JSON.parse(l)); } catch { /* none */ }
+  const ev = load(f, days); console.log(ev.length ? report(ev, { misses }) : t('в журнале пока ничего нет за этот период', 'nothing in the log for that period yet')); process.exit(0);
+}
 if (cmd === 'link') { console.log(url + '/'); process.exit(0); }
 if (cmd === 'connect') {
   const one = ONE[process.argv[3]];

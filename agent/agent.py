@@ -1008,6 +1008,8 @@ def system(a):
         elif s == "processes": add("processes (cpu%, mem%)", f"ps -eo pid,pcpu,pmem,comm --sort=-pcpu | head -{top + 1}")
         elif s == "network": add("network", "ip -br addr 2>/dev/null; ip route 2>/dev/null | head -3; grep -m3 nameserver /etc/resolv.conf")
         elif s == "services": add("failed services", "systemctl --failed --no-legend 2>/dev/null | head -30")
+        elif s == "reach": add("reach: adapters, default route, VPN / DPI / proxy programs", "ip -br addr 2>/dev/null; ip route get 1.1.1.1 2>/dev/null | head -1; ps -eo pid,comm | grep -Ei 'zapret|nfqws|goodbyedpi|clash|mihomo|v2ray|xray|sing-box|openvpn|wireguard|wg-quick|tailscale|zerotier|hamachi|warp|tor$' | grep -v grep; env | grep -i '_proxy=' ")
+        elif s == "connections": add("connections: TCP per process", f"ss -tnpH state established 2>/dev/null | awk '{{print $4, $5, $6}}' | head -{top * 3}")
         elif s == "startup": add("startup", "ls ~/.config/autostart /etc/xdg/autostart 2>/dev/null")
         elif s == "apps": add("apps", "(dpkg-query -W -f='${Package}\\n' 2>/dev/null || rpm -qa) | wc -l; flatpak list --app --columns=application 2>/dev/null | head -40")
         elif s == "drivers": add("loaded kernel modules (lsmod), biggest first", "lsmod | sort -k2 -n -r | head -40")

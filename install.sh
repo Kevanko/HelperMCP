@@ -102,7 +102,7 @@ DIR="$DIR"
 cd "\$DIR" || exit 1
 tty=-T; [ -t 1 ] && tty=""
 case "\${1:-status}" in
-  status|panel|connect|link|help|-h|--help) [ "\${1:-}" = -h ] || [ "\${1:-}" = --help ] && set -- help
+  status|panel|connect|link|report|help|-h|--help) [ "\${1:-}" = -h ] || [ "\${1:-}" = --help ] && set -- help
     exec docker compose exec \$tty -e HM_LANG="\${LC_ALL:-\${LANG:-}}" helpermcp node relay/cli.mjs "\${@:-status}" ;;
   domain) [ -n "\${2:-}" ] || { echo "usage: helpermcp domain help.example.com   (to drop the domain: helpermcp config)"; exit 1; }
     exec bash "\$DIR/install.sh" --reconfigure --yes --domain "\$2" ;;

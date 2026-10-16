@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -15,10 +16,10 @@ const kids = [];
 const stop = () => kids.forEach((k) => k.kill());
 process.on('exit', stop);
 
-const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`);
-fs.rmSync(STATE, { force: true });
+const STATE = path.join(os.tmpdir(), `hm-state-${PORT}.json`), ACT = path.join(os.tmpdir(), `hm-actions-${PORT}.jsonl`);
+fs.rmSync(STATE, { force: true }); fs.rmSync(ACT, { force: true });
 const startRelay = async () => {
-  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', TEST_FAKE_LATENCY_MS: process.env.GUI ? '2500' : '0', STATE_FILE: STATE }, stdio: 'inherit' });
+  const r = spawn('node', [path.join(root, 'relay/server.js')], { env: { ...process.env, PORT, OPERATOR_KEY: KEY, IDLE_MS: '3000', JOB_SYNC_MS: '3000', TEST_FAKE_LATENCY_MS: process.env.GUI ? '2500' : '0', STATE_FILE: STATE, ACT_FILE: ACT }, stdio: 'inherit' });
   kids.push(r);
   for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/health')).ok) break; } catch {} await new Promise((x) => setTimeout(x, 100)); }
   return r;
@@ -172,6 +173,10 @@ console.log(sy.slice(0, 1800)); assert.match(sy, /== overview/); assert.match(sy
 assert.match(sy, /cpu%|pcpu|cpu/i, 'processes show cpu usage');
 const drv = txt(await tool('system', { session: code, sections: ['drivers'] }));
 assert.ok(/running|third-party|module/i.test(drv), 'drivers section answers: ' + drv.slice(0, 80)); console.log('system processes + drivers ok');
+const nc = txt(await tool('system', { session: code, sections: ['network', 'connections', 'reach'] }));
+assert.match(nc, /== network/); assert.match(nc, /== connections|== TCP connections/); assert.match(nc, /== reach/);
+if (useps) { assert.match(nc, /\[Up\]/, 'every adapter is listed with its state'); assert.match(nc, /agent link:/, 'the route layer reports the agent link'); assert.match(nc, /VPN \/ DPI-bypass/, 'reach names VPN / DPI tools'); }
+console.log('system network / connections / reach ok');
 assert.match(txt(await tool('util', { session: code, op: 'env_get', name: 'PATH' })), useps ? /process: .+/ : /.+/);
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
 const zp = path.join(tmp, 'tree-copy.zip');
@@ -187,6 +192,18 @@ assert.match(txt(await tool('run', { session: code, command: 'node', args: ['-e'
 const nf = await raw('run', { session: code, command: 'definitely-not-a-program-xyz --version' });
 assert.match(nf.content.map((c) => c.text).join(' '), /HINT: The program is not installed/);
 assert.match(txt(await tool('misses', { limit: 5 })), /"hint":"not-found-cmd"/, 'the failure is in the mistake log'); console.log('error hint + mistake log ok');
+// the action log: every call is kept for later analysis, typed text / file contents are not, secrets are masked, failures are grouped by `report`
+await tool('write_file', { session: code, path: path.join(tmp, 'secret.txt'), content: 'hunter2secret-content' });
+await tool('run', { session: code, command: 'echo password=abc12345xyz' }).catch(() => {});
+await tool('read_file', { session: code, path: path.join(tmp, 'does-not-exist.txt') }).catch(() => {});
+await new Promise((x) => setTimeout(x, 300));
+const rawLog = fs.readFileSync(ACT, 'utf8'); const entries = rawLog.trim().split('\n').map((l) => JSON.parse(l));
+assert.ok(entries.some((e) => e.tool === 'write_file' && /<21 chars>/.test(e.a)), 'file contents are never logged, only their length');
+assert.ok(!rawLog.includes('hunter2secret') && !rawLog.includes('abc12345xyz'), 'secrets are masked in the log');
+const miss = entries.find((e) => e.tool === 'read_file' && e.ok === false); assert.ok(miss && miss.err && miss.ms >= 0, 'a failed call is logged with its error');
+assert.ok(entries.some((e) => e.kind === 'event'), 'agent events (register, resume, outage, route) are logged too');
+const { load, report } = await import(pathToFileURL(path.join(root, 'relay/report.mjs')).href);
+const rep = report(load(ACT, 1)); assert.match(rep, /== per tool/); assert.match(rep, /failures grouped by cause/); assert.match(rep, /read_file/); console.log('action log + report ok');
 const FDIR = path.join(path.dirname(STATE), 'files');
 for (const f of fs.readdirSync(FDIR)) assert.ok(!fs.readFileSync(path.join(FDIR, f)).includes(blob.subarray(1000, 1064)), 'a fetched file must not be readable on the relay disk');
 await new Promise((r) => setTimeout(r, 500));

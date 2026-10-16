@@ -59,6 +59,7 @@ They open it, run the line for their system and send you the code. Tell your AI:
 | `helpermcp config` | change domain / IP / port step by step |
 | `helpermcp key` | new operator key |
 | `helpermcp update` | update to the latest version |
+| `helpermcp report [days]` | what the AI did and where it failed: errors grouped by cause with the call to replay, slow calls, repeated sequences, outages and route switches |
 | `helpermcp logs` / `restart` | logs, restart |
 
 ## What your friend sees
@@ -85,6 +86,19 @@ They open it, run the line for their system and send you the code. Tell your AI:
 - **Long jobs:** installs and renders don't time out, the AI collects the result later.
 
 The AI opens a **live view** for you right away: a view-only link to share and a control link to click, type and take over, then hand back.
+
+## A link that holds
+
+The session survives VPNs, DPI-bypass tools (zapret and the like) and reboots, and it never waits for a keypress once the friend said *Yes* to keeping it.
+
+- **Reboot:** the helper starts again with Windows in a visible window and takes the same code back at once; the saved session decides the mode, so nothing is asked.
+- **Route layer (Windows):** the helper talks to the relay through a tiny local bridge that can leave through any chosen network adapter. A watchdog checks the relay every few seconds; when it stops answering, every adapter is tried at once and the helper moves to the first one that works (physical adapters first, then the default route, a system proxy, VPN adapters last). It only ever moves to a path that has just worked, remembers the last good one across restarts, and logs every switch. A stuck connection on the dead path is cut instantly.
+- **Look at the network:** `system {sections:["reach"]}` lists every adapter (type, speed, IP, gateway, DNS, MAC), which one is the default route, which one the helper uses, whether each reaches the relay, the VPN / DPI-bypass / proxy programs and filter drivers installed, proxies and the hosts file; `connections` shows who talks to whom.
+- **Not touched:** VPN adapters are never restarted; an adapter restart needs administrator rights and is only tried for a dead physical link.
+
+## The action log
+
+Every call is appended to `data/actions.jsonl` on the server: tool, arguments, result (cut short), time, errors with the hint that was given, and what the agents report (outages with their diagnosis, route switches, resumes). Typed text, file contents and values are never written, only their length; obvious secrets are masked. `helpermcp report [days]` turns it into: failures grouped by cause with the exact call to replay, the slowest calls, sequences that repeat (candidates for one combined tool), stuck loops, and the network events.
 
 ## Android
 

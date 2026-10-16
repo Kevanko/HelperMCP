@@ -721,7 +721,7 @@ function viewerPage(s) {
   const who = s ? `${s.info.user}@${s.info.host}` : '';
   const android = s && /android/i.test(s.info?.os || '') ? 1 : 0;
   const esc = (x) => x.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  return `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><title>Remote screen ${esc(who)}</title>
+  return `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><link rel=icon type=image/svg+xml href=/logo.svg><title>Remote screen ${esc(who)}</title>
 <style>
 :root{--bg:#020a06;--panel:#07140c;--panel2:#0a1d12;--line:#16482b;--line2:#2bb55a;--g:#38ff7a;--fg:#d6ffe4;--mut:#7fae8f;--warn:#ffd166;--hot:#ff8a1e;--st:#38ff7a;--kb:0px}
 *{box-sizing:border-box}
@@ -931,7 +931,7 @@ async function handler(req, res) {
     res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; connect-src 'self'; frame-ancestors 'none'");
     if (await adminHandle(req, res, url)) return;
     if (p === '/health') return text(res, 200, 'ok');
-    if (p === '/favicon.ico') { res.writeHead(204); return res.end(); }
+    if (p === '/logo.svg' || p === '/favicon.svg' || p === '/favicon.ico') { res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' }); return res.end(fs.readFileSync(path.join(here, 'logo.svg'))); }
     if (p === '/assets/panels.js' || p === '/assets/panels.css') {   // the viewer's System / Files drawer
       const f = path.join(here, p.slice(8));
       try { res.writeHead(200, { 'content-type': p.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' }); return res.end(fs.readFileSync(f)); }

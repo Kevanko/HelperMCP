@@ -37,7 +37,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
   const sessionOf = (req) => { const t = cookieOf(req); if (!t) return null; const s = logins.get(sha(t)); if (!s) return null; const now = Date.now(); if (s.exp < now || now - s.last > IDLE_MS) { logins.delete(sha(t)); return null; } s.last = now; return s; };
   const send = (res, code, obj) => { res.setHeader('cache-control', 'no-store'); return d.json(res, code, obj); };
   const asset = (res, name, type) => { try { res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache' }); res.end(fs.readFileSync(path.join(d.here, name))); } catch { d.text(res, 404, 'not found'); } };
-  const page = `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><meta name=robots content=noindex><title>HelperMCP admin</title><link rel=stylesheet href=/admin/assets/admin.css><div id=app></div><script src=/admin/assets/admin.js></script></html>`;
+  const page = `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><meta name=robots content=noindex><link rel=icon type=image/svg+xml href=/logo.svg><title>HelperMCP admin</title><link rel=stylesheet href=/admin/assets/admin.css><div id=app></div><script src=/admin/assets/admin.js></script></html>`;
 
   return async function handle(req, res, url) {
     const p = url.pathname;

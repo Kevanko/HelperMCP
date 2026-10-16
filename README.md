@@ -1,5 +1,6 @@
 <div align="center">
 
+<img src="relay/logo.svg" width="96" alt="HelperMCP logo">
 # HelperMCP
 
 **Your AI fixes a friend's computer or phone, while they watch.**

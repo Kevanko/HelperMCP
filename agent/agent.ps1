@@ -7,7 +7,7 @@ if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'Power
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = $env:HELPER_LANG -eq 'ru'   # the console speaks English; HELPER_LANG=ru for Russian
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'fsop', 'util', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'fsop', 'util', 'ui_click', 'ui_set', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
@@ -1058,6 +1058,246 @@ function Do-Watch($a) {
     $moving = @($changes | Select-Object -Skip 1 | Where-Object { $_ -ge 0.2 }).Count
     $sum = if (-not $moving) { "nothing moved during $sec s" } elseif ($lastChange -lt $sec - 2 / $fps) { "changes in $moving of $($n - 1) frames, settled after $([Math]::Round($lastChange, 1)) s" } else { "still changing at the end ($moving of $($n - 1) frames changed)" }
     @{ jpeg = $ms.ToArray(); mime = 'image/jpeg'; text = "$n frames over $sec s, $sum. Change per frame (%): $($changes -join ', ')" }
+}
+# ---- ui_tree / ui_click / ui_set: the controls of a window as text through UI Automation (compiled on first use, so a start costs nothing)
+function Ensure-Ui {
+    if ($script:UiReady) { return }
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, WindowsBase
+        Add-Type -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase -TypeDefinition @'
+using System; using System.Collections.Generic; using System.Diagnostics; using System.Text; using System.Threading; using System.Runtime.InteropServices; using System.Windows.Automation;
+namespace A__BUILD__ {
+  public static class Ui {   // the controls of a window as text (UI Automation): read, press, fill - no pictures, no coordinates to guess
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    public class Node { public AutomationElement El; public string Type = "", Name = "", Aid = "", Val; public string[] Flags = new string[0]; public bool Enabled = true; public int X, Y, W, H; }
+    delegate void Job();
+    static List<AutomationElement> Cache = new List<AutomationElement>();
+    static AutomationElement Picked;
+    const string Inter = " button check combo edit link listitem menuitem radio slider spinner tabitem treeitem splitbutton document dataitem headeritem ";
+
+    static CacheRequest Req() {
+      CacheRequest r = new CacheRequest();
+      r.Add(AutomationElement.NameProperty); r.Add(AutomationElement.ControlTypeProperty); r.Add(AutomationElement.BoundingRectangleProperty);
+      r.Add(AutomationElement.IsEnabledProperty); r.Add(AutomationElement.IsOffscreenProperty); r.Add(AutomationElement.HasKeyboardFocusProperty);
+      r.Add(AutomationElement.AutomationIdProperty); r.Add(AutomationElement.IsPasswordProperty);
+      r.Add(ValuePattern.ValueProperty); r.Add(ValuePattern.IsReadOnlyProperty);
+      r.Add(TogglePattern.ToggleStateProperty); r.Add(SelectionItemPattern.IsSelectedProperty); r.Add(ExpandCollapsePattern.ExpandCollapseStateProperty);
+      return r;
+    }
+    static object CP(AutomationElement e, AutomationProperty p) { try { return e.GetCachedPropertyValue(p, true); } catch { return null; } }
+    static string Cap(string s, int n) { if (s == null) return ""; s = s.Replace("\r", " ").Replace("\n", " ").Trim(); return s.Length > n ? s.Substring(0, n - 2) + ".." : s; }
+    static string TypeName(AutomationElement e) {
+      string p = e.Cached.ControlType.ProgrammaticName; int i = p.LastIndexOf('.'); p = (i >= 0 ? p.Substring(i + 1) : p).ToLowerInvariant();
+      switch (p) { case "checkbox": return "check"; case "combobox": return "combo"; case "hyperlink": return "link"; case "radiobutton": return "radio"; default: return p; }
+    }
+    static Node Make(AutomationElement e) {
+      Node n = new Node(); n.El = e;
+      try {
+        n.Type = TypeName(e); n.Name = e.Cached.Name ?? ""; n.Aid = e.Cached.AutomationId ?? ""; n.Enabled = e.Cached.IsEnabled;
+        System.Windows.Rect r = e.Cached.BoundingRectangle;
+        if (!r.IsEmpty && !double.IsInfinity(r.X) && !double.IsInfinity(r.Y)) { n.X = (int)r.X; n.Y = (int)r.Y; n.W = (int)r.Width; n.H = (int)r.Height; }
+        object v = CP(e, ValuePattern.ValueProperty); if (v is string && !e.Cached.IsPassword) n.Val = (string)v;
+        List<string> f = new List<string>();
+        if (!n.Enabled) f.Add("disabled");
+        if (e.Cached.HasKeyboardFocus) f.Add("focused");
+        object ro = CP(e, ValuePattern.IsReadOnlyProperty); if (ro is bool && (bool)ro) f.Add("readonly");
+        object t = CP(e, TogglePattern.ToggleStateProperty); if (t is ToggleState) { if ((ToggleState)t == ToggleState.On) f.Add("checked"); else if ((ToggleState)t == ToggleState.Indeterminate) f.Add("partial"); }
+        object s = CP(e, SelectionItemPattern.IsSelectedProperty); if (s is bool && (bool)s) f.Add("selected");
+        object x = CP(e, ExpandCollapsePattern.ExpandCollapseStateProperty); if (x is ExpandCollapseState) { if ((ExpandCollapseState)x == ExpandCollapseState.Collapsed) f.Add("collapsed"); else if ((ExpandCollapseState)x == ExpandCollapseState.Expanded) f.Add("expanded"); }
+        n.Flags = f.ToArray();
+      } catch { return null; }
+      return n;
+    }
+    static void Visit(AutomationElement e, TreeWalker w, CacheRequest rq, int depth, List<Node> acc, int[] budget, DateTime stop) {
+      if (budget[0] <= 0 || DateTime.UtcNow > stop || depth > 60) return;
+      budget[0]--;
+      Node n = Make(e);
+      if (n != null) { bool off = false; try { off = e.Cached.IsOffscreen; } catch { } if (off && depth > 0) return; acc.Add(n); }
+      AutomationElement c = null;
+      try { c = w.GetFirstChild(e, rq); } catch { }
+      while (c != null) {
+        Visit(c, w, rq, depth + 1, acc, budget, stop);
+        if (budget[0] <= 0 || DateTime.UtcNow > stop) break;
+        try { c = w.GetNextSibling(c, rq); } catch { c = null; }
+      }
+    }
+    static List<Node> Collect(AutomationElement win) {
+      CacheRequest rq = Req(); List<Node> acc = new List<Node>();
+      Visit(win.GetUpdatedCache(rq), TreeWalker.ControlViewWalker, rq, 0, acc, new int[] { 9000 }, DateTime.UtcNow.AddSeconds(8));
+      return acc;
+    }
+    static string ProcName(int pid) { try { return Process.GetProcessById(pid).ProcessName; } catch { return "?"; } }
+    static AutomationElement PickWindow(string key) {
+      if (string.IsNullOrEmpty(key)) {   // the window in front, skipping our own console and overlay
+        IntPtr h = GetForegroundWindow(); uint me = (uint)Process.GetCurrentProcess().Id; IntPtr con = GetConsoleWindow();
+        for (int i = 0; i < 60 && h != IntPtr.Zero; i++) {
+          uint pid; GetWindowThreadProcessId(h, out pid);
+          if (pid != me && h != con && IsWindowVisible(h) && GetWindowTextLength(h) > 0) { try { return AutomationElement.FromHandle(h); } catch { } }
+          h = GetWindow(h, 2);
+        }
+      }
+      StringBuilder list = new StringBuilder();
+      foreach (AutomationElement w in AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition)) {
+        string title = ""; int pid2 = 0; try { title = w.Current.Name ?? ""; pid2 = w.Current.ProcessId; } catch { continue; }
+        if (title.Length == 0) continue;
+        string pn = ProcName(pid2);
+        if (!string.IsNullOrEmpty(key) && (title.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0 || pn.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0)) return w;
+        list.Append(pn).Append(": ").Append(Cap(title, 50)).Append(" | ");
+      }
+      throw new Exception((string.IsNullOrEmpty(key) ? "No window in front." : "No such window.") + " Open windows: " + list);
+    }
+    static bool Wanted(Node n, bool all) {
+      if (n.W <= 0 || n.H <= 0) return false;
+      if (all) return true;
+      if (n.Type == "window") return n.Name.Length > 0;
+      if (n.Type == "text") return n.Name.Length > 0;
+      if (Inter.IndexOf(" " + n.Type + " ", StringComparison.Ordinal) < 0) return false;
+      return n.Name.Length > 0 || n.Aid.Length > 0 || !string.IsNullOrEmpty(n.Val) || n.Type == "edit" || n.Type == "document";
+    }
+    static string Label(Node n) { return n.Name.Length > 0 ? n.Name : (n.Aid.Length > 0 ? "{" + n.Aid + "}" : ""); }
+    static int Cx(Node n, double sc, int ox) { return (int)((n.X + n.W / 2.0 - ox) / sc); }
+    static int Cy(Node n, double sc, int oy) { return (int)((n.Y + n.H / 2.0 - oy) / sc); }
+
+    public static string Tree(string window, string query, int max, bool all, double sc, int ox, int oy) {
+      if (sc <= 0) sc = 1;
+      AutomationElement win = PickWindow(window); List<Node> acc = Collect(win);
+      string wt = ""; int wp = 0; try { wt = win.Current.Name; wp = win.Current.ProcessId; } catch { }
+      Cache = new List<AutomationElement>(); StringBuilder sb = new StringBuilder();
+      sb.Append("window \"" + Cap(wt, 80) + "\" (" + ProcName(wp) + ")\n");
+      int shown = 0, total = 0; bool first = true;
+      foreach (Node n in acc) {
+        if (first) { first = false; continue; }
+        if (!Wanted(n, all)) continue;
+        string lab = Label(n);
+        if (!string.IsNullOrEmpty(query) && (lab + " " + n.Val + " " + n.Aid).IndexOf(query, StringComparison.OrdinalIgnoreCase) < 0) continue;
+        total++; if (shown >= max) continue;
+        Cache.Add(n.El); shown++;
+        sb.Append(shown).Append(' ').Append(n.Type);
+        if (lab.Length > 0) sb.Append(" \"").Append(Cap(lab, 70)).Append('"');
+        if (!string.IsNullOrEmpty(n.Val)) sb.Append(" =\"").Append(Cap(n.Val, 60)).Append('"');
+        sb.Append(" @").Append(Cx(n, sc, ox)).Append(',').Append(Cy(n, sc, oy));
+        foreach (string f in n.Flags) sb.Append(' ').Append(f);
+        sb.Append('\n');
+      }
+      if (shown == 0) return sb + "nothing readable here" + (acc.Count <= 1 ? " (the window shows no controls to this agent: a game, a custom-drawn app or an administrator window)" : (string.IsNullOrEmpty(query) ? "" : " matches '" + query + "'")) + ": use screenshot.";
+      if (total > shown) sb.Append("... ").Append(total - shown).Append(" more (use query or max)\n");
+      return sb.ToString();
+    }
+    static bool TypeOk(string have, string want) {
+      if (string.IsNullOrEmpty(want)) return true;
+      want = want.ToLowerInvariant().Replace(" ", "");
+      switch (want) { case "checkbox": want = "check"; break; case "combobox": want = "combo"; break; case "hyperlink": want = "link"; break; case "radiobutton": want = "radio"; break; case "textbox": case "input": case "field": want = "edit"; break; }
+      return have == want || (want == "tab" && have == "tabitem") || (want == "menu" && have == "menuitem") || (want == "item" && have.EndsWith("item"));
+    }
+    // -> [description, centre x, centre y] (real pixels); the control is remembered for Act / Set
+    public static string[] Pick(int id, string name, string type, string window) {
+      AutomationElement el = null;
+      if (id > 0) {
+        if (id > Cache.Count) throw new Exception("No control #" + id + ": run ui_tree first, ids come from the last ui_tree");
+        el = Cache[id - 1];
+        try { string chk = el.Current.Name; } catch { throw new Exception("Control #" + id + " is gone (the window changed): run ui_tree again"); }
+      } else {
+        if (string.IsNullOrEmpty(name)) throw new Exception("Give an id (from ui_tree) or a name");
+        AutomationElement win = PickWindow(window); List<Node> acc = Collect(win);
+        List<Node> best = new List<Node>(); int bestRank = 0; bool first = true;
+        foreach (Node n in acc) {
+          if (first) { first = false; continue; }
+          if (n.W <= 0 || n.H <= 0 || !TypeOk(n.Type, type)) continue;
+          int sc = 0;
+          if (string.Equals(n.Name, name, StringComparison.OrdinalIgnoreCase) || string.Equals(n.Aid, name, StringComparison.OrdinalIgnoreCase)) sc = 3;
+          else if (n.Name.StartsWith(name, StringComparison.OrdinalIgnoreCase)) sc = 2;
+          else if (n.Name.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) sc = 1;
+          if (sc == 0) continue;
+          int rank = sc * 10 + (Inter.IndexOf(" " + n.Type + " ", StringComparison.Ordinal) >= 0 ? 5 : 0) + (n.Enabled ? 1 : 0);
+          if (rank > bestRank) { bestRank = rank; best.Clear(); }
+          if (rank == bestRank) { bool dup = false; foreach (Node o in best) if (o.Type == n.Type && Math.Abs(o.X - n.X) < 3 && Math.Abs(o.Y - n.Y) < 3) dup = true; if (!dup) best.Add(n); }
+        }
+        if (best.Count == 0) throw new Exception("No control named '" + name + "'" + (string.IsNullOrEmpty(type) ? "" : " of type " + type) + " in this window: run ui_tree (query) to see what is there, or use screenshot.");
+        if (best.Count > 1) {
+          Cache = new List<AutomationElement>(); StringBuilder l = new StringBuilder();
+          for (int i = 0; i < best.Count && i < 8; i++) { Cache.Add(best[i].El); l.Append("#" + (i + 1) + " " + best[i].Type + " \"" + Cap(Label(best[i]), 40) + "\" at " + best[i].X + "," + best[i].Y + "; "); }
+          throw new Exception("Several controls match '" + name + "': " + l + "repeat with id (the numbers above) or a more exact name / type.");
+        }
+        el = best[0].El;
+      }
+      Node fresh = Make(el.GetUpdatedCache(Req())); if (fresh == null) throw new Exception("The control cannot be read any more: run ui_tree again");
+      Picked = el;
+      return new string[] { fresh.Type + " \"" + Cap(Label(fresh), 50) + "\"", (fresh.X + fresh.W / 2).ToString(), (fresh.Y + fresh.H / 2).ToString() };
+    }
+    static string Guarded(Job j, string ok) {   // Invoke on a button that opens a modal dialog does not return until the dialog closes
+      Exception err = null; Thread t = new Thread(delegate() { try { j(); } catch (Exception e) { err = e; } }); t.IsBackground = true; t.Start();
+      if (!t.Join(1500)) return ok + " (the app is still busy: a dialog probably opened)";
+      if (err != null) throw err;
+      return ok;
+    }
+    // null = the control has no action of its own: the caller clicks its centre
+    public static string Act() {
+      AutomationElement el = Picked; if (el == null) throw new Exception("nothing picked");
+      if (!el.Current.IsEnabled) throw new Exception("the control is disabled");
+      object p;
+      try {
+        if (el.TryGetCurrentPattern(InvokePattern.Pattern, out p)) { InvokePattern ip = (InvokePattern)p; return Guarded(delegate { ip.Invoke(); }, "pressed"); }
+        if (el.TryGetCurrentPattern(SelectionItemPattern.Pattern, out p)) { ((SelectionItemPattern)p).Select(); return "selected"; }
+        if (el.TryGetCurrentPattern(TogglePattern.Pattern, out p)) { TogglePattern tp = (TogglePattern)p; tp.Toggle(); return "toggled (now " + tp.Current.ToggleState.ToString().ToLowerInvariant() + ")"; }
+        if (el.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out p)) { ExpandCollapsePattern xp = (ExpandCollapsePattern)p; if (xp.Current.ExpandCollapseState == ExpandCollapseState.Expanded) { xp.Collapse(); return "collapsed"; } xp.Expand(); return "expanded"; }
+      } catch (Exception) { return null; }
+      return null;
+    }
+    // null = no direct value access: the caller focuses it and types
+    public static string Set(string value) {
+      AutomationElement el = Picked; if (el == null) throw new Exception("nothing picked");
+      bool pw = false; try { pw = el.Current.IsPassword; } catch { }
+      object p;
+      if (el.TryGetCurrentPattern(ValuePattern.Pattern, out p)) {
+        ValuePattern vp = (ValuePattern)p;
+        if (vp.Current.IsReadOnly) throw new Exception("the control is read-only");
+        Guarded(delegate { vp.SetValue(value); }, "");
+        if (pw) return "set (password, not shown)";
+        string now = ""; try { now = vp.Current.Value; } catch { }
+        return now == value ? "set" : "set, but it now holds \"" + Cap(now, 80) + "\" (the control may reformat the value, or ignore it: check with ui_tree)";
+      }
+      if (el.TryGetCurrentPattern(RangeValuePattern.Pattern, out p)) {
+        double d; if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out d)) throw new Exception("this control wants a number");
+        RangeValuePattern rp = (RangeValuePattern)p; rp.SetValue(d); return "set to " + rp.Current.Value;
+      }
+      return null;
+    }
+    public static void Focus() { if (Picked != null) Picked.SetFocus(); }
+  }
+}
+'@
+    } catch { throw 'UI Automation is not available on this PC: use screenshot and click.' }
+    $script:UiReady = $true
+}
+function Do-UiTree($a) { Ensure-Ui; @{ text = [A__BUILD__.Ui]::Tree([string]$a.window, [string]$a.query, (Int-Or $a.max 120), [bool]$a.all, [double]$Scale, [int]$script:OriginX, [int]$script:OriginY) } }
+function Do-UiClick($a) {
+    Ensure-Ui
+    $p = [A__BUILD__.Ui]::Pick((Int-Or $a.id 0), [string]$a.name, [string]$a.type, [string]$a.window); $cx = [int]$p[1]; $cy = [int]$p[2]
+    $btn = if ($a.right) { 'right' } else { 'left' }
+    if ($a.right -or $a.double) { return @{ text = "$($p[0]): " + (Do-Click @{ x = $cx; y = $cy; raw = $true; button = $btn; double = [bool]$a.double }).text } }
+    Overlay-Send 'active'; Glide $cx $cy $null; Start-Sleep -Milliseconds 200
+    $pb = Probe-Take (Around $cx $cy 640 400)
+    Overlay-Send "click $cx $cy left"
+    $how = [A__BUILD__.Ui]::Act()
+    if ($null -eq $how) { return @{ text = "$($p[0]): no action of its own, clicked it; " + (Do-Click @{ x = $cx; y = $cy; raw = $true; button = 'left' }).text } }
+    Start-Sleep -Milliseconds 700
+    @{ text = "$($p[0]): $how; " + (Probe-Report $pb (Probe-Take (Around $cx $cy 640 400)) 'click' $false) }
+}
+function Do-UiSet($a) {
+    Ensure-Ui
+    $p = [A__BUILD__.Ui]::Pick((Int-Or $a.id 0), [string]$a.name, '', [string]$a.window); $cx = [int]$p[1]; $cy = [int]$p[2]
+    Overlay-Send 'active'; Glide $cx $cy $null
+    $r = [A__BUILD__.Ui]::Set([string]$a.value)
+    if ($null -eq $r) {   # no value access: focus the control and type
+        [A__BUILD__.Ui]::Focus(); Start-Sleep -Milliseconds 150
+        [void](Do-PressKey @{ keys = 'ctrl+a' }); return @{ text = "$($p[0]): typed (it has no direct value access); " + (Do-TypeText @{ text = [string]$a.value }).text }
+    }
+    @{ text = "$($p[0]): $r" }
 }
 function Do-FocusWindow($a) {
     $wins = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | Select-Object Id, ProcessName, MainWindowTitle, MainWindowHandle)
@@ -2373,10 +2613,10 @@ $script:Token = $null; $script:Mode = 'auto'; $script:Code = $null; $script:Last
 # ---- the friend's console: a pinned header with the session code (copied to the clipboard), Esc ends the session at any moment, a soft chime and a flashing window
 # when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
 # and after the answer the window focus and the pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
-$AskGroup = @{ click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; fsop = 'files'; util = 'commands'
+$AskGroup = @{ ui_click = 'input'; ui_set = 'input'; click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; fsop = 'files'; util = 'commands'
     write_file = 'files'; edit_file = 'files'; push_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
-$Quiet = @{ watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
+$Quiet = @{ ui_tree = @('читаю элементы окна', 'reading the window controls'); watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP')
     tree = @('смотрю папки', 'looking through folders'); find = @('ищу файлы', 'searching files'); system = @('смотрю состояние системы', 'reading the system state'); sysdata = @('читаю состояние системы', 'reading the system state'); fsop = @('работаю с файлами', 'working with files') }
 function Group-Label($g) { switch ($g) { 'input' { T 'мышь и клавиатура' 'mouse & keyboard' } 'commands' { T 'команды' 'commands' } 'files' { T 'файлы' 'files' } default { 'MCP' } } }
@@ -2404,6 +2644,7 @@ function Steps-Of($name, $a) {   # the steps of a tool call; a move right before
     $out
 }
 function Describe-Action($name, $a) {   # -> array of short sentences
+    if ($name -eq 'ui_click' -or $name -eq 'ui_set') { $who = if ($a.name) { [string]$a.name } else { "#$($a.id)" }; return @($(if ($name -eq 'ui_click') { (T 'нажать: ' 'press: ') + (Cut $who 60) } else { (T 'ввести в поле ' 'fill in ') + (Cut $who 40) + ': ' + (Cut ([string]$a.value) 40) })) }
     if ($AskGroup[$name] -eq 'input') { return @(Steps-Of $name $a | ForEach-Object { Step-Text $_ }) }
     $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'edit_file' { T 'изменить файл: ' 'edit file: ' } 'push_file' { T 'получить файл: ' 'receive file: ' } 'fsop' { (T 'файлы: ' 'files: ') + $a.op + ' ' } 'util' { (T 'утилита: ' 'utility: ') + $a.op + ' ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
     $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } elseif ($a.url) { $a.url } elseif ($name -eq 'util') { '' } else { ($a | ConvertTo-Json -Compress) }
@@ -2620,7 +2861,7 @@ function Ask-Permission($name, $a) {
     else { Write-Host ('     ' + [char]0x221A + ' ' + (T 'разрешено' 'allowed')) -ForegroundColor Green }
     Restore-Focus $fg
 }
-$GuiTools = 'click', 'move', 'drag', 'scroll', 'type_text', 'press_key', 'actions'
+$GuiTools = 'ui_click', 'ui_set', 'click', 'move', 'drag', 'scroll', 'type_text', 'press_key', 'actions'
 function Resume-State($name, $a) {   # put the window focus and the pointer back where the previous AI action left them
     if ($GuiTools -notcontains $name -or -not $script:AiAt -or ([DateTime]::UtcNow - $script:AiAt).TotalSeconds -gt 90) { return }
     $first = (Steps-Of $name $a | Select-Object -First 1).do
@@ -2678,7 +2919,7 @@ function Process-Command($cmd) {
         Resume-State $name $a
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; ui_tree = 'Do-UiTree'; ui_click = 'Do-UiClick'; ui_set = 'Do-UiSet'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true; $res.data = & $fn $a
         Mark-State $name

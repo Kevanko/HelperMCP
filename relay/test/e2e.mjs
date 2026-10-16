@@ -194,6 +194,34 @@ assert.match(txt(await tool('run', { session: code, command: 'node', args: ['-e'
 const nf = await raw('run', { session: code, command: 'definitely-not-a-program-xyz --version' });
 assert.match(nf.content.map((c) => c.text).join(' '), /HINT: The program is not installed/);
 assert.match(txt(await tool('misses', { limit: 5 })), /"hint":"not-found-cmd"/, 'the failure is in the mistake log'); console.log('error hint + mistake log ok');
+
+// ui_tree / ui_click / ui_set: a real window read as text, pressed and filled without a picture (Windows UI Automation)
+if (useps) {
+  const formFile = path.join(tmp, 'form.ps1');
+  fs.writeFileSync(formFile, '\ufeff' + [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    "$f = New-Object Windows.Forms.Form; $f.Text = 'HM UI Test'; $f.Width = 420; $f.Height = 260; $f.StartPosition = 'CenterScreen'",
+    "$b = New-Object Windows.Forms.Button; $b.Text = 'Press me'; $b.Left = 20; $b.Top = 20; $b.Width = 120; $b.Add_Click({ $f.Text = 'HM UI Test clicked' })",
+    "$t = New-Object Windows.Forms.TextBox; $t.Name = 'txtName'; $t.Left = 20; $t.Top = 70; $t.Width = 200",
+    "$c = New-Object Windows.Forms.CheckBox; $c.Text = 'Agree'; $c.Left = 20; $c.Top = 110",
+    "$l = New-Object Windows.Forms.Label; $l.Text = 'Hello label'; $l.Left = 20; $l.Top = 150",
+    '$f.Controls.AddRange(@($b, $t, $c, $l)); [void]$f.ShowDialog()'].join('\n'));
+  const form = spawn('powershell', ['-NoProfile', '-STA', '-File', formFile]); kids.push(form);
+  let tr = ''; for (let i = 0; i < 30 && !/Press me/.test(tr); i++) { await new Promise((x) => setTimeout(x, 1000)); tr = txt(await raw('ui_tree', { session: code, window: 'HM UI Test' })); }
+  assert.match(tr, /^window "HM UI Test"/); assert.match(tr, /\n\d+ button "Press me" @\d+,\d+/); assert.match(tr, /\n\d+ check "Agree"/); assert.match(tr, /\n\d+ text "Hello label"/, 'ui_tree lists the controls: ' + tr);
+  assert.match(txt(await tool('ui_click', { session: code, name: 'press me', window: 'HM UI Test' })), /button "Press me": pressed/);
+  assert.match(txt(await tool('ui_tree', { session: code, window: 'HM UI Test' })), /^window "HM UI Test clicked"/, 'ui_click pressed the real button');
+  assert.match(txt(await tool('ui_set', { session: code, name: 'txtName', value: 'привет world', window: 'HM UI Test' })), /: set$/);
+  assert.match(txt(await tool('ui_tree', { session: code, window: 'HM UI Test', query: 'txtName' })), /="привет world"/, 'ui_set value read back');
+  const ag = txt(await tool('ui_tree', { session: code, window: 'HM UI Test', query: 'Agree' })); const agId = /\n(\d+) check "Agree"/.exec(ag)[1];
+  assert.match(txt(await tool('ui_click', { session: code, id: Number(agId) })), /toggled \(now on\)/);
+  const bad = await raw('ui_click', { session: code, name: 'no-such-control-xyz', window: 'HM UI Test' }); assert.ok(bad.isError && /No control named/.test(txt(bad)), 'a missing control says so'); console.log('ui_tree / ui_click / ui_set ok');
+  form.kill();
+} else {   // Linux: AT-SPI needs a desktop session; on a headless runner the answer must be a clear message that points to screenshot, not a hang or a crash
+  const lt = await raw('ui_tree', { session: code });
+  assert.match(txt(lt), /^window "|nothing readable|No window|No such window|session bus|AT-SPI is not available/, 'ui_tree answers on Linux: ' + txt(lt));
+  assert.match(txt(await tool('sysinfo', { session: code })), /\S/, 'the agent is still alive after ui_tree'); console.log('ui_tree on Linux ok: ' + txt(lt).split('\n')[0].slice(0, 90));
+}
 // the action log: every call is kept for later analysis, typed text / file contents are not, secrets are masked, failures are grouped by `report`
 await tool('write_file', { session: code, path: path.join(tmp, 'secret.txt'), content: 'hunter2secret-content' });
 await tool('run', { session: code, command: 'echo password=abc12345xyz' }).catch(() => {});

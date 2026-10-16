@@ -85,6 +85,7 @@ On a control link the top bar has **System** and **Files**. System: every proces
 ## What your AI gets
 
 - **Eyes and hands:** a live stream of the screen, screenshots, mouse, keyboard, commands.
+- **The screen as text, not pictures:** `ui_tree` lists a window's controls (name, value, state, position) in a few lines, and `ui_click` / `ui_set` press and fill them by name, through the system's accessibility API (Windows UI Automation, Linux AT-SPI, Android accessibility). Tens of tokens instead of a screenshot, no coordinates to guess, no DPI or layout problems; a screenshot stays the fallback for games and custom-drawn windows.
 - **Files and system in one call:** `tree`, `find` (by name and content), read a range of a file, exact `edit_file`, send a file to the PC, a whole folder back as a zip, and `util` for installs, services, PATH, registry and more — no fragile shell one-liners, no quoting traps.
 - **Find the resource hog in one call:** `system` returns every process with its real CPU %, memory, exe path and publisher, flags anything running from a temp/download folder or unsigned, plus disks, network, startup, services and drivers — so "why does this PC lag" is answered instantly and cheaply. `sysinfo` and `system` take tens of milliseconds (no WMI).
 - **Self-checks:** every click and keystroke reports what changed on screen, or a loud *NO CHANGE*, so it stops instead of typing into the wrong window.

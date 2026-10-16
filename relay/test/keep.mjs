@@ -34,7 +34,7 @@ let client = new Client({ name: 'keep', version: '0' });
 await client.connect(new StreamableHTTPClientTransport(new URL(BASE + '/mcp'), { requestInit: { headers: { Authorization: 'Bearer ' + KEY } } }));
 const call = async (name, args = {}) => { const r = await client.callTool({ name, arguments: args }); return { err: !!r.isError, text: r.content.find((c) => c.type === 'text')?.text ?? '' }; };
 const sessions = async () => JSON.parse((await call('list_sessions')).text);
-const waitFor = async (fn, what, ms = 15000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const v = await fn(); if (v) return v; await sleep(200); } assert.fail('timeout: ' + what + '\n--- agent output ---\n' + agentOut); };
+const waitFor = async (fn, what, ms = 15000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const v = await fn(); if (v) return v; await sleep(200); } assert.fail('timeout: ' + what + '\n--- state dir: ' + JSON.stringify(fs.readdirSync(SDIR)) + '\n--- agent output ---\n' + agentOut); };
 
 let agent = startAgent();
 const code = (await waitFor(async () => (await sessions())[0]?.code, 'registration'));

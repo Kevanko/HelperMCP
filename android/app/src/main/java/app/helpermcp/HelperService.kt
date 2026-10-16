@@ -195,7 +195,7 @@ class HelperService : AccessibilityService() {
         if (tool == "bye") { ended = true; return }
         if (!args.optBoolean("view") && tool != "task_done" && tool != "hold" && tool != "look" && tool != "stream") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "sysinfo" || tool == "stream" || tool == "system" || tool == "task_done" || tool == "hold" || tool == "look"
+        val quiet = tool == "screenshot" || tool == "ui_tree" || tool == "sysinfo" || tool == "stream" || tool == "system" || tool == "task_done" || tool == "hold" || tool == "look"
         if (!quiet) fx.setBusy(true)
         try {
             if (paused && tool != "screenshot" && tool != "sysinfo" && tool != "stream") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
@@ -232,10 +232,10 @@ class HelperService : AccessibilityService() {
         while (true) { val now = SystemClock.uptimeMillis(); if (now - lastEventAt >= quietMs || now - t0 >= maxMs) break; Thread.sleep(40) }
     }
 
-    private val CHECKED = setOf("click", "type_text", "press_key", "scroll")
+    private val CHECKED = setOf("ui_click", "ui_set", "click", "type_text", "press_key", "scroll")
     private val FILES = setOf("tree", "find", "list_dir", "read_file", "write_file", "edit_file", "push_file", "fetch_file", "fsop")
     private val UTIL_ASK = setOf("kill", "uninstall", "download", "zip", "unzip", "clipboard_set")
-    private val GUI = setOf("click", "move", "drag", "scroll", "type_text", "press_key", "actions")
+    private val GUI = setOf("ui_click", "ui_set", "click", "move", "drag", "scroll", "type_text", "press_key", "actions")
 
     // ------------------------------------------------------------------------------------------ questions
     private fun stepText(st: JSONObject): String {
@@ -245,6 +245,8 @@ class HelperService : AccessibilityService() {
             "click" -> if (st.optBoolean("double")) t("двойное нажатие ($x, $y)", "double tap ($x, $y)") else if (st.optString("button") == "right") t("долгое нажатие ($x, $y)", "long press ($x, $y)") else t("нажать ($x, $y)", "tap ($x, $y)")
             "drag" -> (if (st.optBoolean("hold")) t("перенести", "drag and drop") else t("провести пальцем", "swipe")) + " ($x, $y) → (${st.opt("x2")}, ${st.opt("y2")})"
             "scroll" -> t("прокрутить (${st.optInt("amount", 3)})", "scroll (${st.optInt("amount", 3)})")
+            "ui_click" -> t("нажать: ", "press: ") + cut(st.optString("name", "#" + st.optInt("id")))
+            "ui_set" -> t("ввести в поле ", "fill in ") + cut(st.optString("name", "#" + st.optInt("id"))) + ": " + cut(st.optString("value"))
             "type" -> t("ввести \"${cut(st.optString("text"))}\"", "type \"${cut(st.optString("text"))}\"")
             "key" -> t("нажать ${st.optString("keys")}", "press ${st.optString("keys")}")
             "wait" -> t("подождать ${st.optInt("ms", 500)} мс", "wait ${st.optInt("ms", 500)} ms")
@@ -315,6 +317,9 @@ class HelperService : AccessibilityService() {
         "start_process" -> { launch(a.optString("command", a.optString("name", ""))); ok() }
         "actions" -> actions(a)
         "stream" -> ok(cast.control(a))
+        "ui_tree" -> uiTree(a)
+        "ui_click" -> uiClick(a)
+        "ui_set" -> uiSet(a)
         "tree" -> phone.tree(a)
         "find" -> phone.find(a)
         "list_dir" -> phone.listDir(a)
@@ -327,7 +332,167 @@ class HelperService : AccessibilityService() {
         "sysdata" -> throw RuntimeException("the System tabs are for Windows PCs; this phone answers system {sections: [...]} as text")
         "system" -> phone.system(a)
         "util" -> phone.util(a)
-        else -> throw RuntimeException("'$tool' is not available on Android. Use screenshot, click, drag, scroll, type_text, press_key, actions, start_process, sysinfo, system, tree, find, list_dir, read_file, write_file, edit_file, push_file, fetch_file and util (apps, kill, uninstall, open, clipboard, net_test, download, zip, unzip).")
+        else -> throw RuntimeException("'$tool' is not available on Android. Use ui_tree, ui_click, ui_set, screenshot, click, drag, scroll, type_text, press_key, actions, start_process, sysinfo, system, tree, find, list_dir, read_file, write_file, edit_file, push_file, fetch_file and util (apps, kill, uninstall, open, clipboard, net_test, download, zip, unzip).")
+    }
+
+    // ------------------------------------------------------------------------------------------ ui_tree / ui_click / ui_set: the screen as text
+    private class UiItem(val node: AccessibilityNodeInfo, val type: String, val name: String, val value: String?, val flags: List<String>, val r: android.graphics.Rect, val inter: Boolean)
+    private var uiCache: List<AccessibilityNodeInfo> = emptyList()
+    private fun uiCap(s: String, n: Int) = if (s.length > n) s.take(n - 2) + ".." else s
+
+    private fun uiKind(n: AccessibilityNodeInfo): String {
+        val c = n.className?.toString() ?: ""
+        return when {
+            n.isEditable || c.endsWith("EditText") -> "edit"
+            c.contains("Switch") || c.contains("ToggleButton") -> "toggle"
+            c.endsWith("CheckBox") || n.isCheckable -> "check"
+            c.endsWith("RadioButton") -> "radio"
+            c.endsWith("Spinner") -> "combo"
+            c.endsWith("SeekBar") -> "slider"
+            c.endsWith("Button") -> "button"
+            c.contains("Tab") && n.isClickable -> "tabitem"
+            n.isClickable || n.isLongClickable -> "button"
+            c.endsWith("ImageView") -> "image"
+            else -> "text"
+        }
+    }
+
+    private fun uiLabel(n: AccessibilityNodeInfo): String = (n.text ?: n.contentDescription ?: n.hintText ?: "").toString().replace("\n", " ").trim()
+
+    /** one control as the helper sees it (null: invisible or empty); a clickable row without its own words takes the words inside it, and those are then not listed again */
+    private fun uiItem(n: AccessibilityNodeInfo, consumed: MutableSet<AccessibilityNodeInfo>): UiItem? {
+        if (!n.isVisibleToUser) return null
+        val r = android.graphics.Rect(); n.getBoundsInScreen(r)
+        if (r.width() <= 0 || r.height() <= 0 || consumed.contains(n)) return null
+        val kind = uiKind(n); val inter = n.isClickable || n.isLongClickable || n.isCheckable || n.isEditable
+        var name = uiLabel(n); var value: String? = null
+        if (kind == "edit") {
+            value = if (n.isPassword || n.isShowingHintText) null else n.text?.toString()?.take(200)
+            name = if (n.isShowingHintText) (n.hintText?.toString() ?: "") else (n.contentDescription?.toString() ?: n.hintText?.toString() ?: "")
+        }
+        if (name.isEmpty() && inter && kind != "edit") {
+            val words = ArrayList<String>()
+            fun inside(p: AccessibilityNodeInfo, depth: Int) {
+                if (depth > 4 || words.size >= 3) return
+                for (i in 0 until p.childCount) {
+                    val c = p.getChild(i) ?: continue
+                    if (!c.isVisibleToUser) continue
+                    val l = uiLabel(c)
+                    if (l.isNotEmpty() && !c.isClickable) { words.add(l); consumed.add(c) }
+                    inside(c, depth + 1)
+                }
+            }
+            inside(n, 0); name = words.joinToString(" / ")
+        }
+        if (!(inter || name.isNotEmpty() || kind == "edit")) return null
+        val f = ArrayList<String>()
+        if (!n.isEnabled) f.add("disabled"); if (n.isFocused) f.add("focused"); if (n.isChecked) f.add("checked"); if (n.isSelected) f.add("selected"); if (n.isScrollable) f.add("scrollable")
+        return UiItem(n, kind, name, value, f, r, inter)
+    }
+
+    private fun uiCollect(root: AccessibilityNodeInfo): List<UiItem> {
+        val out = ArrayList<UiItem>(); val consumed = HashSet<AccessibilityNodeInfo>(); var budget = 2500; val stop = SystemClock.uptimeMillis() + 6000
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (budget <= 0 || depth > 40 || SystemClock.uptimeMillis() > stop) return
+            budget--
+            if (!n.isVisibleToUser) return
+            uiItem(n, consumed)?.let { out.add(it) }
+            for (i in 0 until n.childCount) { val c = n.getChild(i) ?: continue; walk(c, depth + 1) }
+        }
+        walk(root, 0)
+        return out
+    }
+
+    private fun uiTypeOk(have: String, want0: String): Boolean {
+        if (want0.isBlank()) return true
+        val x = want0.lowercase().replace(" ", "")
+        val w = when (x) { "checkbox" -> "check"; "combobox", "spinner" -> "combo"; "hyperlink" -> "link"; "radiobutton" -> "radio"; "textbox", "input", "field", "textfield" -> "edit"; "switch" -> "toggle"; else -> x }
+        return have == w || (w == "tab" && have == "tabitem") || (w == "item" && have.endsWith("item"))
+    }
+
+    private fun uiTree(a: JSONObject): JSONObject {
+        val root = rootInActiveWindow ?: throw RuntimeException("No window to read (the screen is locked, or the app blocks accessibility): use screenshot.")
+        val pkg = root.packageName?.toString() ?: "?"; val want = a.optString("window")
+        if (want.isNotBlank() && !pkg.contains(want, true)) throw RuntimeException("The app in front is $pkg, not '$want': open it first (start_process) and look again.")
+        val max = a.optInt("max", 120).coerceIn(10, 400); val q = a.optString("query").lowercase(); val sc = if (scale > 0f) scale else 1f
+        val lines = ArrayList<String>(); val cache = ArrayList<AccessibilityNodeInfo>(); var total = 0
+        lines.add("window \"$pkg\"")
+        for (u in uiCollect(root)) {
+            if (q.isNotEmpty() && !(u.name + " " + (u.value ?: "")).lowercase().contains(q)) continue
+            total++
+            if (cache.size >= max) continue
+            cache.add(u.node)
+            val sb = StringBuilder().append(cache.size).append(' ').append(u.type)
+            if (u.name.isNotEmpty()) sb.append(" \"").append(uiCap(u.name, 70)).append('"')
+            if (!u.value.isNullOrEmpty()) sb.append(" =\"").append(uiCap(u.value, 60)).append('"')
+            sb.append(" @").append(((u.r.centerX() - originX) / sc).toInt()).append(',').append(((u.r.centerY() - originY) / sc).toInt())
+            for (f in u.flags) sb.append(' ').append(f)
+            lines.add(sb.toString())
+        }
+        uiCache = cache
+        if (cache.isEmpty()) return ok(lines[0] + "\nnothing readable here" + (if (q.isEmpty()) " (the app draws its own screen, like a game, or it blocks accessibility)" else " matches '$q'") + ": use screenshot.")
+        if (total > cache.size) lines.add("... ${total - cache.size} more (use query or max)")
+        return ok(lines.joinToString("\n"))
+    }
+
+    private fun uiPick(a: JSONObject, kind: String): UiItem {
+        val id = a.optInt("id", 0)
+        if (id > 0) {
+            if (id > uiCache.size) throw RuntimeException("No control #$id: run ui_tree first, ids come from the last ui_tree")
+            val n = uiCache[id - 1]
+            if (!n.refresh()) throw RuntimeException("Control #$id is gone (the screen changed): run ui_tree again")
+            return uiItem(n, HashSet()) ?: throw RuntimeException("Control #$id is not on the screen any more: run ui_tree again")
+        }
+        val name = a.optString("name"); if (name.isBlank()) throw RuntimeException("Give an id (from ui_tree) or a name")
+        val root = rootInActiveWindow ?: throw RuntimeException("No window to read: use screenshot.")
+        val low = name.lowercase(); var best = ArrayList<UiItem>(); var bestRank = 0
+        for (u in uiCollect(root)) {
+            if (!uiTypeOk(u.type, kind)) continue
+            val nm = u.name.lowercase(); val sc = if (nm == low) 3 else if (nm.startsWith(low)) 2 else if (nm.contains(low)) 1 else 0
+            if (sc == 0) continue
+            val rank = sc * 10 + (if (u.inter) 5 else 0) + (if (u.node.isEnabled) 1 else 0)
+            if (rank > bestRank) { bestRank = rank; best = ArrayList() }
+            if (rank == bestRank && best.none { it.type == u.type && Math.abs(it.r.centerX() - u.r.centerX()) < 3 && Math.abs(it.r.centerY() - u.r.centerY()) < 3 }) best.add(u)
+        }
+        if (best.isEmpty()) throw RuntimeException("No control named '$name'" + (if (kind.isBlank()) "" else " of type $kind") + " on this screen: run ui_tree (query) to see what is there, or use screenshot.")
+        if (best.size > 1) {
+            uiCache = best.take(8).map { it.node }
+            throw RuntimeException("Several controls match '$name': " + best.take(8).mapIndexed { i, o -> "#${i + 1} ${o.type} \"${uiCap(o.name, 40)}\" at ${o.r.centerX()},${o.r.centerY()}" }.joinToString("; ") + "; repeat with id (the numbers above) or a more exact name / type.")
+        }
+        return best[0]
+    }
+
+    /** an accessibility action returns at once, the app answers a moment later: wait for the screen to react, so the change check is not fooled */
+    private fun uiAwait(since: Long) { val end = SystemClock.uptimeMillis() + 1500; while (lastEventAt < since && SystemClock.uptimeMillis() < end) Thread.sleep(40) }
+
+    private fun uiClick(a: JSONObject): JSONObject {
+        val since = SystemClock.uptimeMillis()
+        val u = uiPick(a, a.optString("type")); val d = "${u.type} \"${uiCap(u.name, 50)}\""
+        if (!u.node.isEnabled) throw RuntimeException("the control is disabled")
+        val cx = u.r.centerX().toFloat(); val cy = u.r.centerY().toFloat(); val right = a.optBoolean("right")
+        var hit: AccessibilityNodeInfo? = u.node; var hops = 0
+        while (hit != null && hops < 6 && !(if (right) hit.isLongClickable else hit.isClickable)) { hit = hit.parent; hops++ }
+        val target = hit
+        fx.active(); fx.glideBlocking(cx, cy); Thread.sleep(50); fx.ripple(cx, cy, right); fx.press()
+        val act = if (right) AccessibilityNodeInfo.ACTION_LONG_CLICK else AccessibilityNodeInfo.ACTION_CLICK
+        var done = false
+        if (target != null) repeat(if (a.optBoolean("double")) 2 else 1) { if (target.performAction(act)) done = true; Thread.sleep(110) }
+        if (done) { uiAwait(since); return ok("$d: pressed") }
+        return ok("$d: no action of its own, tapped it; " + click(JSONObject().put("x", cx.toDouble()).put("y", cy.toDouble()).put("raw", true).put("button", if (right) "right" else "left")).optString("text"))
+    }
+
+    private fun uiSet(a: JSONObject): JSONObject {
+        val since = SystemClock.uptimeMillis()
+        val u = uiPick(a, ""); val d = "${u.type} \"${uiCap(u.name, 50)}\""; val v = a.optString("value", "")
+        if (!u.node.isEditable) throw RuntimeException("$d is not a text field: tap it and use type_text, or choose another control")
+        fx.active(); fx.glideBlocking(u.r.centerX().toFloat(), u.r.centerY().toFloat()); fx.typing()
+        u.node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+        val b = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, v) }
+        if (!u.node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b)) throw RuntimeException("The field did not accept the text")
+        uiAwait(since)
+        if (u.node.isPassword) return ok("$d: set (password, not shown)")
+        u.node.refresh(); val now = u.node.text?.toString() ?: ""
+        return ok("$d: " + (if (now == v) "set" else "set, but it now holds \"${uiCap(now, 80)}\" (the app may reformat the value: check with ui_tree)"))
     }
 
     private fun ok(text: String = "ok") = JSONObject().put("text", text)

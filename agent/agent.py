@@ -34,7 +34,7 @@ T = {
     "lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
 }
 t = lambda k: T[k][0 if RU else 1]
-ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "edit_file", "push_file", "fsop", "util", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
+ASK_TOOLS = {"run", "start_process", "fetch_file", "write_file", "edit_file", "push_file", "fsop", "util", "ui_click", "ui_set", "click", "move", "drag", "type_text", "press_key", "scroll", "actions", "mcp_start", "mcp_call"}
 MAX_OUT = 100_000
 NODE_VERSION, NODE_MIN = "v22.11.0", 20   # Playwright & co. need Node >= 20
 NODE_DIR = NODE_BIN = None                # temp dir of the portable Node, if we had to download one
@@ -269,6 +269,209 @@ def focus_window(a):
     raise RuntimeError("No such window. Open windows: " + " | ".join(r.split(None, 4)[-1] for r in rows if len(r.split(None, 4)) == 5))
 
 
+# --- ui:begin   ui_tree / ui_click / ui_set: the controls of a window as text through AT-SPI (GTK, Qt, Electron and Chrome with accessibility on)
+UI = {"cache": [], "picked": None, "init": False}
+UI_INTER = {"button", "toggle", "check", "radio", "edit", "link", "listitem", "menuitem", "combo", "slider", "spinner", "tabitem", "treeitem", "document"}
+UI_ROLES = {"push button": "button", "toggle button": "toggle", "check box": "check", "check menu item": "check", "radio button": "radio", "radio menu item": "radio",
+            "entry": "edit", "text": "edit", "password text": "edit", "terminal": "edit", "label": "text", "static": "text", "menu item": "menuitem", "page tab": "tabitem",
+            "list item": "listitem", "combo box": "combo", "link": "link", "spin button": "spinner", "slider": "slider", "tree item": "treeitem", "document web": "document",
+            "document frame": "document", "document text": "document", "frame": "window", "dialog": "window", "window": "window", "alert": "window"}
+
+
+def _atspi():
+    if not (os.environ.get("DBUS_SESSION_BUS_ADDRESS") or os.path.exists(f"/run/user/{os.getuid()}/bus")): raise RuntimeError("No desktop session bus here (a server or a headless session): there are no windows to read. Use screenshot and click.")
+    try:
+        import gi
+        gi.require_version("Atspi", "2.0")
+        from gi.repository import Atspi
+        if not UI["init"]: Atspi.init(); UI["init"] = True
+        return Atspi
+    except Exception as e:
+        raise RuntimeError("AT-SPI is not available here (" + str(e).splitlines()[0][:80] + "). Install: sudo apt install gir1.2-atspi-2.0 python3-gi, and enable accessibility "
+                           "(gsettings set org.gnome.desktop.interface toolkit-accessibility true). Until then use screenshot and click.")
+
+
+def _ui_has(At, ss, name):
+    try: return ss.contains(getattr(At.StateType, name))
+    except Exception: return False
+
+
+def _ui_node(At, acc, depth):
+    try:
+        role = acc.get_role_name() or ""; ss = acc.get_state_set()
+        if depth and not _ui_has(At, ss, "SHOWING"): return None
+        x = y = w = h = 0; comp = acc.get_component_iface()
+        if comp:
+            r = comp.get_extents(At.CoordType.SCREEN); x, y, w, h = r.x, r.y, r.width, r.height
+        typ = UI_ROLES.get(role, role.replace(" ", "")); val = None
+        if typ == "edit" and role != "password text":
+            ti = acc.get_text_iface()
+            if ti:
+                n = ti.get_character_count(); val = ti.get_text(0, min(n, 200)) if n else ""
+        has = lambda s: _ui_has(At, ss, s)
+        flags = []
+        enabled = has("ENABLED") or has("SENSITIVE")
+        if not enabled: flags.append("disabled")
+        if has("FOCUSED"): flags.append("focused")
+        if has("CHECKED"): flags.append("checked")
+        if has("SELECTED"): flags.append("selected")
+        if has("EXPANDED"): flags.append("expanded")
+        elif has("EXPANDABLE"): flags.append("collapsed")
+        if typ == "edit" and not has("EDITABLE"): flags.append("readonly")
+        return {"acc": acc, "type": typ, "name": (acc.get_name() or "").strip(), "val": val, "flags": flags, "enabled": enabled, "x": x, "y": y, "w": w, "h": h, "role": role}
+    except Exception: return None
+
+
+def _ui_walk(At, root, limit=6000, secs=8):
+    out, budget, stop = [], [limit], time.time() + secs
+    def rec(acc, depth):
+        if budget[0] <= 0 or time.time() > stop or depth > 40: return
+        budget[0] -= 1
+        n = _ui_node(At, acc, depth)
+        if n is None and depth: return
+        if n: out.append(n)
+        try: cnt = acc.get_child_count()
+        except Exception: return
+        for i in range(min(cnt, 400)):
+            try: ch = acc.get_child_at_index(i)
+            except Exception: continue
+            if ch is not None: rec(ch, depth + 1)
+            if budget[0] <= 0 or time.time() > stop: break
+    rec(root, 0)
+    return out
+
+
+def _ui_ancestors():
+    out, p = set(), os.getpid()
+    for _ in range(25):
+        out.add(p)
+        try: p = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])
+        except Exception: break
+        if p <= 1: break
+    return out
+
+
+def _ui_window(At, key):
+    desk = At.get_desktop(0); wins = []
+    for i in range(desk.get_child_count()):
+        app = desk.get_child_at_index(i)
+        if app is None: continue
+        try: an = app.get_name() or ""; pid = app.get_process_id()
+        except Exception: continue
+        for j in range(app.get_child_count()):
+            w = app.get_child_at_index(j)
+            if w is None: continue
+            try: ss = w.get_state_set(); wins.append((w, an, w.get_name() or "", pid, _ui_has(At, ss, "ACTIVE"), _ui_has(At, ss, "SHOWING")))
+            except Exception: continue
+    key = (key or "").lower()
+    if key:
+        for w, an, title, pid, act, show in wins:
+            if key in title.lower() or key in an.lower(): return w, an, title
+    else:
+        ours = _ui_ancestors()   # the terminal this agent runs in is not what the helper wants to read
+        for want_active in (True, False):
+            for w, an, title, pid, act, show in wins:
+                if pid not in ours and show and (act or not want_active) and title: return w, an, title
+    raise RuntimeError(("No such window." if key else "No window in front.") + " Open windows: " + " | ".join(f"{an}: {cut(title, 50)}" for w, an, title, pid, act, show in wins if title))
+
+
+def _ui_wanted(n, allv):
+    if n["w"] <= 0 or n["h"] <= 0: return False
+    if allv: return True
+    if n["type"] in ("window", "text"): return bool(n["name"])
+    if n["type"] not in UI_INTER: return False
+    return bool(n["name"] or n["val"]) or n["type"] in ("edit", "document")
+
+
+def _ui_c(n): return int(n["x"] + n["w"] / 2), int(n["y"] + n["h"] / 2)
+
+
+def _ui_sc(cx, cy): return int((cx - ORIGIN[0]) / SCALE), int((cy - ORIGIN[1]) / SCALE)   # real pixels -> screenshot pixels
+
+
+def ui_tree(a):
+    At = _atspi(); w, an, title = _ui_window(At, a.get("window")); nodes = _ui_walk(At, w)
+    UI["cache"] = []; mx = int(a.get("max") or 120); q = (a.get("query") or "").lower(); allv = bool(a.get("all"))
+    lines = [f'window "{cut(title, 80)}" ({an})']; shown = total = 0
+    for n in nodes[1:]:
+        if not _ui_wanted(n, allv): continue
+        if q and q not in (n["name"] + " " + (n["val"] or "")).lower(): continue
+        total += 1
+        if shown >= mx: continue
+        shown += 1; UI["cache"].append(n["acc"]); sx, sy = _ui_sc(*_ui_c(n))
+        lines.append(f'{shown} {n["type"]}' + (f' "{cut(n["name"], 70)}"' if n["name"] else "") + (f' ="{cut(n["val"], 60)}"' if n["val"] else "") + f" @{sx},{sy}" + "".join(" " + f for f in n["flags"]))
+    if not shown:
+        return {"text": "\n".join(lines) + "\nnothing readable here" + (" (this window exposes no controls: a game, a custom-drawn app, or accessibility is off for it)" if len(nodes) <= 1 else f" matches '{q}'") + ": use screenshot."}
+    if total > shown: lines.append(f"... {total - shown} more (use query or max)")
+    return {"text": "\n".join(lines)}
+
+
+def _ui_pick(At, a, typ):
+    pid_ = a.get("id"); name = a.get("name") or ""
+    if pid_:
+        pid_ = int(pid_)
+        if pid_ > len(UI["cache"]): raise RuntimeError(f"No control #{pid_}: run ui_tree first, ids come from the last ui_tree")
+        acc = UI["cache"][pid_ - 1]
+        n = _ui_node(At, acc, 0)
+        if not n: raise RuntimeError(f"Control #{pid_} is gone (the window changed): run ui_tree again")
+    else:
+        if not name: raise RuntimeError("Give an id (from ui_tree) or a name")
+        w, an, title = _ui_window(At, a.get("window")); nodes = _ui_walk(At, w); want = (typ or "").lower().replace(" ", "")
+        want = {"checkbox": "check", "combobox": "combo", "hyperlink": "link", "radiobutton": "radio", "textbox": "edit", "input": "edit", "field": "edit"}.get(want, want)
+        low = name.lower(); best, rank_best = [], 0
+        for n in nodes[1:]:
+            if n["w"] <= 0 or n["h"] <= 0: continue
+            if want and not (n["type"] == want or (want == "tab" and n["type"] == "tabitem") or (want == "menu" and n["type"] == "menuitem") or (want == "item" and n["type"].endswith("item"))): continue
+            nm = n["name"].lower(); sc = 3 if nm == low else 2 if nm.startswith(low) else 1 if low in nm else 0
+            if not sc: continue
+            rank = sc * 10 + (5 if n["type"] in UI_INTER else 0) + (1 if n["enabled"] else 0)
+            if rank > rank_best: rank_best, best = rank, []
+            if rank == rank_best and not any(o["type"] == n["type"] and abs(o["x"] - n["x"]) < 3 and abs(o["y"] - n["y"]) < 3 for o in best): best.append(n)
+        if not best: raise RuntimeError(f"No control named '{name}'" + (f" of type {typ}" if typ else "") + " in this window: run ui_tree (query) to see what is there, or use screenshot.")
+        if len(best) > 1:
+            UI["cache"] = [o["acc"] for o in best[:8]]
+            raise RuntimeError(f"Several controls match '{name}': " + "; ".join(f'#{i} {o["type"]} "{cut(o["name"], 40)}" at {o["x"]},{o["y"]}' for i, o in enumerate(best[:8], 1)) + "; repeat with id (the numbers above) or a more exact name / type.")
+        n = best[0]; acc = n["acc"]
+    UI["picked"] = n
+    return f'{n["type"]} "{cut(n["name"], 50)}"', n
+
+
+def _ui_do(acc):
+    ai = acc.get_action_iface()
+    if not ai: return None
+    names = [(ai.get_action_name(i) or "").lower() for i in range(ai.get_n_actions())]
+    for want in ("click", "press", "activate", "toggle", "select", "jump", "open"):
+        if want in names and ai.do_action(names.index(want)): return want
+    if names and ai.do_action(0): return names[0]
+    return None
+
+
+def ui_click(a):
+    At = _atspi(); d, n = _ui_pick(At, a, a.get("type")); sx, sy = _ui_sc(*_ui_c(n))
+    if a.get("right") or a.get("double"): return {"text": f"{d}: " + click({"x": sx, "y": sy, "button": "right" if a.get("right") else "left", "double": bool(a.get("double"))})["text"]}
+    if not n["enabled"]: raise RuntimeError("the control is disabled")
+    overlay_send("active"); glide(sx, sy); overlay_send(f"click {sx} {sy} left")
+    try: how = _ui_do(n["acc"])
+    except Exception: how = None
+    if how is None: return {"text": f"{d}: no action of its own, clicked it; " + click({"x": sx, "y": sy})["text"]}
+    time.sleep(0.4); return {"text": f"{d}: pressed ({how})"}
+
+
+def ui_set(a):
+    At = _atspi(); d, n = _ui_pick(At, a, ""); acc = n["acc"]; v = str(a.get("value", "")); sx, sy = _ui_sc(*_ui_c(n))
+    overlay_send("active"); glide(sx, sy)
+    ei = acc.get_editable_text_iface()
+    if ei:
+        if not ei.set_text_contents(v): raise RuntimeError("the control refused the text (read-only?)")
+        if n["role"] == "password text": return {"text": f"{d}: set (password, not shown)"}
+        ti = acc.get_text_iface(); now = ti.get_text(0, min(ti.get_character_count(), 200)) if ti else v
+        return {"text": f"{d}: " + ("set" if now == v else f'set, but it now holds "{cut(now, 80)}" (the control may reformat the value, or ignore it: check with ui_tree)')}
+    comp = acc.get_component_iface()
+    if comp: comp.grab_focus()
+    time.sleep(0.15); press_key({"keys": "ctrl+a"}); return {"text": f"{d}: typed (it has no direct value access); " + type_text({"text": v})["text"]}
+# --- ui:end
+
+
 def trace(a):
     """read along: to the start of the line, then slide under it at reading pace (no click)"""
     xlib(); overlay_send("active"); x1, y1 = _target(a); x2, y2 = _target(a, "x2", "y2")
@@ -353,7 +556,7 @@ def restore_focus(w):
     except Exception: pass
 
 
-ASK_GROUP = {"click": "input", "move": "input", "drag": "input", "scroll": "input", "type_text": "input", "press_key": "input", "actions": "input", "run": "commands",
+ASK_GROUP = {"ui_click": "input", "ui_set": "input", "click": "input", "move": "input", "drag": "input", "scroll": "input", "type_text": "input", "press_key": "input", "actions": "input", "run": "commands",
              "start_process": "commands", "util": "commands", "write_file": "files", "edit_file": "files", "push_file": "files", "fetch_file": "files", "fsop": "files", "mcp_start": "mcp", "mcp_call": "mcp"}
 GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard"), "commands": ("команды", "commands"), "files": ("файлы", "files"), "mcp": ("MCP", "MCP")}
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
@@ -395,6 +598,8 @@ def steps_of(name, a):
 
 
 def describe(name, a):
+    if name in ("ui_click", "ui_set"):
+        who = a.get("name") or "#" + str(a.get("id")); return [(("нажать: " if RU else "press: ") + cut(who, 60)) if name == "ui_click" else (("ввести в поле " if RU else "fill in ") + cut(who, 40) + ": " + cut(a.get("value", ""), 40))]
     if name in ASK_GROUP and ASK_GROUP[name] == "input": return [step_text(st) for st in steps_of(name, a)]
     ru = RU
     return [{"run": ("команда: ", "command: "), "start_process": ("запустить: ", "start: "), "write_file": ("записать файл: ", "write file: "), "fetch_file": ("скопировать файл: ", "copy file: "), "edit_file": ("изменить файл: ", "edit file: "), "push_file": ("получить файл: ", "receive file: "), "util": ("утилита: ", "utility: "),
@@ -402,7 +607,7 @@ def describe(name, a):
             + cut((a.get("op", "") + " " if name == "util" else "") + (a.get("command") or a.get("path") or a.get("name") or a.get("url") or json.dumps(a, ensure_ascii=False)), 90)]
 
 
-QUIET = {"watch": ("смотрю, что происходит на экране", "watching the screen"), "trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
+QUIET = {"ui_tree": ("читаю элементы окна", "reading the window controls"), "watch": ("смотрю, что происходит на экране", "watching the screen"), "trace": ("читаю текст на экране", "reading text on the screen"), "agent_log": ("читаю журнал", "reading the log"), "screenshot": ("смотрю на экран", "looking at the screen"), "sysinfo": ("смотрю сведения о системе", "reading system info"), "list_dir": ("смотрю папку", "listing a folder"),
          "read_file": ("читаю файл", "reading a file"), "mcp_tools": ("смотрю MCP", "listing MCP tools"), "mcp_stop": ("останавливаю MCP", "stopping MCP"),
          "tree": ("смотрю папки", "looking through folders"), "find": ("ищу файлы", "searching files"), "system": ("смотрю состояние системы", "reading the system state")}
 
@@ -2054,12 +2259,12 @@ def set_mode(a):
     print(c("33", "  " + (f"Администратор сменил режим на {m}" if RU else f"The administrator switched the mode to {m}")), flush=True)
     if sys.stdout.isatty(): header(CODE["c"], False, m)
     return {"text": m}
-TOOLS.update(look=look, hold=hold, task_done=task_done, set_mode=set_mode, trace=trace, watch=watch, focus_window=focus_window,
+TOOLS.update(ui_tree=ui_tree, ui_click=ui_click, ui_set=ui_set, look=look, hold=hold, task_done=task_done, set_mode=set_mode, trace=trace, watch=watch, focus_window=focus_window,
              tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util, stream=stream)
 META = {"look", "hold", "task_done", "stream", "set_mode"}
 
 
-GUI_TOOLS = {"click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
+GUI_TOOLS = {"ui_click", "ui_set", "click", "move", "drag", "scroll", "type_text", "press_key", "actions"}   # one X11 connection: never two at once
 GUI_LOCK, ASK_LOCK = threading.Lock(), threading.Lock()
 
 

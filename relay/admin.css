@@ -20,7 +20,7 @@ td{padding:.4rem .6rem;border-bottom:1px solid rgba(22,72,43,.4);vertical-align:
 .code{font-size:14px;color:var(--g);letter-spacing:.04em}.acts{display:flex;gap:.4rem;flex-wrap:nowrap;justify-content:flex-end}.recent{color:var(--mut);font-size:12px;margin-top:.25rem}
 pre{white-space:pre-wrap;word-break:break-word;background:#010603;border:1px solid var(--line);padding:.7rem;border-radius:6px;max-height:70vh;overflow:auto}
 .set{max-width:420px}.set label{display:block;margin:.6rem 0 .2rem;color:var(--mut)}.set input{width:100%}.ok{color:var(--g)}
-@media(max-width:700px){td:nth-child(n+4):not(:last-child),th:nth-child(n+4):not(:last-child){display:none}}
+@media(max-width:700px){td:nth-child(n+5):not(:last-child),th:nth-child(n+5):not(:last-child){display:none}}
 /* row actions: one size, one baseline, aligned right */
 td.ac,th:last-child{text-align:right;width:1%;white-space:nowrap}
 .acts button{min-width:4.6rem;height:2rem;padding:0 .8rem;display:inline-flex;align-items:center;justify-content:center}
@@ -42,3 +42,11 @@ button.go.bad{background:var(--bad);border-color:var(--bad);color:#190000}
 .sws input[type=color]{width:34px;height:26px;padding:0;border-radius:5px;cursor:pointer;background:none}
 .pv{padding:.7rem .9rem;border-radius:8px;background:#010603;border:1px solid var(--c);color:var(--c);box-shadow:0 0 18px color-mix(in srgb,var(--c) 45%,transparent),inset 0 0 14px color-mix(in srgb,var(--c) 18%,transparent);text-align:center;overflow-wrap:anywhere}
 @media(max-width:700px){.acts button{min-width:0;padding:0 .55rem}}
+/* OS icons, action icons, preview tiles */
+.ic{flex:none;vertical-align:-2px}
+nav button,.acts button,header button{display:inline-flex;align-items:center;gap:.35rem}
+td.pv,th:first-child{width:1%;padding-right:.2rem}
+.tile{position:relative;width:40px;height:40px;border-radius:7px;overflow:hidden;background:var(--panel2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--mut)}
+.tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile .badge{position:absolute;right:-2px;bottom:-2px;width:15px;height:15px;border-radius:4px;background:var(--bg);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--g)}
+.tile .ic-camera-off,.tile>.ic-android{width:20px;height:20px}

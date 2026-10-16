@@ -914,7 +914,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, call, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => Date.now() - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {

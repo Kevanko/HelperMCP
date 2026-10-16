@@ -28,10 +28,11 @@ const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-sr
 const IDLE_MS = 30 * 60_000, MAX_MS = 8 * 3600_000, LOCK_MS = 15 * 60_000, MAX_FAILS = 5;
 
 export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, status, report, audit, ONLINE_MS }
-  const fails = new Map(), logins = new Map(); let recentFails = [];   // ip -> { n, until } ; sha(token) -> { csrf, exp, last, user }
+  const fails = new Map(), logins = new Map(), previews = new Map(); let recentFails = [];   // ip -> { n, until } ; sha(token) -> { csrf, exp, last, user } ; code -> { buf, t }
+  const PREVIEW_TTL = 15_000;
   const sha = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');
   const dummy = crypto.randomBytes(16).toString('hex');
-  setInterval(() => { const now = Date.now(); for (const [k, v] of logins) if (v.exp < now || now - v.last > IDLE_MS) logins.delete(k); for (const [k, v] of fails) if (v.until < now && v.n < MAX_FAILS) fails.delete(k); recentFails = recentFails.filter((t) => now - t < 600_000); }, 60_000).unref();
+  setInterval(() => { const now = Date.now(); for (const [k, v] of logins) if (v.exp < now || now - v.last > IDLE_MS) logins.delete(k); for (const [k, v] of fails) if (v.until < now && v.n < MAX_FAILS) fails.delete(k); for (const [k, v] of previews) if (now - v.t > 60_000 || !d.sessions.has(k)) previews.delete(k); recentFails = recentFails.filter((t) => now - t < 600_000); }, 60_000).unref();
   const cookieOf = (req) => (/(?:^|;\s*)hm_admin=([0-9a-f]{64})/.exec(req.headers.cookie || '') || [])[1];
   const secure = (req) => req.socket.encrypted || req.headers['x-forwarded-proto'] === 'https';
   const sessionOf = (req) => { const t = cookieOf(req); if (!t) return null; const s = logins.get(sha(t)); if (!s) return null; const now = Date.now(); if (s.exp < now || now - s.last > IDLE_MS) { logins.delete(sha(t)); return null; } s.last = now; return s; };
@@ -84,6 +85,17 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       })).sort((a, b) => Number(b.online) - Number(a.online) || a.last_seen_s - b.last_seen_s)); return true;
     }
     if (api === 'report') { send(res, 200, { text: d.report(Math.min(60, Math.max(1, Number(url.searchParams.get('days')) || 7))) }); return true; }
+    if (api === 'preview') {   // a small square screenshot for the sessions list; cached briefly so the list poll doesn't hammer the agent
+      const code = String(url.searchParams.get('code') || '').toUpperCase(), s = d.sessions.get(code);
+      if (!s) { res.writeHead(404); return res.end(); }
+      const cached = previews.get(code);
+      if (cached && now - cached.t < PREVIEW_TTL) { res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(cached.buf); }
+      try {
+        const r = await d.call(code, 'screenshot', { view: true, max_width: 220, quality: 45 }, 12_000, { human: true });
+        if (!r.jpeg) { res.writeHead(204); return res.end(); }
+        previews.set(code, { buf: r.jpeg, t: now }); res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); res.end(r.jpeg);
+      } catch { res.writeHead(204); res.end(); } return true;
+    }
     if (req.method !== 'POST') { send(res, 404, { error: 'unknown' }); return true; }
     const b = JSON.parse((await d.body(req, 5000)) || '{}');
     if (api === 'open') {

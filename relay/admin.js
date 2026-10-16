@@ -15,6 +15,43 @@
   const ago = (s) => (s < 60 ? s + ' s' : s < 3600 ? Math.round(s / 60) + ' min' : s < 86400 ? Math.round(s / 3600) + ' h' : Math.round(s / 86400) + ' d');
   const dur = (s) => { const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return (d ? d + 'd ' : '') + h + 'h ' + m + 'm'; };
 
+  // small inline icons (no icon font, no network): outline glyphs for actions, filled glyphs for OS marks
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  function svgEl(tag, attrs) { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; }
+  function icon(name, size) {
+    const s = svgEl('svg', { viewBox: '0 0 16 16', width: size || 15, height: size || 15, class: 'ic ic-' + name, 'aria-hidden': 'true' });
+    const outline = (d) => { s.setAttribute('fill', 'none'); s.setAttribute('stroke', 'currentColor'); s.setAttribute('stroke-width', '1.4'); s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round'); s.append(svgEl('path', { d })); };
+    const filled = (...ds) => { s.setAttribute('fill', 'currentColor'); for (const d of ds) s.append(svgEl('path', { d })); };
+    switch (name) {
+      case 'open': outline('M6 3H3.5A1.5 1.5 0 0 0 2 4.5v8A1.5 1.5 0 0 0 3.5 14h8a1.5 1.5 0 0 0 1.5-1.5V10 M9 2h5v5 M14 2 7 9'); break;
+      case 'eye': outline('M1.5 8S4 3 8 3s6.5 5 6.5 5-2.5 5-6.5 5-6.5-5-6.5-5z M8 10a2 2 0 1 0 0-4 2 2 0 0 0 0 4z'); break;
+      case 'power': outline('M8 2v6 M4 3.5a6 6 0 1 0 8 0'); break;
+      case 'list': outline('M5.5 4h8 M5.5 8h8 M5.5 12h8 M2.3 4h.01 M2.3 8h.01 M2.3 12h.01'); break;
+      case 'doc': outline('M4 1.8h5.5L13 5.3V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2.8a1 1 0 0 1 1-1z M9.3 1.8V5h3.5'); break;
+      case 'lock': outline('M4.5 7.3V5a3.5 3.5 0 1 1 7 0v2.3 M3.8 7.3h8.4a.8.8 0 0 1 .8.8V13a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8.1a.8.8 0 0 1 .8-.8z'); break;
+      case 'logout': outline('M6.5 2H3.2a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3.3 M10.5 11l3-3-3-3 M13.3 8H5.8'); break;
+      case 'camera-off': outline('M2 2l12 12 M5.3 4H3.5a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h8.3 M11.7 5.3V5a1 1 0 0 0-1-1H9l-1-1.5H8 M14 5.5v6a1 1 0 0 1-1 1h-.3 M8 6.3A2 2 0 0 1 10 8.4'); break;
+      case 'windows': filled('M1 2.6 6.6 1.8V7.3H1z M7.3 1.7 15 .6V7.3H7.3z M1 8.1h5.6v5.5L1 12.8z M7.3 8.1H15v6.7l-7.7-1.1z'); break;
+      case 'linux': filled('M8 .9c1 0 1.8.9 1.8 2.1 0 .8-.3 1.3-.6 1.8.9.6 1.7 1.6 2.1 2.8.5 1.5.3 2.9-.1 3.9.4.3.6.7.6 1.2 0 .9-1.4 1.5-2.4 1.9-1.2.5-2.6.6-3.6.3-1-.3-2.4-.4-3.6-.9-1-.4-2.4-1-2.4-1.9 0-.5.2-.9.6-1.2-.4-1-.6-2.4-.1-3.9.4-1.2 1.2-2.2 2.1-2.8-.3-.5-.6-1-.6-1.8C6.2 1.8 7 .9 8 .9z M6.3 7.3a.6.6 0 1 0 0-1.2.6.6 0 0 0 0 1.2z M9.7 7.3a.6.6 0 1 0 0-1.2.6.6 0 0 0 0 1.2z'); break;
+      case 'android': filled('M4.3 6.6h7.4v4.6a1 1 0 0 1-1 1h-.3v1.6a.9.9 0 0 1-1.8 0v-1.6H7.8v1.6a.9.9 0 0 1-1.8 0v-1.6h-.3a1 1 0 0 1-1-1V6.6z M3 6.6a1 1 0 1 0-1.9 0M14.9 6.6a1 1 0 1 0-1.9 0 M5.6 5.8c0-1.6 1.1-2.8 2.4-2.8s2.4 1.2 2.4 2.8M6.2 2.3l-.7-1.1M9.8 2.3l.7-1.1 M6.5 5.6h.01 M9.5 5.6h.01'); break;
+      case 'device': filled('M2 2.5h12a1 1 0 0 1 1 1V10a1 1 0 0 1-1 1H9.5v1.7h1.8a.6.6 0 0 1 0 1.1H4.7a.6.6 0 0 1 0-1.1h1.8V11H2a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1z M2.5 3.5h11V9h-11z'); break;
+    }
+    return s;
+  }
+  const label = (iconName, text) => [icon(iconName), ' ', text];
+  const osKind = (os) => (/android/i.test(os) ? 'android' : /linux|ubuntu|debian/i.test(os) ? 'linux' : 'windows');
+  // a square tile for the sessions list: a live screenshot for a desktop OS, an OS glyph for a phone or when there is nothing to show
+  function previewTile(s) {
+    const t = el('div', { class: 'tile' });
+    if (s.online && osKind(s.os) !== 'android') {
+      const img = el('img', { alt: '', loading: 'lazy', src: '/admin/api/preview?code=' + encodeURIComponent(s.code) + '&t=' + Math.floor(Date.now() / 15000) });
+      img.addEventListener('error', () => { img.remove(); t.append(icon('camera-off', 20)); }, { once: true });
+      t.append(img);
+    } else t.append(icon(osKind(s.os) === 'android' ? 'android' : 'camera-off', 20));
+    t.append(el('span', { class: 'badge', title: s.os }, icon(osKind(s.os), 10)));
+    return t;
+  }
+
   // our own dialogs instead of the browser's prompt / confirm / alert
   function modal(title, content, { ok = 'OK', danger = false, cancel = 'Cancel', onok } = {}) {
     return new Promise((resolve) => {
@@ -52,8 +89,9 @@
 
   async function panel(me) {
     const status = el('div', { class: 'cards' }), body = el('div');
-    const tabs = ['sessions', 'report', 'account'].map((t) => el('button', { text: t[0].toUpperCase() + t.slice(1), class: t === tab ? 'on' : '', onclick: () => { tab = t; panel(me); } }));
-    app.replaceChildren(el('header', null, el('h1', { text: 'HelperMCP / admin' }), el('nav', null, tabs), el('span', { class: 'sp' }), el('span', { class: 'mut', text: me.user }), el('button', { text: 'Sign out', onclick: async () => { try { await call('logout', {}); } catch (_) { /* gone */ } login(); } })), el('main', null, status, body));
+    const TAB_ICON = { sessions: 'list', report: 'doc', account: 'lock' };
+    const tabs = ['sessions', 'report', 'account'].map((t) => el('button', { class: t === tab ? 'on' : '', onclick: () => { tab = t; panel(me); } }, label(TAB_ICON[t], t[0].toUpperCase() + t.slice(1))));
+    app.replaceChildren(el('header', null, el('h1', { text: 'HelperMCP / admin' }), el('nav', null, tabs), el('span', { class: 'sp' }), el('span', { class: 'mut', text: me.user }), el('button', { onclick: async () => { try { await call('logout', {}); } catch (_) { /* gone */ } login(); } }, label('logout', 'Sign out'))), el('main', null, status, body));
     clearInterval(timer);
     const guard = (e) => { if (e.status === 401) login('Signed out. Sign in again.'); else body.replaceChildren(el('div', { class: 'err', text: e.message })); };
     async function top() {
@@ -64,15 +102,16 @@
       const draw = async () => {
         try {
           const rows = await call('sessions');
-          body.replaceChildren(rows.length ? el('table', null, el('thead', null, el('tr', null, ['Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', ''].map((h) => el('th', { text: h })))),
+          body.replaceChildren(rows.length ? el('table', null, el('thead', null, el('tr', null, ['', 'Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', ''].map((h) => el('th', { text: h })))),
             el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off' },
+              el('td', { class: 'pv' }, previewTile(s)),
               el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null),
               el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os }), s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool + (r.args ? ' ' + r.args.slice(0, 40) : '')).join(' · ') }) : null),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
               el('td', { text: s.mode }), el('td', { text: ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
-              el('td', { class: 'ac' }, el('div', { class: 'acts' }, el('button', { class: 'go', text: 'Open', title: 'open the live view', onclick: async () => { try { const j = await call('open', { code: s.code }); window.open(j.control, '_blank', 'noopener'); } catch (e) { guard(e); } } }),
-                el('button', { text: 'Look', title: 'glow colour and task text', onclick: () => lookBox(s).catch(guard) }),
-                el('button', { class: 'danger', text: 'End', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
+              el('td', { class: 'ac' }, el('div', { class: 'acts' }, el('button', { class: 'go', title: 'open the live view', onclick: async () => { try { const j = await call('open', { code: s.code }); window.open(j.control, '_blank', 'noopener'); } catch (e) { guard(e); } } }, label('open', 'Open')),
+                el('button', { title: 'glow colour and task text', onclick: () => lookBox(s).catch(guard) }, label('eye', 'Look')),
+                el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End')))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
         } catch (e) { guard(e); }
       };
       draw(); timer = setInterval(() => { draw(); top(); }, 3000);

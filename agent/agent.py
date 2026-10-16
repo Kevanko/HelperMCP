@@ -2009,7 +2009,13 @@ def look(a):
 def hold(a):
     PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
 def task_done(a):
-    PHASE["p"] = "done"; overlay_send("state done"); print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
+    PHASE["p"] = "done"; overlay_send("state done")
+    if PERSIST["on"]:   # a finished job should not reappear after the PC restarts; a new command re-arms it (handle(), below)
+        for f in (AUTOSTART, os.path.join(STATE_DIR, "start.sh")):
+            try: os.remove(f)
+            except Exception: pass
+        log("task done: autostart removed (a reboot will not bring the console back)")
+    print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
 TOOLS.update(look=look, hold=hold, task_done=task_done, trace=trace, watch=watch, focus_window=focus_window,
              tree=tree, find=find, edit_file=edit_file, push_file=push_file, system=system, util=util, stream=stream)
 META = {"look", "hold", "task_done", "stream"}
@@ -2026,8 +2032,10 @@ def handle(cmd, mode, token):
     if not view and name not in META:
         PHASE["last"] = time.time()
         if not OP["seen"] or PHASE["p"] != "ok":
-            first = not OP["seen"]; OP["seen"] = True; PHASE["p"] = "ok"; overlay_send("state ok"); show_status()
+            first = not OP["seen"]; was_done = PHASE["p"] == "done"
+            OP["seen"] = True; PHASE["p"] = "ok"; overlay_send("state ok"); show_status()
             if first: print(c("32", "  ● " + t("st_ok")), flush=True)
+            if was_done and PERSIST["on"]: install_autostart()
         ln = line_for(name, args)
         if ln: print(ln, flush=True)
     quiet_ = name in QUIET or name in META or view
@@ -2090,8 +2098,8 @@ def main():
         mode = "full" if input(t("mode")).strip() == "2" else "ask"
     persist = os.environ.get("HELPER_PERSIST")
     if saved: PERSIST["on"] = True
-    elif persist in ("0", "1"): PERSIST["on"] = persist == "1"
-    elif sys.stdin.isatty(): PERSIST["on"] = input(t("persist_q")).strip().lower() not in ("n", "no", "н", "нет")
+    elif persist in ("0", "1"): PERSIST["on"] = persist == "1"   # tests / an explicit opt-out only: otherwise the session is always kept
+    else: PERSIST["on"] = True
     wait = 1.0
     note = ""
     if saved:

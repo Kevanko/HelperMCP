@@ -29,7 +29,8 @@ let relay = await startRelay();
 
 // the real install path: fetch the script from the relay, like `irm | iex` would
 // PORTABLE=1: hide Node from the agent to test the portable-Node download
-const agentEnv = { ...process.env, HELPER_MODE: 'full', HELPER_DEBUG: '1', HELPER_INIT_TIMEOUT: '25', HELPER_NO_OVERLAY: '1' };
+const agentTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-state-'));   // persist is now on by default: keep the agent's saved session / autostart off this dev machine's real profile
+const agentEnv = { ...process.env, HELPER_MODE: 'full', HELPER_DEBUG: '1', HELPER_INIT_TIMEOUT: '25', HELPER_NO_OVERLAY: '1', HELPER_NO_AUTOSTART: '1', HELPER_STATE_DIR: agentTmp };
 if (process.env.PORTABLE) {
   for (const k of Object.keys(agentEnv)) if (k.toUpperCase() === 'PATH') agentEnv[k] = agentEnv[k].split(path.delimiter).filter((p) => !/node/i.test(p)).join(path.delimiter);
 }

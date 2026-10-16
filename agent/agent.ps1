@@ -1153,7 +1153,11 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
     @{ text = $(if ($out) { $out -join ', ' } else { 'nothing to change' }) }
 }
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
-function Do-TaskDone($a) { $script:Phase = 'done'; Overlay-Send 'state done'; Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' } }
+function Do-TaskDone($a) {
+    $script:Phase = 'done'; Overlay-Send 'state done'
+    if ($script:Persist) { try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }; Write-AgentLog 'task done: autostart removed (a reboot will not bring the console back)' }   # a finished job should not reappear after the PC restarts; a new command re-arms it (below)
+    Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' }
+}
 function Do-PressKey($a) {
     $kc = $null; try { $kc = [V__BUILD__.Caret]::Get() } catch { }; $kr = [V__BUILD__.Probe]::FgRect(); $am = Arrow-Mask; $pb = Probe-Take $kr (@(Caret-Mask $kc) + $am)
     Overlay-Send 'typing'; Pin-Caret
@@ -2639,8 +2643,10 @@ function Process-Command($cmd) {
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
-            $first = -not $script:OperatorSeen; $script:OperatorSeen = $true; $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status
+            $first = -not $script:OperatorSeen; $wasDone = $script:Phase -eq 'done'
+            $script:OperatorSeen = $true; $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status
             if ($first) { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
+            if ($wasDone -and $script:Persist) { Install-Autostart }   # work resumed after task_done: re-arm the safety net
         }
     }
     if (-not $viewFrame -and -not $meta) { Say-Step $name $a }
@@ -2708,8 +2714,8 @@ function Start-Helper {
     $script:Mode = $mode
     try { [F__BUILD__.Route]::Init($RELAY, $(try { (Get-Content (Join-Path $StateDir 'route.txt') -ErrorAction Stop | Select-Object -First 1) } catch { '' }), (Join-Path $StateDir 'route.block')); [Net.WebRequest]::DefaultWebProxy = [F__BUILD__.Route]::Proxy } catch { Write-AgentLog "route layer: $_" }   # the link to the relay survives a VPN, zapret or a dead default route
     if ($saved) { $script:Mode = $mode = $saved.mode; $script:Persist = $true }
-    elseif ($env:HELPER_PERSIST -in '0', '1') { $script:Persist = ($env:HELPER_PERSIST -eq '1') }
-    elseif (-not [Console]::IsInputRedirected) { $script:Persist = ((Read-Host (T 'Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]' 'Keep this session through internet loss and reboots (the code stays the same)? [Y/n]')).Trim().ToLower() -notin 'n', 'no', 'н', 'нет') }
+    elseif ($env:HELPER_PERSIST -in '0', '1') { $script:Persist = ($env:HELPER_PERSIST -eq '1') }   # tests / an explicit opt-out only: otherwise the session is always kept (internet loss, reboots), like the mode question used to default
+    else { $script:Persist = $true }
     $note = ''
     if ($saved) { Write-Host ('  ' + (T 'Продолжаю прошлый сеанс ' 'Resuming the previous session ') + $saved.code) -ForegroundColor Yellow; $note = if ([Math]::Abs($saved.boot - (Get-BootTime)) -gt 90) { 'after a reboot' } else { 'restarted' }; Write-AgentLog "resuming session $($saved.code) ($note)" }
     $wait = 1.0

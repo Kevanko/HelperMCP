@@ -5,7 +5,7 @@ $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored a
 # built-in ones (ConvertTo-SecureString, ...): use 5.1's own module folders.
 if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'PowerShell[\\/]7') { $env:PSModulePath = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'), (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules'), (Join-Path $PSHOME 'Modules')) -join ';' }
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
-$ru = (Get-Culture).TwoLetterISOLanguageName -eq 'ru'
+$ru = $env:HELPER_LANG -eq 'ru'   # the console speaks English; HELPER_LANG=ru for Russian
 function T($r, $e) { if ($ru) { $r } else { $e } }
 $AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'util', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
@@ -769,7 +769,20 @@ namespace K__BUILD__ {
     static string C(string code, string s) { return VT ? "\u001b[" + code + "m" + s + "\u001b[0m" : s; }
     static void Say(string s) { try { Console.WriteLine(s); } catch { } }
     static void Ov(string line) { try { var o = Overlay; if (o != null) lock (o) o.WriteLine(line); } catch { } }
-    static void Status(string text, bool ok) { if (!VT) return; try { Console.Write("\u001b7\u001b[5;1H\u001b[2K  \u001b[33m\u2502 \u001b[" + (ok ? "1;32m" : "1;38;5;208m") + text + "\u001b[0m\u001b8"); } catch { } }
+    // the pinned header: a box over the full width of the console, every line centred and closed on the right
+    public static int W() { try { return Math.Max(40, Math.Min(200, Console.WindowWidth - (VT ? 0 : 1))); } catch { return 79; } }
+    static string Pad(string t, int w, out int left) { if (t.Length > w) t = t.Substring(0, w); left = (w - t.Length) / 2; return t; }
+    public static string Row(string text, string ansi) {
+      int w = W() - 2, l; var t = Pad(text, w, out l);
+      return C("33", "\u2502") + new string(' ', l) + (VT && ansi != null ? "\u001b[" + ansi + "m" + t + "\u001b[0m" : t) + new string(' ', w - t.Length - l) + C("33", "\u2502");
+    }
+    public static string CodeRow(string label, string code, string tail) {
+      int w = W() - 2; string plain = label + "  " + " " + code + " " + (tail.Length > 0 ? "   " + tail : ""); int l = Math.Max(0, (w - plain.Length) / 2), r = Math.Max(0, w - plain.Length - l);
+      return C("33", "\u2502") + new string(' ', l) + C("33", label + "  ") + C("30;43", " " + code + " ") + (tail.Length > 0 ? C("32", "   " + tail) : "") + new string(' ', r) + C("33", "\u2502");
+    }
+    public static string Top(string title) { int w = W() - 2; string t = " " + title + " "; int l = (w - t.Length) / 2; return C("33", "\u250C" + new string('\u2500', l) + t + new string('\u2500', Math.Max(0, w - l - t.Length)) + "\u2510"); }
+    public static string Bottom() { return C("33", "\u2514" + new string('\u2500', W() - 2) + "\u2518"); }
+    static void Status(string text, bool ok) { if (!VT) return; try { Console.Write("\u001b7\u001b[5;1H\u001b[2K" + Row(text, ok ? "1;32" : "1;38;5;208") + "\u001b8"); } catch { } }
     public static void Post(string path, string json) {
       try { var rq = (HttpWebRequest)WebRequest.Create(Relay + path); rq.Method = "POST"; rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/json"; rq.Timeout = 3000;
         var b = System.Text.Encoding.UTF8.GetBytes(json); rq.ContentLength = b.Length; using (var st = rq.GetRequestStream()) st.Write(b, 0, b.Length); rq.GetResponse().Close(); } catch { }
@@ -2141,22 +2154,25 @@ function Status-Text {
 function Show-Status {   # redraw only the status row (row 5) of the pinned header
     try { [K__BUILD__.Keys]::OpSeen = $script:OperatorSeen; if (-not [K__BUILD__.Keys]::Paused) { $xx = Status-Text; [K__BUILD__.Keys]::StRestore = $xx[1]; [K__BUILD__.Keys]::StRestoreOk = ($xx[0] -eq 'ok') } } catch { }
     if (-not $script:VT -or -not $script:HdrDrawn) { return }
-    try { $e = [char]27; $x = Status-Text; $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::Write("${e}7$e[5;1H$e[2K  $e[33m$([char]0x2502) $col$($x[1])$e[0m${e}8") } catch { }
+    try { $e = [char]27; $x = Status-Text; $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::Write("${e}7$e[5;1H$e[2K" + [K__BUILD__.Keys]::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })) + "${e}8") } catch { }
 }
 function Draw-Header($code, $copied) {
-    $e = [char]27; $bar = [string]([char]0x2500) * 56
+    $e = [char]27; $k = [K__BUILD__.Keys]
     try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
     try { if ($script:VT) { [Console]::Write("$e[2J$e[H") } else { Clear-Host } } catch { }
-    Write-Host ('  ' + [char]0x250C + ' ' + (T 'УДАЛЁННАЯ ПОМОЩЬ' 'REMOTE HELP') + ' ' + $bar) -ForegroundColor Yellow
-    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Код сессии:' 'Session code:') + '  ') -ForegroundColor Yellow -NoNewline; Write-Host " $code " -ForegroundColor Black -BackgroundColor Yellow -NoNewline
-    if ($copied) { Write-Host ('   ' + [char]0x221A + ' ' + (T 'скопирован в буфер обмена' 'copied to the clipboard')) -ForegroundColor Green } else { Write-Host '' }
-    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Скажи этот код тому, кто помогает.' 'Tell this code to the person who helps you.')) -ForegroundColor DarkYellow
-    Write-Host ('  ' + [char]0x2502 + ' ' + (T 'Esc - завершить сеанс в любой момент' 'Esc - end the session at any time')) -ForegroundColor DarkYellow
-    $x = Status-Text; Write-Host ('  ' + [char]0x2502 + ' ') -ForegroundColor Yellow -NoNewline
-    if ($script:VT) { $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::WriteLine("$col$($x[1])$e[0m") } else { Write-Host $x[1] -ForegroundColor $(if ($x[0] -eq 'ok') { 'Green' } else { 'DarkYellow' }) }
-    Write-Host ('  ' + [char]0x2514 + $bar + [string]([char]0x2500) * 18) -ForegroundColor Yellow
+    $k::VT = $script:VT
+    $x = Status-Text; $relayHost = try { ([Uri]$RELAY).Host } catch { $RELAY }
+    $lines = @(
+        $k::Top('Remote Help'),
+        $k::CodeRow('Session code', $code, $(if ($copied) { ([string][char]0x2713) + ' copied to the clipboard' } else { '' })),
+        $k::Row('Tell this code to the person who is helping you.', '33'),
+        $k::Row(('Mode: ' + $(if ($script:Mode -eq 'full') { 'full access' } else { 'ask before every action' }) + '   |   Server: ' + $relayHost), '2;33'),
+        $k::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })),
+        $k::Row('Press Esc at any time to pause or end the session.', '33'),
+        $k::Bottom())
+    foreach ($l in $lines) { if ($script:VT) { [Console]::WriteLine($l) } else { Write-Host $l -ForegroundColor Yellow } }
     $script:HdrDrawn = $true
-    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[7;${h}r$e[7;1H") } catch { } }   # the header stays on top, the log scrolls below it
+    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[8;${h}r$e[8;1H") } catch { } }   # the header stays on top, the log scrolls below it
 }
 function Flash-Console {
     try { $f = New-Object 'H.U__BUILD__+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U__BUILD__]::GetAncestor([H.U__BUILD__]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U__BUILD__]::FlashWindowEx([ref]$f) } catch { }

@@ -129,6 +129,7 @@ async function aiShot(code, a) {
 // ---- live stream (like a video call): the agent pushes frames over one long upload, the relay fans them out to the open viewers.
 // A frame is [u32 length][u8 type][payload]: K = full JPEG ([u16 n][meta JSON][jpeg]), T = changed tiles ([u16 count] then [u16 x][u16 y][u32 n][jpeg]),
 // C = H.264 config ([u16 n][meta JSON {codec, w, h, ox, oy, sc}]), V = H.264 access unit ([u8 key][annex-B bytes]), P = ping.
+const SHOT_TOOLS = new Set(['click', 'move', 'drag', 'scroll', 'type_text', 'press_key', 'actions', 'start_process', 'focus_window']);
 const LIVE_BACKLOG = 1_500_000;   // bytes waiting for a slow viewer before it skips frames until the next full picture
 function streamCtl(code, s, a) {
   if (s.noStream) return;
@@ -297,6 +298,22 @@ async function callJob(session, tool, args, ms) {
   jobs.set(id, j);
   return settle(id, j, SYNC_MS);
 }
+// wait_screen: instead of the AI taking screenshots in a loop (each one a round trip and a picture), the relay asks the agent for tiny "unchanged" answers
+// and returns ONE picture when the screen changed / settled. A change = the picture hash differs (the glow overlay is taken out of the picture).
+async function waitScreen(code, a) {
+  const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error(`No such session "${code}"`);
+  const until = a.until === 'change' ? 'change' : 'stable', end = Date.now() + Math.min(60, Math.max(1, Number(a.timeout_s) || 10)) * 1000, t0 = Date.now();
+  let prev = s.shotHash || null, got = null, quiet = 0, changed = false;
+  while (Date.now() < end) {
+    const d = await call(code, 'screenshot', { max_width: 1000, quality: 55, ...(prev ? { prev } : {}) }, 30_000);
+    if (d && (d.same || (prev && d.h === prev))) { quiet++; if (until === 'stable' && (changed || quiet >= 3) && quiet >= 2) break; }
+    else { changed = true; quiet = 0; got = d; if (d.h) { prev = d.h; s.shotHash = d.h; s.shotKey = ''; } if (until === 'change') break; }
+    await new Promise((x) => setTimeout(x, 150));
+  }
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  if (!got) return { text: `No change on the screen in ${secs} s.` };
+  return got.jpeg ? { ...got, text: `${until === 'change' ? 'The screen changed' : 'The screen settled'} after ${secs} s.` } : { text: `Changed after ${secs} s.` };
+}
 async function waitJob(id, ms) {
   const j = jobs.get(id);
   if (!j) throw new Error(`Unknown or already delivered job "${id}".`);
@@ -398,6 +415,8 @@ const tools = [
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
+  { name: 'wait_screen', session: true, description: 'Wait for the screen to react, then get ONE picture: until "change" returns at the first change, "stable" (default) when it has changed and then stopped moving (a page loaded, an installer finished). Much cheaper and faster than taking screenshots in a loop; use it after a click that starts something slow. Returns text only if nothing changed within timeout_s.',
+    props: { until: { type: 'string', enum: ['change', 'stable'] }, timeout_s: { type: 'number', minimum: 1, maximum: 60, description: 'default 10' } }, run: (session, a) => waitScreen(session, a) },
   { name: 'watch', agent: true, description: 'Live look: films the screen for a few seconds and returns one picture with the frames in a grid (time and how much changed on each) plus a short text summary. Use it to see what happens over time: a loading bar, an animation, a window that flickers, whether typing or a click had any effect, an error that shows for a moment.',
     props: { seconds: { type: 'number', minimum: 1, maximum: 10, description: 'default 3' }, fps: { type: 'number', minimum: 1, maximum: 5, description: 'frames per second, default 3' }, monitor: { type: 'integer', minimum: 0 },
       region: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' }, w: { type: 'number' }, h: { type: 'number' } }, description: 'only this part, in the coordinates of your last screenshot' } },
@@ -552,6 +571,7 @@ Workflow for any task:
 15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.
 16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.
 17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
+17b. Speed with the screen: do not loop action -> screenshot -> think. Put several steps in ONE actions call, add shot:true to the action that needs a look at the result (the picture comes back in the same answer, an unchanged screen costs a line), and after something slow starts (a click that loads a page, an installer) call wait_screen (it returns one picture when the screen has changed and settled, or text if nothing moved). Never take screenshots in a loop to wait.
 17a. Slow PC / what eats CPU, RAM or disk / anything malicious: ONE call to system {sections:["processes"]} lists every process with its real CPU %, memory, the exe path and who signed it, and marks with ! anything run from a temp or download folder or unsigned outside the normal install dirs. system {} also gives disks, network and startup; add "drivers" and "services". Kill a bad one with util {op:"kill"} and delete its file. sysinfo and system cost tens of ms now: prefer them to a handful of run commands. Network problems on a PC (cuts, slow, a VPN / zapret / proxy in the way): system {sections:["reach"]} lists every adapter with its type, IP, gateway, DNS, which one is the default route, which one the agent talks through, whether each reaches the relay, plus the VPN / DPI-bypass programs, network filter drivers, proxies and hosts entries; {sections:["connections"]} shows who talks to whom. The agent keeps its own link alive by itself (it moves to another adapter when the current route dies, VPN adapters last) and logs every switch.
 18. No quoting traps: to start a program with arguments use run {command: "program", args: [...]} (no shell, each argument arrives exactly as given). For a longer script use write_file, then run the file. A failed command may come back with a HINT line: follow it instead of retrying the same thing.`;
 
@@ -559,6 +579,7 @@ function buildMcp(fixed) {
   const m = new Server({ name: 'helpermcp', version: '0.4.0' }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
   const sessionProp = { session: str("Session code shown on the user's screen, e.g. K7M2-QX9P") };
 
+  const SHOT_PROP = { shot: { type: 'boolean', description: 'also return the screen as it is after this action (one call instead of action + screenshot)' } };
   m.setRequestHandler(ListToolsRequestSchema, async () => {
     const list = tools
       .filter((t) => !(fixed && t.local && !t.always))
@@ -568,7 +589,7 @@ function buildMcp(fixed) {
           name: t.name, description: t.description,
           inputSchema: {
             type: 'object',
-            properties: { ...(needsSession ? sessionProp : {}), ...t.props },
+            properties: { ...(needsSession ? sessionProp : {}), ...t.props, ...(SHOT_TOOLS.has(t.name) ? SHOT_PROP : {}) },
             required: [...(needsSession ? ['session'] : []), ...(t.required || [])],
           },
         };
@@ -598,7 +619,9 @@ function buildMcp(fixed) {
       if (!t) throw new Error(`Unknown tool ${name}`);
       if (t.local) return fmt(await t.run(a));
       if (!session) throw new Error('"session" is required (code shown on the user\'s screen)');
+      const wantShot = SHOT_TOOLS.has(name) && a.shot; delete a.shot;
       const out = fmt(t.run ? await t.run(session, a) : name === 'screenshot' ? await aiShot(session, a) : await callJob(session, name, a, t.ms?.(a)));
+      if (wantShot) { try { out.content.push(...fmt(await aiShot(session, {})).content); } catch (e) { out.content.push({ type: 'text', text: 'screen after: ' + e.message }); } }
       const sx = sessions.get(String(session).toUpperCase());
       const first = out.content[0]?.type === 'text' ? out.content[0].text : '';
       const hint = hintFor(sx, String(session).toUpperCase(), name, a, first, false);
@@ -739,7 +762,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 </style>
 <div id=top><span id=dot></span><span id=st>…</span><span id=who>${esc(who)}</span>
 <div id=mons></div>
-<button id=zr title="1:1" style="display:none">1:1</button><button id=ctl hidden></button></div>
+<button id=zr title="1:1" style="display:none">1:1</button><button id=ctl hidden></button><button id=disc></button></div>
 <div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
 <aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
 <section id=sys hidden><h2 id=hSys style="padding-left:0"></h2><div id=sg></div><div class=bar><i id=bc></i></div><div class=bar><i id=bm></i></div><div id=sp></div></section>
@@ -766,9 +789,9 @@ async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_
  catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
 async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}status(L.end,'')}
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
-let abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve();
+let gone=false,abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve();
 const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
-setInterval(()=>{if(gotEver&&!noLive&&frames)status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);
+setInterval(()=>{if(gotEver&&!noLive&&dot.className==='on')status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
 const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
 function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(1)+'G':n>=1048576?Math.round(n/1048576)+'M':Math.round(n/1024)+'K';
@@ -870,6 +893,8 @@ cv.addEventListener('pointerdown',e=>{if(control||zoom<=1)return;pan={x:e.client
 cv.addEventListener('pointermove',e=>{if(!pan)return;tx=pan.tx+(e.clientX-pan.x);ty=pan.ty+(e.clientY-pan.y);applyZoom()});
 addEventListener('pointerup',()=>{pan=null});
 $('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
+// disconnect: stop watching (the stream closes at once; the helper stops filming 15 s after the last viewer leaves); the same button reconnects
+$('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(ended&&gone){location.reload();return}gone=true;ended=true;if(abort)abort.abort();status(ru?'отключено':'disconnected','');$('disc').textContent=ru?'Подключиться':'Reconnect'};
 if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
  const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?(kb.offsetHeight||52)+'px':'0px');$('tag').style.display=on?'block':'none';$('tag').textContent=L.tag;send('/takeover',{on});if(on)txt.focus()};
  b.onclick=()=>set(!control);

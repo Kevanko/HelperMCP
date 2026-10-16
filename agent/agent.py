@@ -7,7 +7,7 @@ import urllib.parse, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 
 RELAY = os.environ.get("HELPER_RELAY") or "__RELAY__"
-RU = (locale.getlocale()[0] or os.environ.get("LANG", "")).lower().startswith("ru")
+RU = os.environ.get("HELPER_LANG", "") == "ru"   # the console speaks English; HELPER_LANG=ru for Russian
 T = {
     "banner": ("УДАЛЁННАЯ ПОМОЩЬ. Код сессии:", "REMOTE HELP. Session code:"),
     "tell": ("Назови этот код тому, кто тебе помогает. Закрой окно или Ctrl+C - доступ пропадёт.",
@@ -359,7 +359,7 @@ GROUP_LABEL = {"input": ("мышь и клавиатура", "mouse & keyboard")
 ALLOWED, AI = set(), {"t": 0.0, "pos": None, "fw": None}
 END = threading.Event()
 KEYQ = queue.Queue(); PUMP = {"on": False, "old": None}
-HDR = 6   # lines of the pinned header
+HDR = 7   # lines of the pinned header
 OP = {"seen": False}   # has the helper sent anything yet
 ORANGE = "38;5;208"
 def c(code, x): return f"\033[{code}m{x}\033[0m"
@@ -455,9 +455,20 @@ def copy_clip(text):
     overlay_send("clip " + text); return bool(OVERLAY_PROC)   # the overlay (GTK) owns the clipboard while the session lasts
 
 
+def _w():
+    try: return max(40, min(200, shutil.get_terminal_size().columns))
+    except Exception: return 80
+
+
+def row(text, code="33", pre=""):
+    """one line of the pinned header: a box over the full console width, the text centred, closed on the right"""
+    w = _w() - 2; text = text[:w]; l = (w - len(text)) // 2
+    return c("33", "│") + " " * l + (c(code, text) if code else text) + " " * (w - len(text) - l) + c("33", "│")
+
+
 def status_line():
     st = "lost" if NET["s"] == "lost" else ("paused" if PAUSED.is_set() else ("ok" if OP["seen"] else "wait"))
-    return c("33", "  │ ") + (c("1;32", "● " + t("st_ok")) if st == "ok" else c("1;" + ORANGE, "⏸ " + t("st_paused") if st == "paused" else "◌ " + t("st_lost" if st == "lost" else "st_wait")))
+    return row("● " + t("st_ok") if st == "ok" else ("⏸ " + t("st_paused") if st == "paused" else "◌ " + t("st_lost" if st == "lost" else "st_wait")), "1;32" if st == "ok" else "1;" + ORANGE)
 
 
 def show_status():
@@ -466,13 +477,18 @@ def show_status():
         sys.stdout.write("\0337\033[5;1H\033[2K" + status_line() + "\0338"); sys.stdout.flush()
 
 
-def header(code, copied):
+def header(code, copied, mode="ask"):
     try: rows = shutil.get_terminal_size().lines
     except Exception: rows = 24
-    bar = "─" * 54
+    w = _w() - 2; title = " Remote Help "; l = (w - len(title)) // 2
+    tail = "   ✓ copied to the clipboard" if copied else ""
+    plain = "Session code   " + code + " " + tail; pad = max(0, (w - len(plain)) // 2)
+    code_row = c("33", "│") + " " * pad + c("33", "Session code  ") + c("30;43", f" {code} ") + c("32", tail) + " " * max(0, w - pad - len(plain)) + c("33", "│")
+    host = urllib.parse.urlparse(RELAY).hostname or RELAY
     PUMP["hdr"] = True
-    sys.stdout.write("\033[2J\033[H" + c("1;33", f"  ┌ {t('hdr1')} {bar}") + "\n" + c("1;33", f"  │ {t('hdr2')}  ") + c("1;30;43", f" {code} ") + c("32", f"   ✔ {t('copied')}" if copied else "") + "\n"
-                     + c("33", f"  │ {t('hdr4')}") + "\n" + c("33", f"  │ {t('hdr3')}") + "\n" + status_line() + "\n" + c("1;33", f"  └{bar}{'─' * 18}") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
+    sys.stdout.write("\033[2J\033[H" + c("33", "┌" + "─" * l + title + "─" * (w - l - len(title)) + "┐") + "\n" + code_row + "\n"
+                     + row("Tell this code to the person who is helping you.") + "\n" + row(f"Mode: {'ask before every action' if mode == 'ask' else 'full access'}   |   Server: {host}", "2;33") + "\n"
+                     + status_line() + "\n" + row("Press Esc at any time to pause or end the session.") + "\n" + c("33", "└" + "─" * w + "┘") + "\n" + f"\033[{HDR + 1};{rows}r\033[{HDR + 1};1H")
     sys.stdout.flush()
 
 
@@ -2016,7 +2032,7 @@ def main():
     log(f"session {code} {'resumed' if reg.get('resumed') else 'started'} persist={PERSIST['on']} relay={RELAY}")
     overlay_start()
     copied = copy_clip(code)
-    if sys.stdout.isatty(): header(code, copied)
+    if sys.stdout.isatty(): header(code, copied, mode)
     else: print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
     play("ok")
     if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()

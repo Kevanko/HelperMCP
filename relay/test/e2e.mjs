@@ -261,6 +261,11 @@ assert.ok(vlog.some((e) => e.tool === 'run') && !vlog.some((e) => e.args.include
 assert.equal((await fetch(BASE + '/v/' + '0'.repeat(36))).status, 404);
 assert.equal((await fetch(vurl + '/input', { method: 'POST', body: '{"a":"key","keys":"x"}' })).status, 403, 'the view-only link cannot control');
 if (process.env.GUI) { const fr = await fetch(vurl + '/frame'); assert.equal(fr.headers.get('content-type'), 'image/jpeg'); assert.ok((await fr.arrayBuffer()).byteLength > 1000); }
+assert.ok(page.includes('id=disc'), 'the viewer has a Disconnect button');
+if (process.env.GUI) {   // wait_screen: one picture when the screen changed / settled, a line when nothing moved
+  const w = await tool('wait_screen', { session: code, until: 'change', timeout_s: 2 });
+  assert.ok(!w.isError && /No change|changed|settled/.test(txt(w)), 'wait_screen answers: ' + txt(w).slice(0, 80)); console.log('wait_screen ok');
+}
 console.log('viewer ok');
 // files from the live view (control link only): browse, download, drop a file onto the PC; the AI hears about the upload
 const ctl = { 'x-ctl': /#c=([0-9a-f]+)/.exec(vtxt)[1] };

@@ -169,6 +169,9 @@ assert.equal(zip.slice(0, 2).toString(), 'PK'); assert.ok(zip.includes(Buffer.fr
 // system state and ready-made utilities
 const sy = txt(await tool('system', { session: code }));
 console.log(sy.slice(0, 1800)); assert.match(sy, /== overview/); assert.match(sy, /== disks/); assert.match(sy, /== processes/); assert.match(sy, /== network/); console.log('system ok');
+assert.match(sy, /cpu%|pcpu|cpu/i, 'processes show cpu usage');
+const drv = txt(await tool('system', { session: code, sections: ['drivers'] }));
+assert.ok(/running|third-party|module/i.test(drv), 'drivers section answers: ' + drv.slice(0, 80)); console.log('system processes + drivers ok');
 assert.match(txt(await tool('util', { session: code, op: 'env_get', name: 'PATH' })), useps ? /process: .+/ : /.+/);
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
 const zp = path.join(tmp, 'tree-copy.zip');

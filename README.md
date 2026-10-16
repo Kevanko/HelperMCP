@@ -77,7 +77,8 @@ They open it, run the line for their system and send you the code. Tell your AI:
 ## What your AI gets
 
 - **Eyes and hands:** a live stream of the screen, screenshots, mouse, keyboard, commands.
-- **Files and system in one call:** `tree`, `find` (by name and content), read a range of a file, exact `edit_file`, send a file to the PC, a whole folder back as a zip, `system` (processes, disks, network, startup, errors), and `util` for installs, services, PATH, registry and more — no fragile shell one-liners, no quoting traps.
+- **Files and system in one call:** `tree`, `find` (by name and content), read a range of a file, exact `edit_file`, send a file to the PC, a whole folder back as a zip, and `util` for installs, services, PATH, registry and more — no fragile shell one-liners, no quoting traps.
+- **Find the resource hog in one call:** `system` returns every process with its real CPU %, memory, exe path and publisher, flags anything running from a temp/download folder or unsigned, plus disks, network, startup, services and drivers — so "why does this PC lag" is answered instantly and cheaply. `sysinfo` and `system` take tens of milliseconds (no WMI).
 - **Self-checks:** every click and keystroke reports what changed on screen, or a loud *NO CHANGE*, so it stops instead of typing into the wrong window.
 - **A plan with stages:** each step has its own colour, shown on the friend's screen and in your live view.
 - **Other MCP servers on their PC:** a real visible browser (`playwright`), Blender, anything; missing Node / uv are fetched on the fly.
@@ -101,6 +102,7 @@ To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=http
 - **Weak connections.** Screenshots are raw JPEG and shrink on slow links, unchanged screens aren't sent, big output is gzipped.
 - **Live stream.** The view is a real stream, not a slideshow: Windows sends only the screen tiles that change, Linux with `ffmpeg` sends H.264 (the browser decodes it with WebCodecs), and it steps quality to the link. Behind nginx add `proxy_buffering off; proxy_request_buffering off;` for the `/v/` and `/a/` paths; Caddy needs nothing.
 - **Files in the live view.** On the control link a Files panel browses the remote folders, downloads a file with a click, and drops files from your computer straight onto the open folder on the friend's PC.
+- **Zoom the preview.** Ctrl + mouse wheel zooms the live picture toward the cursor, drag pans, and a 1:1 button resets — the coordinates you click stay exact while zoomed.
 - **Linux.** Mouse and keyboard need X11 ("Ubuntu on Xorg"). On Wayland, screenshots, commands, files and browsers still work.
 - **Mistake log.** Missed taps and redone actions are saved with context (`misses` tool) so you can spot patterns.
 

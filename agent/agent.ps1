@@ -288,6 +288,83 @@ namespace F__BUILD__ {
     }
   }
 
+  // Fast system facts without WMI (Get-CimInstance is ~1 s): memory, and a rich process snapshot with real CPU %, the exe path,
+  // who signed it and a "!" for anything that looks out of place (running from Temp/AppData/Downloads, or no publisher) - so one call finds a resource hog or something nasty.
+  public static class Sys {
+    [StructLayout(LayoutKind.Sequential)] struct MEMORYSTATUSEX { public uint dwLength, dwMemoryLoad; public ulong ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual; }
+    [DllImport("kernel32.dll")] static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX m);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, System.Text.StringBuilder buf, ref int size);
+
+    public static string Mem() {   // "ram X.X of Y.Y GB free (Z% used); page ..."
+      var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) }; GlobalMemoryStatusEx(ref m);
+      double gb = 1024.0 * 1024 * 1024;
+      return string.Format(System.Globalization.CultureInfo.InvariantCulture, "ram {0:0.0} of {1:0.0} GB free ({2}% used); commit {3:0.0} of {4:0.0} GB free",
+        m.ullAvailPhys / gb, m.ullTotalPhys / gb, m.dwMemoryLoad, m.ullAvailPageFile / gb, m.ullTotalPageFile / gb);
+    }
+    public static int MemLoad() { var m = new MEMORYSTATUSEX { dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX)) }; GlobalMemoryStatusEx(ref m); return (int)m.dwMemoryLoad; }
+
+    [DllImport("kernel32.dll")] static extern bool GetSystemTimes(out long idle, out long kernel, out long user);
+    public static double CpuLoad(int ms) {   // whole-machine CPU busy %, sampled over ms (kernel time already includes idle)
+      long i0, k0, u0, i1, k1, u1; GetSystemTimes(out i0, out k0, out u0); System.Threading.Thread.Sleep(ms); GetSystemTimes(out i1, out k1, out u1);
+      double tot = (k1 - k0) + (u1 - u0), idle = i1 - i0; return tot <= 0 ? 0 : Math.Round((tot - idle) / tot * 100.0, 0);
+    }
+
+    static string PathOf(int pid) {
+      IntPtr h = OpenProcess(0x1000, false, pid); if (h == IntPtr.Zero) return "";   // PROCESS_QUERY_LIMITED_INFORMATION
+      try { int n = 512; var sb = new System.Text.StringBuilder(n); return QueryFullProcessImageName(h, 0, sb, ref n) ? sb.ToString() : ""; } finally { CloseHandle(h); }
+    }
+    static readonly string[] Shady = { "\\temp\\", "\\downloads\\", "\\`$recycle", "\\appdata\\local\\temp\\" };
+    static bool Looks(string path, string company) {
+      if (string.IsNullOrEmpty(path)) return false;   // a protected system process, not suspicious by itself
+      string p = path.ToLowerInvariant();
+      foreach (var s in Shady) if (p.Contains(s)) return true;
+      return string.IsNullOrEmpty(company) && !p.StartsWith("c:\\windows\\") && p.IndexOf("\\program files") < 0;   // unsigned and not a normal install
+    }
+
+    public static string Procs(int top, int sampleMs, bool all) {
+      var cpu0 = new Dictionary<int, TimeSpan>(); var t0 = DateTime.UtcNow;
+      var s0 = System.Diagnostics.Process.GetProcesses();   // two fresh snapshots: reading TotalProcessorTime a second time on the same object is cached, and Refresh() on every process is slow
+      foreach (var p in s0) { try { cpu0[p.Id] = p.TotalProcessorTime; } catch { } p.Dispose(); }
+      System.Threading.Thread.Sleep(sampleMs);
+      int cores = Environment.ProcessorCount; var rows = new List<double[]>(); var info = new Dictionary<int, string[]>(); var names = new Dictionary<int, string>();
+      double dt = (DateTime.UtcNow - t0).TotalMilliseconds * cores;
+      var procs = System.Diagnostics.Process.GetProcesses();
+      foreach (var p in procs) {
+        try {
+          double cpu = 0; TimeSpan a; if (cpu0.TryGetValue(p.Id, out a)) cpu = Math.Max(0, (p.TotalProcessorTime - a).TotalMilliseconds / dt * 100.0);
+          rows.Add(new double[] { p.Id, cpu, p.WorkingSet64 }); names[p.Id] = p.ProcessName;
+        } catch { }
+      }
+      foreach (var p in procs) { try { p.Dispose(); } catch { } }
+      var byCpu = new List<double[]>(rows); byCpu.Sort((x, y) => y[1].CompareTo(x[1]));
+      var byMem = new List<double[]>(rows); byMem.Sort((x, y) => y[2].CompareTo(x[2]));
+      var show = new HashSet<int>();   // resolve the exe path + publisher only for what we show: doing it for all ~400 is the slow part
+      if (all) foreach (var r in rows) show.Add((int)r[0]);
+      else { for (int i = 0; i < Math.Min(top, byCpu.Count); i++) show.Add((int)byCpu[i][0]); for (int i = 0; i < Math.Min(top, byMem.Count); i++) show.Add((int)byMem[i][0]); }
+      foreach (int pid in show) {
+        string path = PathOf(pid), company = "";
+        if (path.Length > 0) { try { var fv = System.Diagnostics.FileVersionInfo.GetVersionInfo(path); company = (fv.CompanyName ?? "").Trim(); } catch { } }
+        info[pid] = new[] { names.ContainsKey(pid) ? names[pid] : "", path, company, Looks(path, company) ? "!" : " " };
+      }
+      var sb = new System.Text.StringBuilder();
+      sb.Append("cpu% / mem / pid  name  [publisher]  path   (! = runs from a temp/download/unsigned location, look closer)\n");
+      var inv = System.Globalization.CultureInfo.InvariantCulture;
+      Action<List<double[]>, int> dump = (list, n) => {
+        foreach (var r in list.GetRange(0, Math.Min(n, list.Count))) {
+          int pid = (int)r[0]; var f = info[pid];
+          sb.AppendFormat(inv, "{0}{1,5:0.0}% {2,8} {3,-6} {4}  {5}{6}\n", f[3], r[1], Fs.Human((long)r[2]), pid, f[0], f[2].Length > 0 ? "[" + f[2] + "] " : "", f[1]);
+        }
+      };
+      if (all) dump(byCpu, byCpu.Count);
+      else { sb.Append("-- top by CPU --\n"); dump(byCpu, top); sb.Append("-- top by memory --\n"); dump(byMem, top); }
+      int flagged = 0; foreach (var kv in info) if (kv.Value[3] == "!") flagged++;
+      sb.AppendFormat("{0} processes running; of the {1} shown, {2} flagged with !  (use a bigger top, or the full list, to look wider)", rows.Count, show.Count, flagged);
+      return sb.ToString();
+    }
+  }
+
   // The live picture for the viewer, like a video call: its own thread films the screen ~15 times a second, compares it with the last frame in
   // 64x64 tiles and sends only the tiles that changed (a full picture when much changed, on request and every 10 s) over one long upload.
   // ponytail: JPEG tiles, not H.264; a portable ffmpeg (gdigrab + libx264 -tune zerolatency) could feed V frames the same way if more is needed
@@ -839,28 +916,32 @@ function Do-System($a) {
         try {
             switch ($s) {
                 'overview' {
-                    Sec 'overview'; $os = Get-CimInstance Win32_OperatingSystem; $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-                    $up = (Get-Date) - $os.LastBootUpTime
-                    Line "$($os.Caption) build $($os.BuildNumber), $env:COMPUTERNAME\$env:USERNAME, admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator'))"
-                    Line ("up {0}d {1}h {2}m; cpu {3} ({4} cores) load {5}%; ram {6:0.0} of {7:0.0} GB free" -f $up.Days, $up.Hours, $up.Minutes, $cpu.Name.Trim(), $cpu.NumberOfLogicalProcessors, $cpu.LoadPercentage, ($os.FreePhysicalMemory / 1MB), ($os.TotalVisibleMemorySize / 1MB))
+                    Sec 'overview'; $st = Static-Sys; $up = Uptime-TS
+                    Line "$($st.os), $env:COMPUTERNAME\$env:USERNAME, admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator'))"
+                    Line ("up {0}d {1}h {2}m; cpu {3} ({4} cores) busy {5}%; {6}" -f $up.Days, $up.Hours, $up.Minutes, $st.cpu, $st.cores, [F__BUILD__.Sys]::CpuLoad(150), [F__BUILD__.Sys]::Mem())
                 }
                 'disks' {
                     Sec 'disks'
-                    Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { Line ("{0} {1} free of {2} ({3:0}% free) {4} {5}" -f $_.DeviceID, [F__BUILD__.Fs]::Human($_.FreeSpace), [F__BUILD__.Fs]::Human($_.Size), (100.0 * $_.FreeSpace / [Math]::Max(1.0, [double]$_.Size)), $_.FileSystem, $_.VolumeName) }
+                    [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady } | ForEach-Object { Line ("{0} {1} free of {2} ({3:0}% free) {4} {5}" -f $_.Name.TrimEnd('\'), [F__BUILD__.Fs]::Human($_.AvailableFreeSpace), [F__BUILD__.Fs]::Human($_.TotalSize), (100.0 * $_.AvailableFreeSpace / [Math]::Max(1.0, [double]$_.TotalSize)), $_.DriveFormat, $_.VolumeLabel) }
                 }
                 'processes' {
-                    Sec "processes: top $top by CPU now (%), then by memory"
-                    $n = [Environment]::ProcessorCount
-                    Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.Name -ne '_Total' -and $_.Name -ne 'Idle' } | Sort-Object PercentProcessorTime -Descending | Select-Object -First $top |
-                        ForEach-Object { Line ("{0,5:0}%  {1,8}  pid {2,-6} {3}" -f ($_.PercentProcessorTime / $n), [F__BUILD__.Fs]::Human($_.WorkingSetPrivate), $_.IDProcess, $_.Name) }
-                    Line '--'
-                    Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First $top | ForEach-Object { Line ("{0,8}  pid {1,-6} {2}" -f [F__BUILD__.Fs]::Human($_.WorkingSet64), $_.Id, $_.ProcessName) }
+                    Sec "processes: real CPU % (sampled), memory, who signed it, where it runs from"
+                    Line ([F__BUILD__.Sys]::Procs($top, 200, $false))
                 }
                 'network' {
                     Sec 'network'
-                    Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True' | Sort-Object { -not $_.DefaultIPGateway } | ForEach-Object { Line ("{0}: ip {1}; gw {2}; dns {3}; dhcp={4}" -f $_.Description, (@($_.IPAddress) -join ', '), (@($_.DefaultIPGateway) -join ', '), (@($_.DNSServerSearchOrder) -join ', '), $_.DHCPEnabled) }
+                    [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' } | ForEach-Object {
+                        $ipp = $_.GetIPProperties(); $v4 = @($ipp.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.Address.ToString() })
+                        if ($v4.Count) { Line ("{0}: ip {1}; gw {2}; dns {3}" -f $_.Name, ($v4 -join ', '), (@($ipp.GatewayAddresses | ForEach-Object { $_.Address.ToString() }) -join ', '), (@($ipp.DnsAddresses | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.ToString() }) -join ', ')) }
+                    }
                     $px = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
                     if ($px.ProxyEnable) { Line "proxy: $($px.ProxyServer)" }
+                }
+                'drivers' {
+                    Sec 'third-party / unsigned kernel drivers (running); Microsoft ones are hidden'
+                    $rows = @(driverquery /v /fo csv 2>$null | ConvertFrom-Csv | Where-Object { $_.'Start Mode' -ne 'Disabled' -and $_.State -eq 'Running' -and $_.'Display Name' -notmatch '^(Microsoft|Windows)' })
+                    foreach ($d in ($rows | Select-Object -First 50)) { Line ("{0,-28} {1}" -f $d.'Module Name', $d.'Display Name') }
+                    Line "$($rows.Count) third-party running"
                 }
                 'services' {
                     Sec 'auto-start services that are not running'
@@ -994,14 +1075,26 @@ function Do-ListDir($a) {
     }
     @{ text = ($rows -join "`n") }
 }
+# static facts never change during a session: read them once from the registry (instant), not WMI (~1 s)
+function Static-Sys {
+    if ($script:StaticSys) { return $script:StaticSys }
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $name = $cv.ProductName; if ($cv.DisplayVersion) { $name += ' ' + $cv.DisplayVersion }
+    $build = "$($cv.CurrentBuild).$($cv.UBR)"; if ([int]($cv.CurrentBuild) -ge 22000 -and $name -match 'Windows 10') { $name = $name -replace 'Windows 10', 'Windows 11' }   # the key still says 10 on 11
+    $cpu = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0' -ErrorAction SilentlyContinue).ProcessorNameString
+    $script:StaticSys = @{ os = "$name build $build"; cpu = ($cpu -replace '\s+', ' ').Trim(); cores = [Environment]::ProcessorCount }
+    $script:StaticSys
+}
+function Uptime-TS { [TimeSpan]::FromMilliseconds([Environment]::TickCount64) }
 function Do-SysInfo($a) {
-    $os = Get-CimInstance Win32_OperatingSystem
+    $st = Static-Sys
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator')
     @{ text = (@{
-        os = "$($os.Caption) build $($os.BuildNumber)"; host = $env:COMPUTERNAME; user = $env:USERNAME; admin = $admin
-        powershell = $PSVersionTable.PSVersion.ToString(); cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
-        ram_gb = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 1); free_ram_gb = [Math]::Round($os.FreePhysicalMemory / 1MB, 1)
-        monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) }); boot = $os.LastBootUpTime.ToString('s'); lang = (Get-Culture).Name; node = (& { try { (& node -v 2>$null) } catch { $null } }); uv = (& { try { (& uv --version 2>$null) } catch { $null } })
+        os = $st.os; host = $env:COMPUTERNAME; user = $env:USERNAME; admin = $admin
+        powershell = $PSVersionTable.PSVersion.ToString(); cpu = $st.cpu; cores = $st.cores
+        memory = [F__BUILD__.Sys]::Mem()
+        monitors = @([Windows.Forms.Screen]::AllScreens | ForEach-Object -Begin { $i = 0 } -Process { "{0}: {1}x{2} at {3},{4}{5}" -f $i++, $_.Bounds.Width, $_.Bounds.Height, $_.Bounds.X, $_.Bounds.Y, $(if ($_.Primary) { " (primary)" } else { "" }) })
+        uptime = (Uptime-TS).ToString('d\.hh\:mm'); lang = (Get-Culture).Name; node = (& { try { (& node -v 2>$null) } catch { $null } }); uv = (& { try { (& uv --version 2>$null) } catch { $null } })
         started = @($script:Started | ForEach-Object { '{0} running={1}' -f $_.Id, (-not $_.HasExited) })
     } | ConvertTo-Json) }
 }

@@ -398,7 +398,7 @@ const tools = [
   { name: 'find', agent: true, ms: (a) => 60_000, description: 'Find files by name (glob) and/or by content (regex, case-insensitive): answers path (and size) or path:line: text. Skips .git / node_modules, binary files and files over 5 MB when searching content.',
     props: { path: str('Folder to search'), name: str('file name glob, e.g. *.json or config*'), text: str('regex to search inside files'), max: { type: 'integer', minimum: 1, maximum: 1000, description: 'results, default 100' }, depth: { type: 'integer', minimum: 1, maximum: 50 } }, required: ['path'] },
   { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (adapters, IP, gateway, DNS), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
-    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'events'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
+    props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events'] } }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
   { name: 'util', agent: true, ms: (a) => (/install|download|zip/.test(a.op) ? 1_900_000 : 120_000),
     description: 'Ready-made, tested operations: right on the first try, no quoting. op: apps (search installed programs: name), install / uninstall (winget / apt id or name), kill (name or pid, whole process tree), service (name, value=start|stop|restart|status), env_get (name; empty = all), env_set (name, value; user scope), path_add (path; user PATH, no setx truncation), reg_get / reg_set (path = HKCU\\..., name, value), open (url or path with the default app), clipboard_get / clipboard_set (value), dns_flush, net_test (host, port: DNS + TCP check), ports (name = port number: who listens), download (url -> path, resumes), zip (path -> dest), unzip (path -> dest), shortcut (path = target, dest = .lnk file).',
     props: { op: { type: 'string', enum: ['apps', 'install', 'uninstall', 'kill', 'service', 'env_get', 'env_set', 'path_add', 'reg_get', 'reg_set', 'open', 'clipboard_get', 'clipboard_set', 'dns_flush', 'net_test', 'ports', 'download', 'zip', 'unzip', 'shortcut'] },
@@ -516,7 +516,8 @@ Workflow for any task:
 14. Save tokens and time: do not take a screenshot after every step. Every click, typing and key press reports what changed on the screen; trust it. Take a screenshot when you need to see something new; use region to read small things; an unchanged screen costs one line. Use watch when something happens over time.
 15. Stop at the first sign of trouble: if an action reports NO CHANGE (typing that did not appear, a click on nothing), do not continue the plan; look (screenshot or watch), find out why, fix it, then continue.
 16. Before typing or pressing keys, make sure the right window has the focus: focus_window is safer than clicking on the window.
-17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), system (processes, disks, network, services, startup, apps, errors in one call), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
+17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
+17a. Slow PC / what eats CPU, RAM or disk / anything malicious: ONE call to system {sections:["processes"]} lists every process with its real CPU %, memory, the exe path and who signed it, and marks with ! anything run from a temp or download folder or unsigned outside the normal install dirs. system {} also gives disks, network and startup; add "drivers" and "services". Kill a bad one with util {op:"kill"} and delete its file. sysinfo and system cost tens of ms now: prefer them to a handful of run commands.
 18. No quoting traps: to start a program with arguments use run {command: "program", args: [...]} (no shell, each argument arrives exactly as given). For a longer script use write_file, then run the file. A failed command may come back with a HINT line: follow it instead of retrying the same thing.`;
 
 function buildMcp(fixed) {
@@ -670,7 +671,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 #frame:before{left:-8px;top:-8px;border-right:0;border-bottom:0}#frame:after{right:-8px;bottom:-8px;border-left:0;border-top:0}
 #frame i:before{right:-8px;top:-8px;border-left:0;border-bottom:0}#frame i:after{left:-8px;bottom:-8px;border-right:0;border-top:0}
 #cv{max-width:100%;max-height:calc(100vh - 44px - var(--kb) - 28px);background:#000;box-shadow:0 0 0 1px var(--line),0 0 40px rgba(0,0,0,.6);display:block}
-#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px var(--warn),0 0 30px rgba(255,209,102,.18)}
+#cv{transition:none}#cv.pan{cursor:grab}#zr{padding:.3rem .55rem}#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px var(--warn),0 0 30px rgba(255,209,102,.18)}
 #tag{position:absolute;left:14px;top:12px;color:var(--warn);background:rgba(2,10,6,.85);border:1px solid var(--warn);border-radius:4px;padding:.1rem .5rem;display:none}
 #side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
 #side h2{margin:0;padding:.65rem .9rem .35rem;font-size:12px;font-weight:600;color:var(--mut)}
@@ -696,7 +697,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 </style>
 <div id=top><span id=dot></span><span id=st>…</span><span id=who>${esc(who)}</span>
 <select id=mon title=screen><option value="">all screens</option><option>0</option><option>1</option><option>2</option><option>3</option></select>
-<button id=ctl hidden></button></div>
+<button id=zr title="1:1" style="display:none">1:1</button><button id=ctl hidden></button></div>
 <div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
 <aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
 <section id=files hidden><h2 id=hFiles style="padding-left:0"></h2><div id=fbar><button id=fup title=up>..</button><input id=fp spellcheck=false><button id=fgo>&#8635;</button></div><div id=fl></div><div id=fmsg></div></section>
@@ -790,6 +791,16 @@ if(CTL){const F=ru?{t:'Файлы',drop:'Перетащите файлы на с
  ls('~')}
 async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
 function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
+// zoom into the picture (wheel to zoom toward the cursor, drag to pan when zoomed; the control coordinates stay correct because real() reads the live box)
+let zoom=1,tx=0,ty=0;
+function applyZoom(){cv.style.transformOrigin='0 0';cv.style.transform=zoom===1?'':'translate('+tx+'px,'+ty+'px) scale('+zoom+')';$('zr').style.display=zoom>1.01?'inline-flex':'none'}
+cv.addEventListener('wheel',e=>{if(control&&!(e.ctrlKey||e.metaKey))return;e.preventDefault();const r=cv.getBoundingClientRect();const nz=Math.min(8,Math.max(1,zoom*(e.deltaY<0?1.2:1/1.2)));const lx=(e.clientX-r.left)/zoom,ly=(e.clientY-r.top)/zoom;tx=e.clientX-nz*lx-(r.left-tx);ty=e.clientY-nz*ly-(r.top-ty);zoom=nz;if(zoom===1){tx=0;ty=0}applyZoom()},{passive:false});
+cv.addEventListener('dblclick',()=>{zoom=1;tx=0;ty=0;applyZoom()});
+let pan=null;
+cv.addEventListener('pointerdown',e=>{if(control||zoom<=1)return;pan={x:e.clientX,y:e.clientY,tx,ty};try{cv.setPointerCapture(e.pointerId)}catch(_){}} );
+cv.addEventListener('pointermove',e=>{if(!pan)return;tx=pan.tx+(e.clientX-pan.x);ty=pan.ty+(e.clientY-pan.y);applyZoom()});
+addEventListener('pointerup',()=>{pan=null});
+$('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
 if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
  const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?(kb.offsetHeight||52)+'px':'0px');$('tag').style.display=on?'block':'none';$('tag').textContent=L.tag;send('/takeover',{on});if(on)txt.focus()};
  b.onclick=()=>set(!control);
@@ -799,7 +810,7 @@ if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textConte
   if(moved>8)send('/input',{a:'drag',x:d.p.x,y:d.p.y,x2:u.x,y2:u.y,hold:Date.now()-d.t>500});
   else send('/input',{a:'click',x:u.x,y:u.y,button:d.b===2?'right':'left'})});
  cv.addEventListener('contextmenu',e=>{if(control)e.preventDefault()});
- let acc=0,wt=0;cv.addEventListener('wheel',e=>{if(!control)return;e.preventDefault();acc+=Math.sign(e.deltaY)*Math.max(1,Math.round(Math.abs(e.deltaY)/100));clearTimeout(wt);wt=setTimeout(()=>{const p=real(e);send('/input',{a:'scroll',x:p.x,y:p.y,amount:Math.max(-20,Math.min(20,acc))});acc=0},120)},{passive:false});
+ let acc=0,wt=0;cv.addEventListener('wheel',e=>{if(!control||e.ctrlKey||e.metaKey)return;e.preventDefault();acc+=Math.sign(e.deltaY)*Math.max(1,Math.round(Math.abs(e.deltaY)/100));clearTimeout(wt);wt=setTimeout(()=>{const p=real(e);send('/input',{a:'scroll',x:p.x,y:p.y,amount:Math.max(-20,Math.min(20,acc))});acc=0},120)},{passive:false});
  $('send').onclick=()=>{if(txt.value){send('/input',{a:'text',text:txt.value});txt.value=''}};
  txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();if(txt.value)send('/input',{a:'text',text:txt.value});setTimeout(()=>send('/input',{a:'key',keys:'enter'}),350);txt.value=''}});
  kb.querySelectorAll('[data-k]').forEach(x=>x.onclick=()=>send('/input',{a:'key',keys:x.dataset.k}));

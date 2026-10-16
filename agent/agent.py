@@ -1010,6 +1010,7 @@ def system(a):
         elif s == "services": add("failed services", "systemctl --failed --no-legend 2>/dev/null | head -30")
         elif s == "startup": add("startup", "ls ~/.config/autostart /etc/xdg/autostart 2>/dev/null")
         elif s == "apps": add("apps", "(dpkg-query -W -f='${Package}\\n' 2>/dev/null || rpm -qa) | wc -l; flatpak list --app --columns=application 2>/dev/null | head -40")
+        elif s == "drivers": add("loaded kernel modules (lsmod), biggest first", "lsmod | sort -k2 -n -r | head -40")
         elif s == "events": add("recent errors", "journalctl -p err -n 20 --no-pager -q 2>/dev/null")
         else: out.append(f"== {s}: unknown section")
     return {"text": "\n".join(out)}

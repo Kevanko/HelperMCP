@@ -437,6 +437,14 @@ if (process.env.GUI) {
   const shot = await tool('screenshot', { session: code });
   assert.ok(shot.content.some((c) => c.type === 'image' && c.data.length > 200)); console.log('screenshot ok');
   // live stream (like a video call): a full picture first, then only the tiles that changed while the pointer moves
+  // a busy desktop (video, animations) changes most tiles and the agent rightly sends full pictures: cover the monitors with a black window so only the pointer moves
+  let cover; if (useps) {
+    const cf = path.join(tmp, 'cover.ps1');
+    fs.writeFileSync(cf, '﻿' + ['Add-Type -AssemblyName System.Windows.Forms, System.Drawing',
+      '$fs = foreach ($s in [Windows.Forms.Screen]::AllScreens) { $f = New-Object Windows.Forms.Form; $f.FormBorderStyle = "None"; $f.StartPosition = "Manual"; $f.Bounds = $s.Bounds; $f.BackColor = [Drawing.Color]::Black; $f.TopMost = $true; $f.ShowInTaskbar = $false; $f.Show(); $f }',
+      '$end = [DateTime]::UtcNow.AddSeconds(40); while ([DateTime]::UtcNow -lt $end) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }'].join('\n'));
+    cover = spawn('powershell', ['-NoProfile', '-STA', '-File', cf]); kids.push(cover); await new Promise((x) => setTimeout(x, 2500));
+  }
   const ac = new AbortController(), lr = await fetch(vurl + '/live', { signal: ac.signal });
   assert.equal(lr.status, 200);
   const rd = lr.body.getReader(), seen = [], t0 = Date.now(); let lbuf = Buffer.alloc(0);
@@ -446,7 +454,7 @@ if (process.env.GUI) {
     lbuf = Buffer.concat([lbuf, Buffer.from(value)]);
     while (lbuf.length >= 5) { const n = lbuf.readUInt32BE(0); if (lbuf.length < 5 + n) break; seen.push({ ty: String.fromCharCode(lbuf[4]), n, t: Date.now() - t0 }); if (lbuf[4] === 83 && !globalThis.__snap) globalThis.__snap = JSON.parse(lbuf.subarray(5, 5 + n).toString('utf8')); lbuf = lbuf.subarray(5 + n); }
   }
-  ac.abort(); await mover;
+  ac.abort(); await mover; cover?.kill();
   const firstK = seen.find((f) => f.ty === 'K')?.t, tiles = seen.filter((f) => f.ty === 'T');
   assert.ok(firstK !== undefined && firstK < 3000, 'a full picture arrives within 3 s: ' + JSON.stringify(seen.slice(0, 5)));
   assert.ok(tiles.length >= 3, 'changed tiles stream while the pointer moves: ' + JSON.stringify(seen.slice(0, 20)));

@@ -39,6 +39,7 @@ class HelperService : AccessibilityService() {
         @Volatile var running = false
         @Volatile var note = ""
         @Volatile var paused = false
+        @Volatile var unattended = false   // set from the admin panel only (never offered to the AI or on the phone): the phone cannot end the session, it can only pause it
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -72,15 +73,15 @@ class HelperService : AccessibilityService() {
     fun startSession(relay: String, ask: Boolean) {
         if (running) return
         paused = false; note = ""; Cast.denied = false; Cast.info = ""; registerScreenReceiver()
-        running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; phase = "connecting"
-        fx.onEnd = { endSession() }
+        running = true; ended = false; allowed.clear(); opSeen = false; askMode = ask; unattended = false; phase = "connecting"
+        fx.onEnd = { if (unattended) setPaused(!paused) else endSession() }
         Thread { try { loop(relay) } finally { main.post { try { val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager; if (cm.primaryClip?.getItemAt(0)?.text?.toString() == code) cm.clearPrimaryClip() } catch (_: Throwable) { } }; running = false; code = null; phase = "ready"; fx.hide(); wake?.let { if (it.isHeld) it.release() } } }.start()
     }
 
     fun refreshFx() { fx.rebuild() }
     fun usageGranted() = if (::phone.isInitialized) phone.usageOk() else true
 
-    fun endSession() { ended = true; paused = false; unregisterScreenReceiver(); if (::fx.isInitialized) fx.hide(); if (::cast.isInitialized) cast.release() }
+    fun endSession() { ended = true; paused = false; unattended = false; unregisterScreenReceiver(); if (::fx.isInitialized) fx.hide(); if (::cast.isInitialized) cast.release() }
     /** one picture for the live viewer when there is no video (the overlay stays in it, like the friend sees the screen) */
     fun liveShot(): Shot = screenshot(JSONObject().put("view", true).put("max_width", 900).put("quality", 55))
 
@@ -124,7 +125,7 @@ class HelperService : AccessibilityService() {
 
     private fun register(relay: String, resume: String?): JSONObject {
         val body = JSONObject().put("os", "Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})").put("host", "${Build.MANUFACTURER} ${Build.MODEL}")
-            .put("user", "android").put("mode", if (askMode) "confirm" else "auto").put("persist", true)   // a network loss must not end the session: the relay keeps it and the helper is told to wait_online, not to stop; no "unattended" mode here: Android always needs a fresh MediaProjection consent tap
+            .put("user", "android").put("mode", if (unattended) "unattended" else if (askMode) "confirm" else "auto").put("persist", true)   // a network loss must not end the session: the relay keeps it and the helper is told to wait_online, not to stop; no "unattended" mode here: Android always needs a fresh MediaProjection consent tap
         if (resume != null) body.put("resume", resume)
         val (st, data) = Net.req(relay, "POST", "/a/register", null, body.toString().toByteArray(), timeoutMs = 20000)
         if (st != 200) throw RuntimeException("register: HTTP $st")
@@ -195,10 +196,10 @@ class HelperService : AccessibilityService() {
         if (tool == "bye") { ended = true; return }
         if (!args.optBoolean("view") && tool != "task_done" && tool != "hold" && tool != "look" && tool != "stream") { lastOpAt = SystemClock.uptimeMillis(); if (!opSeen && !paused) { opSeen = true; phase = "ok"; fx.resetClock(); fx.setState("ok") } }
         var data: Any? = null; var error: String? = null
-        val quiet = tool == "screenshot" || tool == "ui_tree" || tool == "sysinfo" || tool == "stream" || tool == "system" || tool == "task_done" || tool == "hold" || tool == "look"
+        val quiet = tool == "screenshot" || tool == "ui_tree" || tool == "sysinfo" || tool == "stream" || tool == "set_mode" || tool == "system" || tool == "task_done" || tool == "hold" || tool == "look"
         if (!quiet) fx.setBusy(true)
         try {
-            if (paused && tool != "screenshot" && tool != "sysinfo" && tool != "stream") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
+            if (paused && tool != "screenshot" && tool != "sysinfo" && tool != "stream" && tool != "set_mode") throw RuntimeException("PAUSED by the user (screen off or the pause button). The session is kept. Do not retry now: use wait_online, then continue.")
             if (askMode && tool in GUI || tool == "start_process" && askMode) askPermission(tool, args)
             if (askMode && (tool in FILES && !(tool == "fsop" && args.optString("op") in setOf("preview", "stat")) || tool == "util" && args.optString("op") in UTIL_ASK)) askFiles(tool, args)
             val t0 = SystemClock.uptimeMillis()
@@ -317,6 +318,7 @@ class HelperService : AccessibilityService() {
         "start_process" -> { launch(a.optString("command", a.optString("name", ""))); ok() }
         "actions" -> actions(a)
         "stream" -> ok(cast.control(a))
+        "set_mode" -> { when (a.optString("mode")) { "confirm" -> { askMode = true; unattended = false }; "auto" -> { askMode = false; unattended = false }; "unattended" -> { askMode = false; unattended = true }; else -> throw RuntimeException("unknown mode") }; allowed.clear(); ok(a.optString("mode")) }   // admin panel only
         "ui_tree" -> uiTree(a)
         "ui_click" -> uiClick(a)
         "ui_set" -> uiSet(a)

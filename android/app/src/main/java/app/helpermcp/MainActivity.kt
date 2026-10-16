@@ -89,7 +89,7 @@ class MainActivity : Activity() {
 
     private fun toggle() {
         val s = HelperService.inst
-        if (HelperService.running) { s?.endSession(); return }
+        if (HelperService.running) { if (HelperService.unattended) s?.setPaused(!HelperService.paused) else s?.endSession(); return }
         if (s == null) { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)); return }
         prefs.edit().putString("relay", relay.text.toString().trim()).putBoolean("ask", askSwitch.isChecked).apply()
         s.startSession(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY }, askSwitch.isChecked)
@@ -125,7 +125,7 @@ class MainActivity : Activity() {
         filesBtn.visibility = if (android.os.Environment.isExternalStorageManager()) View.GONE else View.VISIBLE
         usageBtn.visibility = if (HelperService.inst?.usageGranted() != false) View.GONE else View.VISIBLE
         pauseBtn.text = if (HelperService.paused) t("Продолжить", "Continue") else t("Пауза", "Pause")
-        start.text = if (HelperService.running) t("Завершить помощь", "End help") else t("2. Начать помощь", "2. Start help")
+        start.text = if (HelperService.running && HelperService.unattended) (if (HelperService.paused) t("Продолжить (завершить может только админ)", "Continue (only the admin can end this)") else t("Пауза (завершить может только админ)", "Pause (only the admin can end this)")) else if (HelperService.running) t("Завершить помощь", "End help") else t("2. Начать помощь", "2. Start help")
         if (System.currentTimeMillis() % 20000 < 600) Update.check(relay.text.toString().trim().ifEmpty { BuildConfig.RELAY })
         versionLine.text = "v" + BuildConfig.VERSION_NAME + (if (up != null) "  →  " + up.optString("versionName") else if (Update.checked == "ok") t("  (последняя версия)", "  (up to date)") else if (Update.checked.isNotEmpty()) "  (" + Update.checked + ")" else "")
         Crash.last(this)?.let { versionLine.text = versionLine.text.toString() + "\n\n" + t("Последний сбой:", "Last crash:") + "\n" + it }

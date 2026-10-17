@@ -118,6 +118,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     }
     if (api === 'end') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      await Promise.race([d.call(code, 'bye', {}, 4000, { human: true }).catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);   // tell the helper to stop for good first: dropping the session alone left it re-registering
       d.drop(code, 'The session was ended by the administrator. STOP: do not retry, tell the operator.'); d.audit('admin_end', { code }); send(res, 200, {}); return true;
     }
     if (api === 'password') {

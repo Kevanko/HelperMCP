@@ -57,6 +57,7 @@ function save() {
         sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
         devices: [...devices].map(([dh, code]) => ({ dh, code })),
+        ended: [...ended].filter(([, t]) => Date.now() - t < 3600_000).map(([code, t]) => ({ code, t })),   // an ended session stays ended across a relay restart: its agent must not slip back in
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
       fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
@@ -1246,6 +1247,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
+    for (const x of st.ended || []) ended.set(x.code, x.t);
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }
 }

@@ -2066,7 +2066,7 @@ function Do-FsOp($a) {
 }
 
 # ---- ready-made operations: right on the first try, no quoting
-$ReadOnlyUtil = 'apps', 'threats', 'browser', 'bsod', 'health', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
+$ReadOnlyUtil = 'apps', 'appinfo', 'threats', 'browser', 'bsod', 'health', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
 function Installed-Apps($q) {   # "name|version|publisher" from the uninstall keys (fast, no WMI Win32_Product)
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and (-not $q -or $_.DisplayName -like "*$q*" -or $_.PSChildName -like "*$q*") } |
@@ -2323,6 +2323,66 @@ function Threats-Report($days) {   # read-only, facts only: what the antivirus f
     $flags = @($out | Where-Object { $_ -like '! *' }).Count; $out = @("== verdict: $flags item(s) marked ! to look at (only facts the system itself reports, nothing is guessed from a file name; a detection on a command line can also be a false alarm)") + $out
     $out -join "`n"
 }
+function Resolve-App($q) {   # every way Windows knows a program by this name: running processes, Start menu shortcuts, App Paths, Store apps (AUMID), the PATH
+    $r = [ordered]@{ run = @(); lnk = @(); reg = @(); store = @(); path = $null }
+    $pid_ = $q -match '^\d+$'
+    $cim = @{}; foreach ($pc in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue) { $cim[[int]$pc.ProcessId] = $pc }
+    foreach ($p in Get-Process -ErrorAction SilentlyContinue) {
+        $hit = if ($pid_) { $p.Id -eq [int]$q } else { $p.ProcessName -like "*$q*" -or ($p.MainWindowTitle -and $p.MainWindowTitle -like "*$q*") }
+        if (-not $hit) { continue }
+        $path = ''; try { $path = $p.Path } catch { }; $co = ''; $ver = ''; if ($path) { try { $fv = [Diagnostics.FileVersionInfo]::GetVersionInfo($path); $co = $fv.CompanyName; $ver = $fv.FileVersion } catch { } }
+        $r.run += [pscustomobject]@{ pid = $p.Id; name = $p.ProcessName; path = $path; cmd = [string]$cim[$p.Id].CommandLine; title = $p.MainWindowTitle; company = $co; version = $ver; started = $(try { $p.StartTime.ToString('MM-dd HH:mm') } catch { '' }); mb = [int]($p.WorkingSet64 / 1MB) }
+    }
+    if ($pid_) { return $r }
+    $sh = New-Object -ComObject WScript.Shell
+    foreach ($d in "$env:ProgramData\Microsoft\Windows\Start Menu\Programs", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs", "$env:USERPROFILE\Desktop", "$env:PUBLIC\Desktop") {
+        $deep = $d -like '*Start Menu*'   # the Desktop is not searched deeply: it can hold whole project trees
+        foreach ($f in @(if ($deep) { Get-ChildItem $d -Recurse -Filter *.lnk -ErrorAction SilentlyContinue } else { Get-ChildItem $d -Filter *.lnk -ErrorAction SilentlyContinue }) | Where-Object { $_.BaseName -like "*$q*" } | Select-Object -First 8) { try { $l = $sh.CreateShortcut($f.FullName); $r.lnk += [pscustomobject]@{ name = $f.BaseName; target = $l.TargetPath; args = $l.Arguments; dir = $l.WorkingDirectory; file = $f.FullName } } catch { } }
+    }
+    foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths') {
+        foreach ($i in Get-ChildItem $k -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "*$q*" } | Select-Object -First 5) { $v = (Get-ItemProperty $i.PSPath -ErrorAction SilentlyContinue).'(default)'; if ($v) { $r.reg += [pscustomobject]@{ name = $i.PSChildName; path = ([string]$v).Trim('"') } } }
+    }
+    foreach ($u in Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and $_.DisplayName -like "*$q*" } | Select-Object -First 4) { $ic = ([string]$u.DisplayIcon -replace ',\s*-?\d+$', '').Trim('"'); if ($ic -match '\.exe$' -and (Test-Path $ic)) { $r.reg += [pscustomobject]@{ name = $u.DisplayName; path = $ic } } elseif ($u.InstallLocation) { $r.reg += [pscustomobject]@{ name = $u.DisplayName; path = [string]$u.InstallLocation + '  (folder)' } } }
+    try { foreach ($sa in Get-StartApps -ErrorAction Stop | Where-Object { $_.Name -like "*$q*" } | Select-Object -First 6) { $r.store += [pscustomobject]@{ name = $sa.Name; aumid = $sa.AppID } } } catch { }
+    $cm = Get-Command $q -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($cm) { $r.path = $cm.Source }
+    $r
+}
+function App-Info($q) {
+    if (-not $q) { throw 'name = program name, part of a window title, or a process id' }
+    $r = Resolve-App $q; $out = @()
+    if ($r.run.Count) { $out += '== running'; foreach ($x in $r.run | Select-Object -First 8) { $out += "pid $($x.pid) $($x.name) since $($x.started), $($x.mb) MB"; if ($x.path) { $out += "  exe: $($x.path)" + $(if ($x.company -or $x.version) { "  [$($x.company) $($x.version)]" } else { '' }) }; if ($x.cmd) { $out += "  command line: $(Cut $x.cmd 400)" }; if ($x.title) { $out += "  window: $(Cut $x.title 80)" } } }
+    if ($r.lnk.Count) { $out += '== shortcuts (Start menu / desktop)'; foreach ($x in $r.lnk) { $out += "$($x.name) -> $($x.target) $($x.args)".Trim() + "  [$($x.file)]" } }
+    if ($r.reg.Count) { $out += '== registered programs (App Paths / install info)'; foreach ($x in $r.reg) { $out += "$($x.name): $($x.path)" } }
+    if ($r.store.Count) { $out += '== Start menu apps (launch a Store app with: util launch, name; or shell:AppsFolder\<id>)'; foreach ($x in $r.store) { $out += "$($x.name): $($x.aumid)" } }
+    if ($r.path) { $out += "== on the PATH: $($r.path)" }
+    if (-not $out.Count) { return "nothing known as '$q' (not running, no shortcut, not registered, not on the PATH): try util ffind" }
+    $out -join "`n"
+}
+function App-Launch($q, [string[]]$argv, $p) {   # start a program by its name with arguments: a path, a Start menu shortcut, App Paths, a Store app, the PATH (in that order)
+    $exe = $null; $pre = @(); $aumid = $null
+    if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { $exe = $p }
+    elseif ($q -and (Test-Path -LiteralPath $q -PathType Leaf)) { $exe = $q }
+    elseif ($q -match '^shell:AppsFolder\\') { $aumid = $q -replace '^shell:AppsFolder\\', '' }
+    else {
+        $r = Resolve-App $q
+        $ex = @($r.lnk | Where-Object { $_.name -ieq $q }); if (-not $ex.Count) { $ex = @($r.lnk) }
+        $ok = @($ex | Where-Object { $_.target -match '\.exe$' -and (Test-Path $_.target) })
+        if ($ok.Count) { $exe = $ok[0].target; if ($ok[0].args) { $pre = @($ok[0].args) } }
+        elseif ($r.reg.Count -and ($r.reg | Where-Object { $_.path -match '\.exe$' -and (Test-Path $_.path) })) { $exe = @($r.reg | Where-Object { $_.path -match '\.exe$' -and (Test-Path $_.path) })[0].path }
+        elseif ($r.store.Count) { $sx = @($r.store | Where-Object { $_.name -ieq $q }); if (-not $sx.Count) { $sx = @($r.store) }; $aumid = $sx[0].aumid }
+        elseif ($r.path) { $exe = $r.path }
+        elseif ($ex.Count) { Start-Process -FilePath $ex[0].file; return "opened the shortcut $($ex[0].file)" }
+    }
+    if ($aumid) {
+        if ($argv.Count) { throw "'$q' is a Store app: it cannot take command-line arguments from here" }
+        Start-Process explorer.exe "shell:AppsFolder\$aumid"; return "started the Store app $aumid"
+    }
+    if (-not $exe) { throw "no program found for '$q' (util appinfo shows what Windows knows by that name)" }
+    $all = @($pre) + @($argv); $before = @(Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    $sp = @{ FilePath = $exe; WorkingDirectory = (Split-Path $exe); PassThru = $true }; if ($all.Count) { $sp.ArgumentList = $all }
+    $pr = Start-Process @sp; Start-Sleep -Milliseconds 700
+    "started $exe$(if ($all.Count) { ' ' + ($all -join ' ') }) (pid $($pr.Id)$(if ($pr.HasExited) { ', already exited with code ' + $pr.ExitCode + ': it may have handed over to a running copy' }))"
+}
 function Do-Util($a) {
     $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
     switch ($op) {
@@ -2348,6 +2408,8 @@ function Do-Util($a) {
         'bsod' { return @{ text = (Bsod-Report $(if ($val -match '^\d+$') { [int]$val } else { 60 })) } }
         'health' { return @{ text = (Health-Report $name) } }
         'threats' { return @{ text = (Threats-Report $(if ($val -match '^\d+$') { [int]$val } else { 14 })) } }
+        'appinfo' { return @{ text = (App-Info $(if ($name) { $name } else { $val })) } }
+        'launch' { return @{ text = (App-Launch $name ([string[]]@($a.args)) $p) } }
         'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
         { $_ -in 'install', 'uninstall' } {
             if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }

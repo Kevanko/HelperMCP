@@ -188,7 +188,10 @@ if (useps) {   // registry search, crash report, run history (Windows only)
   await tool('run', { session: code, command: 'reg', args: ['delete', 'HKCU\\Software\\HmFindTest', '/f'] });
   assert.match(txt(await tool('util', { session: code, op: 'crash', name: 'no-such-program-zz', value: '1' })), /no crash events/);
   assert.match(txt(await tool('util', { session: code, op: 'recent', value: '3' })), /ran|opened file|nothing found/);
-  console.log('reg_find / crash / recent ok');
+  const uniq = 'hmffind_' + Date.now() + '.zzz'; fs.writeFileSync(path.join(tmp, uniq), 'x');
+  const ff = txt(await tool('util', { session: code, op: 'ffind', name: uniq, value: 'new' }));
+  assert.ok(ff.includes(path.join(tmp, uniq)) || /needs administrator/.test(ff), 'ffind finds the new file on any disk, or says it needs administrator: ' + ff);
+  console.log('reg_find / crash / recent / ffind ok' + (/needs administrator/.test(ff) ? ' (not administrator: ffind refused)' : ''));
 }
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
 const zp = path.join(tmp, 'tree-copy.zip');

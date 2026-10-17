@@ -621,6 +621,83 @@ namespace F__BUILD__ {
     }
   }
 
+  // Instant file search on every NTFS disk: the volume's own file table (FSCTL_ENUM_USN_DATA) is read in one go, names are matched in memory.
+  // Needs administrator rights (raw volume handle). ponytail: no live USN follow-up, the table is re-read when it is older than 2 minutes (seconds even for a million files)
+  public static class Mft {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFile(string n, uint acc, uint share, IntPtr sa, uint disp, uint fl, IntPtr t);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inb, int inLen, byte[] outb, int outLen, out int ret, IntPtr ov);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    class Vol { public Dictionary<ulong, ulong> Par = new Dictionary<ulong, ulong>(); public Dictionary<ulong, string> Name = new Dictionary<ulong, string>(); public DateTime At = DateTime.UtcNow; public double Secs; }
+    static readonly Dictionary<string, Vol> cache = new Dictionary<string, Vol>();
+    const ulong M = 0xFFFFFFFFFFFFUL;
+    static Vol Load(string drive) {
+      Vol v; lock (cache) { if (cache.TryGetValue(drive, out v) && (DateTime.UtcNow - v.At).TotalSeconds < 120) return v; }
+      var sw = Stopwatch.StartNew();
+      IntPtr h = CreateFile("\\\\.\\" + drive.Substring(0, 2), 0x80000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+      if (h == new IntPtr(-1)) throw new Exception("cannot open the volume (error " + Marshal.GetLastWin32Error() + "): administrator rights are needed");
+      v = new Vol();
+      try {
+        var inb = new byte[24]; BitConverter.GetBytes(long.MaxValue).CopyTo(inb, 16);
+        var buf = new byte[1 << 20]; int ret;
+        while (DeviceIoControl(h, 0x000900b3, inb, 24, buf, buf.Length, out ret, IntPtr.Zero)) {
+          if (ret <= 8) break;
+          int o = 8;
+          while (o < ret) {
+            int len = BitConverter.ToInt32(buf, o); if (len <= 0) break;
+            if (BitConverter.ToUInt16(buf, o + 4) == 2) {
+              ulong frn = BitConverter.ToUInt64(buf, o + 8) & M, par = BitConverter.ToUInt64(buf, o + 16) & M;
+              int nl = BitConverter.ToUInt16(buf, o + 56), no = BitConverter.ToUInt16(buf, o + 58);
+              v.Par[frn] = par; v.Name[frn] = Encoding.Unicode.GetString(buf, o + no, nl);
+            }
+            o += len;
+          }
+          Array.Copy(buf, 0, inb, 0, 8);
+        }
+      } finally { CloseHandle(h); }
+      v.Secs = sw.Elapsed.TotalSeconds;
+      lock (cache) { cache[drive] = v; }
+      return v;
+    }
+    static string PathOf(Vol v, ulong f, string root, Dictionary<ulong, string> memo, int depth) {
+      if (f == 5 || depth > 200) return root;
+      string p; if (memo.TryGetValue(f, out p)) return p;
+      string n; if (!v.Name.TryGetValue(f, out n)) return root;
+      ulong par; v.Par.TryGetValue(f, out par);
+      p = PathOf(v, par, root, memo, depth + 1) + "\\" + n; memo[f] = p; return p;
+    }
+    public static string Find(string[] drives, string glob, string under, int max, bool newest) {
+      bool wild = glob.IndexOfAny(new[] { '*', '?' }) >= 0;
+      var rx = new Regex("^" + (wild ? "" : ".*") + Regex.Escape(glob).Replace("\\*", ".*").Replace("\\?", ".") + (wild ? "" : ".*") + "$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+      if (drives == null || drives.Length == 0) { var l = new List<string>(); foreach (var d in DriveInfo.GetDrives()) { try { if (d.DriveType == DriveType.Fixed && d.IsReady && d.DriveFormat == "NTFS") l.Add(d.Name); } catch { } } drives = l.ToArray(); }
+      var hits = new List<string>(); var notes = new List<string>(); int cap = newest ? 5000 : max; double idx = 0;
+      var th = new List<Thread>(); foreach (var d0 in drives) { var dd = d0; var t = new Thread(() => { try { Load(dd); } catch { } }); t.Start(); th.Add(t); } foreach (var t in th) t.Join();   // all disks at once
+      foreach (var d in drives) {
+        Vol v; try { v = Load(d); } catch (Exception e) { notes.Add(d.Substring(0, 2) + " skipped: " + e.Message); continue; }
+        idx += v.Secs; var memo = new Dictionary<ulong, string>(); string root = d.Substring(0, 2);
+        foreach (var kv in v.Name) {
+          if (!rx.IsMatch(kv.Value)) continue;
+          string p = PathOf(v, kv.Key, root, memo, 0);
+          if (p.IndexOf("\\$Recycle.Bin", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+          if (under.Length > 0 && p.IndexOf(under, StringComparison.OrdinalIgnoreCase) != 0) continue;
+          hits.Add(p); if (hits.Count >= cap) break;
+        }
+        if (hits.Count >= cap) break;
+      }
+      var rows = new List<KeyValuePair<DateTime, string>>();
+      foreach (var p in hits) {
+        DateTime t = DateTime.MinValue; string sz = "";
+        try { if (Directory.Exists(p)) { t = Directory.GetLastWriteTime(p); sz = "<dir>"; } else { var fi = new FileInfo(p); t = fi.LastWriteTime; sz = Fs.Human(fi.Length); } } catch { }
+        rows.Add(new KeyValuePair<DateTime, string>(t, (t == DateTime.MinValue ? "                " : t.ToString("yyyy-MM-dd HH:mm")) + "  " + sz.PadLeft(7) + "  " + p));
+      }
+      if (newest) rows.Sort((a, b) => b.Key.CompareTo(a.Key)); else rows.Sort((a, b) => string.Compare(a.Value.Substring(27), b.Value.Substring(27), StringComparison.OrdinalIgnoreCase));
+      var sb = new StringBuilder();
+      for (int i = 0; i < rows.Count && i < max; i++) sb.Append(rows[i].Value).Append('\n');
+      sb.Append(hits.Count >= cap ? ("... stopped at " + cap + " matches: narrow the name or the path\n") : (hits.Count + " match(es)\n"));
+      sb.Append("(file table read in " + idx.ToString("0.0") + " s or taken from the 2-minute cache)\n");
+      foreach (var n in notes) sb.Append(n).Append('\n');
+      return sb.ToString().TrimEnd();
+    }
+  }
   // The link to the relay. Every request to the relay goes through a tiny local CONNECT proxy that can leave through a chosen network adapter
   // (IP_UNICAST_IF), so a VPN, a DPI-bypass tool (zapret / WinDivert) or a broken default route cannot take the helper down. A watchdog asks the relay
   // for /health every few seconds; when that fails, every route is tried in parallel and the first healthy one wins (physical adapters first, the
@@ -2069,12 +2146,28 @@ function Reg-Find($root, $text, $what, $max) {   # keys / value names / data und
     $r = @($script:rf | Select-Object -First $max)
     ($(if ($r.Count) { $r } else { "nothing matches '$text' under $root" }) + $(if ($script:rfTimeout) { @('(stopped after 25 s: narrow the path)') } else { @() })) -join "`n"
 }
+function Test-Admin { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 function Do-Util($a) {
     $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
     switch ($op) {
         'crash' { return @{ text = (Crash-Report $name $(if ($val -match '^\d+$') { [int]$val } else { 7 })) } }
         'recent' { return @{ text = (Recent-Programs $name $(if ($val -match '^\d+$') { [int]$val } else { 7 })) } }
         'reg_find' { return @{ text = (Reg-Find $(if ($p) { $p } else { 'HKCU\Software' }) $name $(if ($val -in 'key', 'value', 'data') { $val } else { 'all' }) $(if ($a.max) { [int]$a.max } else { 50 })) } }
+        'ffind' {
+            if (-not (Test-Admin)) { throw "ffind reads the NTFS file table of every disk and needs administrator rights: util elevate restarts the helper as administrator (the friend accepts one Windows prompt); find works without them, only slower" }
+            $dr = if ($p -match '^([A-Za-z]):') { @($Matches[1].ToUpper() + ':\') } else { @() }
+            return @{ text = [F__BUILD__.Mft]::Find([string[]]$dr, $name, $p, $(if ($a.max) { [int]$a.max } else { 100 }), ($val -eq 'new')) }
+        }
+        'elevate' {
+            if (Test-Admin) { return @{ text = 'already running as administrator' } }
+            if (-not $script:Persist) { throw 'this session is not kept, so it cannot continue after the restart' }
+            $f = Join-Path $StateDir 'agent.ps1'; [void](New-Item $StateDir -ItemType Directory -Force)
+            [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))
+            Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $f + '"')   # throws when the friend declines the Windows prompt
+            Write-AgentLog 'restarting as administrator'
+            Start-Process cmd.exe -WindowStyle Hidden -ArgumentList ('/c ping -n 6 127.0.0.1 >nul & taskkill /PID ' + $PID + ' /F')   # this helper steps aside once the elevated one has taken the session over
+            return @{ text = 'the helper restarts as administrator and continues this session (about 5-10 s: wait_online, then sysinfo). If the admin account is another user, a new code is shown on the friend screen instead. After a reboot it starts normally again (not elevated).' }
+        }
         'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
         { $_ -in 'install', 'uninstall' } {
             if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }

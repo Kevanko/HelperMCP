@@ -1989,7 +1989,7 @@ function Do-FsOp($a) {
 }
 
 # ---- ready-made operations: right on the first try, no quoting
-$ReadOnlyUtil = 'apps', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
+$ReadOnlyUtil = 'apps', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
 function Installed-Apps($q) {   # "name|version|publisher" from the uninstall keys (fast, no WMI Win32_Product)
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and (-not $q -or $_.DisplayName -like "*$q*" -or $_.PSChildName -like "*$q*") } |
@@ -1999,9 +1999,82 @@ function Run-Args($exe, [string[]]$argv, $secs = 1800) { $r = Do-Run @{ command 
 function Exit-Of($t) { if ($t -match '^\[exit (-?\d+)\]') { [int]$Matches[1] } else { -1 } }
 $WingetCodes = @{ -1978335212 = 'no package found with that name or id (search: run winget search <name>)'; -1978335189 = 'already installed, no newer version'; -1978335215 = 'the installer failed (see output)'
     -1978334967 = 'a reboot is needed to finish'; -1978335224 = 'download failed (network)'; -1978335135 = 'already installed' }
+function Rot13($s) { -join ($s.ToCharArray() | ForEach-Object { $c = [int]$_; if ($c -ge 65 -and $c -le 90) { [char](($c - 65 + 13) % 26 + 65) } elseif ($c -ge 97 -and $c -le 122) { [char](($c - 97 + 13) % 26 + 97) } else { $_ } }) }
+function Crash-Report($name, $days) {   # why a program died: Application Error / Hang / .NET / system events with module, exception code and full path, the events right before, dump files
+    $since = (Get-Date).AddDays(-$days); $out = @(); $hits = @()
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000, 1002, 1026; StartTime = $since } -ErrorAction SilentlyContinue)
+    $ev += @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 41, 1001, 6008; StartTime = $since } -ErrorAction SilentlyContinue)
+    foreach ($e in ($ev | Sort-Object TimeCreated -Descending)) {
+        $m = $e.Message; if ($name -and $m -notlike "*$name*") { continue }
+        $t = $e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+        $line = if ($e.Id -eq 1000 -and $e.Properties.Count -ge 12) { $q = $e.Properties; "$t CRASH $($q[0].Value) $($q[1].Value): module $($q[3].Value) $($q[4].Value), exception 0x$($q[6].Value) at offset $($q[7].Value), pid 0x$($q[8].Value); exe $($q[10].Value); module path $($q[11].Value)" }
+                elseif ($e.Id -eq 1002) { "$t HANG $($e.Properties[0].Value) $($e.Properties[1].Value): " + (Cut ($m -replace '\s+', ' ') 220) }
+                elseif ($e.Id -eq 1026) { "$t .NET " + (Cut ($m -replace '\s+', ' ') 400) }
+                elseif ($e.Id -eq 41) { "$t SYSTEM unexpected shutdown / power loss / bugcheck (Kernel-Power 41)" }
+                elseif ($e.Id -eq 1001) { "$t BSOD " + (Cut ($m -replace '\s+', ' ') 300) }
+                else { "$t SYSTEM unclean shutdown (6008)" }
+        $hits += [pscustomobject]@{ time = $e.TimeCreated; line = $line }
+        if ($hits.Count -ge 15) { break }
+    }
+    if (-not $hits.Count) { $out += "no crash events in the last $days days" + $(if ($name) { " that mention '$name'" } else { '' }) } else { $out += $hits.line }
+    if ($hits.Count) {   # what was going on in the minutes before the newest one
+        $t0 = $hits[0].time
+        $pre = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'; Level = 1, 2, 3; StartTime = $t0.AddMinutes(-3); EndTime = $t0 } -MaxEvents 12 -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne 1000 })
+        if ($pre.Count) { $out += ''; $out += 'just before the newest one (3 min):'; $out += $pre | ForEach-Object { "  $($_.TimeCreated.ToString('HH:mm:ss')) [$($_.LevelDisplayName)] $($_.ProviderName) #$($_.Id): " + (Cut ($_.Message -replace '\s+', ' ') 160) } }
+    }
+    $dumps = @(); foreach ($d in 'C:\Windows\Minidump', 'C:\Windows\LiveKernelReports', (Join-Path $env:LOCALAPPDATA 'CrashDumps')) { if (Test-Path $d) { $dumps += Get-ChildItem $d -Recurse -File -Include *.dmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $since -and (-not $name -or $_.Name -like "*$name*") } } }
+    if ($dumps.Count) { $out += ''; $out += 'dump files (fetch_file to take one):'; $out += $dumps | Sort-Object LastWriteTime -Descending | Select-Object -First 8 | ForEach-Object { "  $($_.LastWriteTime.ToString('yyyy-MM-dd HH:mm')) $([int]($_.Length / 1KB)) KB $($_.FullName)" } }
+    $out -join "`n"
+}
+function Recent-Programs($name, $days) {   # what ran and when: UserAssist (run counts), BAM and Prefetch (administrator), recently opened files
+    $since = (Get-Date).AddDays(-$days); $rows = @(); $notes = @()
+    try {
+        foreach ($g in Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist' -ErrorAction Stop) {
+            $k = Get-Item "Registry::$($g.Name)\Count" -ErrorAction SilentlyContinue; if (-not $k) { continue }
+            foreach ($v in $k.GetValueNames()) {
+                $b = $k.GetValue($v); if ($b -isnot [byte[]] -or $b.Length -lt 68) { continue }
+                $ft = [BitConverter]::ToInt64($b, 60); if ($ft -le 0) { continue }
+                $t = [DateTime]::FromFileTime($ft); if ($t -lt $since) { continue }
+                $rows += [pscustomobject]@{ time = $t; line = "$($t.ToString('yyyy-MM-dd HH:mm:ss')) ran x$([BitConverter]::ToUInt32($b, 4))  $(Rot13 $v)" }
+            }
+        }
+    } catch { $notes += "UserAssist: $($_.Exception.Message)" }
+    try {
+        foreach ($u in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings' -ErrorAction Stop) {
+            $k = Get-Item "Registry::$($u.Name)"; foreach ($v in $k.GetValueNames()) { $b = $k.GetValue($v); if ($b -is [byte[]] -and $b.Length -ge 8 -and $v -match '\\') { $t = [DateTime]::FromFileTime([BitConverter]::ToInt64($b, 0)); if ($t -ge $since) { $rows += [pscustomobject]@{ time = $t; line = "$($t.ToString('yyyy-MM-dd HH:mm:ss')) ran (bam)  $v" } } } }
+        }
+    } catch { $notes += 'BAM: needs administrator' }
+    try { foreach ($f in Get-ChildItem 'C:\Windows\Prefetch\*.pf' -ErrorAction Stop | Where-Object { $_.LastWriteTime -ge $since }) { $rows += [pscustomobject]@{ time = $f.LastWriteTime; line = "$($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) ran (prefetch)  $($f.Name -replace '-[0-9A-F]{8}\.pf$', '')" } } } catch { $notes += 'Prefetch: needs administrator' }
+    try { foreach ($f in Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Recent') -Filter *.lnk -ErrorAction Stop | Where-Object { $_.LastWriteTime -ge $since }) { $rows += [pscustomobject]@{ time = $f.LastWriteTime; line = "$($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) opened file  $($f.BaseName)" } } } catch { }
+    if ($name) { $rows = @($rows | Where-Object { $_.line -like "*$name*" }) }
+    $r = @($rows | Sort-Object time -Descending | Select-Object -First 60)
+    ($(if ($r.Count) { $r.line } else { "nothing found in the last $days days" + $(if ($name) { " for '$name'" } else { '' }) }) + $(if ($notes.Count) { @('', 'not read: ' + ($notes -join '; ')) } else { @() })) -join "`n"
+}
+function Reg-Find($root, $text, $what, $max) {   # keys / value names / data under a root; stops after 25 s so a huge hive cannot hang the helper
+    $hive = switch -Regex ($root) { '^HKLM' { [Microsoft.Win32.Registry]::LocalMachine } '^HKCR' { [Microsoft.Win32.Registry]::ClassesRoot } '^HKU' { [Microsoft.Win32.Registry]::Users } default { [Microsoft.Win32.Registry]::CurrentUser } }
+    $sub = ($root -replace '^(HKCU|HKLM|HKCR|HKU)(\\|$)', ''); $start = if ($sub) { $hive.OpenSubKey($sub) } else { $hive }
+    if (-not $start) { throw "no such registry path: $root" }
+    $sw = [Diagnostics.Stopwatch]::StartNew(); $script:rf = @(); $script:rfTimeout = $false
+    $walk = { param($k, $path)
+        if ($script:rf.Count -ge $max) { return }
+        if ($sw.Elapsed.TotalSeconds -gt 25) { $script:rfTimeout = $true; return }
+        if ($what -in 'all', 'value', 'data') { foreach ($n in $k.GetValueNames()) {
+            $d = try { $k.GetValue($n) } catch { $null }; $ds = if ($d -is [byte[]]) { '' } else { (@($d) -join ' ') }
+            if (($what -in 'all', 'value' -and $n -like "*$text*") -or ($what -in 'all', 'data' -and $ds -like "*$text*")) { $script:rf += "$path :: $(if ($n) { $n } else { '(default)' }) = $(Cut $ds 150)"; if ($script:rf.Count -ge $max) { return } } } }
+        foreach ($s in $k.GetSubKeyNames()) {
+            if ($what -in 'all', 'key' -and $s -like "*$text*") { $script:rf += "$path\$s  [key]" }
+            $c = try { $k.OpenSubKey($s) } catch { $null }; if ($c) { try { & $walk $c "$path\$s" } finally { $c.Close() } }
+            if ($script:rf.Count -ge $max -or $script:rfTimeout) { return } } }
+    & $walk $start $root
+    $r = @($script:rf | Select-Object -First $max)
+    ($(if ($r.Count) { $r } else { "nothing matches '$text' under $root" }) + $(if ($script:rfTimeout) { @('(stopped after 25 s: narrow the path)') } else { @() })) -join "`n"
+}
 function Do-Util($a) {
     $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
     switch ($op) {
+        'crash' { return @{ text = (Crash-Report $name $(if ($val -match '^\d+$') { [int]$val } else { 7 })) } }
+        'recent' { return @{ text = (Recent-Programs $name $(if ($val -match '^\d+$') { [int]$val } else { 7 })) } }
+        'reg_find' { return @{ text = (Reg-Find $(if ($p) { $p } else { 'HKCU\Software' }) $name $(if ($val -in 'key', 'value', 'data') { $val } else { 'all' }) $(if ($a.max) { [int]$a.max } else { 50 })) } }
         'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
         { $_ -in 'install', 'uninstall' } {
             if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }
@@ -2776,6 +2849,7 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
         $f = Join-Path $StateDir 'agent.ps1'
         [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))   # the one-liner runs from memory: keep a copy
         Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $f + '"')
+        try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }   # Task Manager's "Startup apps" switch would otherwise keep it off after a reboot
         Write-AgentLog 'autostart installed'
     } catch { Write-AgentLog "autostart failed: $_" }
 }
@@ -3027,8 +3101,8 @@ function Start-Helper {
     $mode = Norm-Mode $env:HELPER_MODE
     if ($saved -and (Norm-Mode $saved.mode)) { $mode = Norm-Mode $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
     elseif (-not $mode) {
-        $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов' 'Mode: [1] ask before every action (recommended)  [2] auto, no questions')
-        $mode = if ($ans.Trim() -eq '2') { 'auto' } else { 'confirm' }
+        $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов  [3] постоянный доступ (Esc только ставит на паузу, завершить может только админ)' 'Mode: [1] ask before every action (recommended)  [2] auto, no questions  [3] unattended (Esc only pauses, only the admin ends it)')
+        $mode = switch ($ans.Trim()) { '2' { 'auto' } '3' { 'unattended' } default { 'confirm' } }
     }
     $script:Mode = $mode; [K__BUILD__.Keys]::Unattended = ($mode -eq 'unattended')
     try { [F__BUILD__.Route]::Init($RELAY, $(try { (Get-Content (Join-Path $StateDir 'route.txt') -ErrorAction Stop | Select-Object -First 1) } catch { '' }), (Join-Path $StateDir 'route.block')); [Net.WebRequest]::DefaultWebProxy = [F__BUILD__.Route]::Proxy } catch { Write-AgentLog "route layer: $_" }   # the link to the relay survives a VPN, zapret or a dead default route

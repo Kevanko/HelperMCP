@@ -180,6 +180,16 @@ assert.match(nc, /== network/); assert.match(nc, /== connections|== TCP connecti
 if (useps) { assert.match(nc, /\[Up\]/, 'every adapter is listed with its state'); assert.match(nc, /agent link:/, 'the route layer reports the agent link'); assert.match(nc, /VPN \/ DPI-bypass/, 'reach names VPN / DPI tools'); }
 console.log('system network / connections / reach ok');
 assert.match(txt(await tool('util', { session: code, op: 'env_get', name: 'PATH' })), useps ? /process: .+/ : /.+/);
+if (useps) {   // registry search, crash report, run history (Windows only)
+  await tool('util', { session: code, op: 'reg_set', path: 'HKCU\\Software\\HmFindTest', name: 'hm_find_name', value: 'hm_find_data_77' });
+  const rf = txt(await tool('util', { session: code, op: 'reg_find', path: 'HKCU\\Software', name: 'hm_find_data', value: 'data' }));
+  assert.match(rf, /HmFindTest :: hm_find_name = hm_find_data_77/, 'reg_find finds the value data: ' + rf);
+  assert.match(txt(await tool('util', { session: code, op: 'reg_find', path: 'HKCU\\Software', name: 'HmFindTes', value: 'key' })), /HmFindTest {2}\[key\]/);
+  await tool('run', { session: code, command: 'reg', args: ['delete', 'HKCU\\Software\\HmFindTest', '/f'] });
+  assert.match(txt(await tool('util', { session: code, op: 'crash', name: 'no-such-program-zz', value: '1' })), /no crash events/);
+  assert.match(txt(await tool('util', { session: code, op: 'recent', value: '3' })), /ran|opened file|nothing found/);
+  console.log('reg_find / crash / recent ok');
+}
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
 const zp = path.join(tmp, 'tree-copy.zip');
 assert.match(txt(await tool('util', { session: code, op: 'zip', path: ft, dest: zp })), /tree-copy\.zip/);

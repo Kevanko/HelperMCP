@@ -25,8 +25,8 @@ T = {
     "persist_q": ("Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]: ", "Keep this session through internet loss and reboots (the code stays the same)? [Y/n]: "),
     "overlay_paused": ("Пауза", "Paused"), "resuming": ("Продолжаю прошлый сеанс", "Resuming the previous session"),
     "ready": ("Подключено. Жду действий.", "Connected. Waiting for actions."),
-    "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов: ",
-             "Mode: [1] ask before every action (recommended)  [2] auto, no questions: "),
+    "mode": ("Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов  [3] постоянный доступ (Esc только пауза, завершить может только админ): ",
+             "Mode: [1] ask before every action (recommended)  [2] auto, no questions  [3] unattended (Esc only pauses, only the admin ends it): "),
     "allow": ("Разрешить: ", "Allow: "),
     "keys": ("да", "yes"), "always": ("всегда", "always"), "no": ("нет", "no"), "endk": ("завершить сеанс", "end the session"), "until": ("до конца сеанса", "until the session ends"),
     "ok1": ("разрешено", "allowed"), "ok2": ("дальше без вопросов", "no more questions for"), "den": ("отклонено", "denied"), "esc": ("сеанс завершён (Esc)", "session ended (Esc)"),
@@ -1450,7 +1450,7 @@ def util(a):
         dest = os.path.expanduser(a.get("dest") or os.path.splitext(path)[0])
         with zipfile.ZipFile(path) as z: z.extractall(dest)
         return {"text": "extracted to " + dest}
-    if op in ("reg_get", "reg_set", "shortcut"): raise RuntimeError(op + " is Windows only")
+    if op in ("reg_get", "reg_set", "reg_find", "crash", "recent", "shortcut"): raise RuntimeError(op + " is Windows only")
     raise RuntimeError("unknown op " + op)
 
 
@@ -2392,7 +2392,7 @@ def main():
     saved = None if os.environ.get("HELPER_NEW") else load_session()
     mode = norm_mode((saved or {}).get("mode")) or norm_mode(os.environ.get("HELPER_MODE"))
     if not mode:
-        mode = "auto" if input(t("mode")).strip() == "2" else "confirm"
+        mode = {"2": "auto", "3": "unattended"}.get(input(t("mode")).strip(), "confirm")
     MODE["m"] = mode
     persist = os.environ.get("HELPER_PERSIST")
     if saved: PERSIST["on"] = True

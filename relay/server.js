@@ -225,7 +225,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
   // in "ask" mode a human must click through prompts, give them time
-  if (s.mode === 'confirm') timeoutMs += 120_000;
+  if (s.mode === 'confirm' && tool !== 'bye') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
   if (!args.view && tool !== 'stream') { // live-viewer frames are not "actions"
@@ -492,7 +492,7 @@ const tools = [
     props: { x: num('x'), y: num('y'), x2: num('x2'), y2: num('y2'), button: { type: 'string', enum: ['left', 'right', 'middle'] }, hold: { type: 'boolean', description: 'Android: long-press first, then move (drag and drop of icons / list items); without it the drag is a swipe' } }, required: ['x', 'y', 'x2', 'y2'] },
   { name: 'scroll', agent: true, description: 'Scroll the mouse wheel (positive amount = down, negative = up), optionally at (x,y) in screenshot coordinates.',
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
-  { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus.', props: { text: str('Text') }, required: ['text'] },
+  { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus. The answer names the window that was in front and warns when it runs as administrator (the helper is then ignored). Windows: window (part of its title, process name or pid) brings that window to the front first; with background=true the text goes to that window\'s focused control WITHOUT taking the focus or changing the window order (classic Win32 / Electron programs; not games or some modern apps: then retry without background).', props: { text: str('Text'), window: str('Windows: window title part / process / pid to type into'), background: { type: 'boolean', description: 'Windows: type without bringing the window to the front' } }, required: ['text'] },
   { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', props: { keys: str('Key combo') }, required: ['keys'] },
   { name: 'actions', agent: true, ms: (a) => 30000 + (a.steps || []).length * 20000,
     description: 'A short sequence of small GUI steps done as ONE action the friend confirms once (move + click, click + type, drag, scroll, key presses). Prefer this over separate click / move / type_text calls. Coordinates are screenshot pixels. Stops at the first failing step.',
@@ -531,7 +531,7 @@ const tools = [
       return { text: `Watch (view only, safe to share): ${l.watch}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${l.control}` };
     } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
-    run: async (code) => { await call(code, 'bye').catch(() => {}); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },
+    run: async (code) => { await Promise.race([call(code, 'bye', {}, 4000).catch(() => {}), new Promise((r) => setTimeout(r, 2000))]); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },   // the agent never answers 'bye': waiting for it used to hang the call for a minute (three in ask mode)
 ];
 const byName = new Map(tools.map((t) => [t.name, t]));
 
@@ -1171,12 +1171,13 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       s.lastSeen = Date.now();
       if (p === '/a/poll' && req.method === 'GET') {
         if (url.searchParams.get('w') === '0' && !s.queue.length) { res.writeHead(204); return res.end(); }   // agent busy with a long call: just peek
-        if (s.waiting) json(s.waiting, 204, {}); // superseded poll
+        if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 204, {}); } // superseded poll: its timer must go too, or it fires on a finished response and takes the relay down
         s.waiting = res;
-        s.waitTimer = setTimeout(() => { s.waiting = null; res.writeHead(204); res.end(); }, POLL_MS);
+        s.waitTimer = setTimeout(() => { if (s.waiting === res) s.waiting = null; if (!res.headersSent) { res.writeHead(204); res.end(); } }, POLL_MS);
         res.on('close', () => { if (s.waiting === res) { s.waiting = null; clearTimeout(s.waitTimer); } });
         return flush(s);
       }
+      if (p === '/a/speed' && req.method === 'POST') { let n = 0; req.on('data', (d) => { n += d.length; }); req.on('end', () => json(res, 200, { n })); req.on('error', () => {}); return; }   // the agent measures its upload speed through each route
       if (p === '/a/stream' && req.method === 'POST') {   // the live picture: one long upload, frames forwarded as they come
         try { s.ingest?.destroy(); } catch { /* gone */ }
         s.ingest = req; let buf = Buffer.alloc(0);
@@ -1260,5 +1261,7 @@ if (TLS_CERT && TLS_KEY) {
   server = http.createServer(handler);
 }
 server.requestTimeout = 0; // long-poll
+process.on('uncaughtException', (e) => console.error('uncaught (kept running):', e && e.stack || e));   // one bad request must not drop every session: agents would sit at "Connecting"
+process.on('unhandledRejection', (e) => console.error('unhandled rejection (kept running):', e && e.stack || e));
 server.listen(PORT, process.env.HOST || '0.0.0.0', () =>
   console.log(`HelperMCP relay on ${TLS_CERT ? 'https' : 'http'}://0.0.0.0:${PORT}`));

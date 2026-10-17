@@ -82,6 +82,43 @@ namespace V__BUILD__ {
         SendInput((uint)ev.Length, ev, Marshal.SizeOf(typeof(IN)));
       }
     }
+    [StructLayout(LayoutKind.Sequential)] struct RC2 { public int l, t, r, b; }
+    [StructLayout(LayoutKind.Sequential)] struct GT2 { public int size, flags; public IntPtr active, focus, capture, menu, move, caret; public RC2 rc; }
+    [DllImport("user32.dll", EntryPoint = "PostMessageW")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);   // the W form: the A form turns a Cyrillic letter into one byte
+    [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint tid, ref GT2 i);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
+    [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, System.Text.StringBuilder sb, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int n);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint acc, bool inh, uint pid);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr p, uint acc, out IntPtr tok);
+    [DllImport("advapi32.dll")] static extern bool GetTokenInformation(IntPtr tok, int cls, out int val, int len, out int ret);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    public static string Fg() { var h = GetForegroundWindow(); var sb = new System.Text.StringBuilder(200); GetWindowText(h, sb, 200); uint pid; GetWindowThreadProcessId(h, out pid); return sb.ToString() + "|" + pid; }
+    // true only when the process certainly runs with higher rights than this helper (then Windows drops this helper's keys and clicks)
+    public static bool Elevated(uint pid) {
+      IntPtr p = OpenProcess(0x1000, false, pid); if (p == IntPtr.Zero) return Marshal.GetLastWin32Error() == 5;
+      try { IntPtr tok; if (!OpenProcessToken(p, 8, out tok)) return Marshal.GetLastWin32Error() == 5; try { int v, r; return GetTokenInformation(tok, 20, out v, 4, out r) && v != 0; } finally { CloseHandle(tok); } } finally { CloseHandle(p); }
+    }
+    public static bool Activate(IntPtr h) {
+      if (IsIconic(h)) ShowWindow(h, 9);
+      uint pid; uint ft = GetWindowThreadProcessId(GetForegroundWindow(), out pid), me = GetCurrentThreadId();
+      AttachThreadInput(me, ft, true); try { SetForegroundWindow(h); } finally { AttachThreadInput(me, ft, false); }
+      if (GetForegroundWindow() != h) { var alt = new[] { K(0x12, 0, 0), K(0x12, 0, 2) }; SendInput((uint)alt.Length, alt, Marshal.SizeOf(typeof(IN))); SetForegroundWindow(h); }   // a tap on Alt lets a background process take the front
+      return GetForegroundWindow() == h;
+    }
+    // text into the control that has the keyboard focus INSIDE that window's own thread, without bringing the window to the front (WM_CHAR)
+    public static string TypeTo(IntPtr top, string s) {
+      uint pid; uint tid = GetWindowThreadProcessId(top, out pid); var g = new GT2(); g.size = Marshal.SizeOf(typeof(GT2));
+      IntPtr t = top; if (GetGUIThreadInfo(tid, ref g) && g.focus != IntPtr.Zero) t = g.focus;
+      foreach (char c in s) { if (c == (char)13) continue; PostMessage(t, 0x0102, (IntPtr)(c == (char)10 ? 13 : c), IntPtr.Zero); }
+      var sb = new System.Text.StringBuilder(80); GetClassName(t, sb, 80); return sb.ToString();
+    }
   }
   public static class Probe {   // a coarse grey picture of a part of the screen: enough to tell whether anything changed
     public static byte[] Grab(int x, int y, int w, int h, int gw, int gh, int[] mask) {
@@ -512,8 +549,8 @@ namespace F__BUILD__ {
   public static class Live {
     public static string Relay, Token; public static volatile string Err = "";
     static volatile bool run, key; static volatile int mon = -1; static Thread th;
-    public static void Start(int m) { if (m != mon) key = true; mon = m; run = true; if (th == null || !th.IsAlive) { th = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }; th.Start(); } }
-    public static void Stop() { run = false; }
+    public static void Start(int m) { if (m != mon) key = true; mon = m; run = true; Route.Streaming = true; if (th == null || !th.IsAlive) { th = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }; th.Start(); } }
+    public static void Stop() { run = false; Route.Streaming = false; }
     public static void Key() { key = true; }
     public static bool Running { get { return th != null && th.IsAlive && run; } }
 
@@ -741,7 +778,13 @@ namespace F__BUILD__ {
         relay = new Uri(url); host = relay.Host; port = relay.Port; blockFile = block;   // block: a test hook, a file naming the routes (def, sys, if14 ...) that must fail while it exists
         if (relay.Scheme != "https" || Environment.GetEnvironmentVariable("HELPER_ROUTE") == "0") return;
         var ord = Order(); if (ord.Count == 0) return;
-        var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time: no search after a reboot
+        var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time
+        try {   // but never trust it blindly: every route is asked at once (up to 3 s), the saved one wins when it answers, otherwise the first that does. Starting on a dead route cost several "Connecting" rounds
+          var res = ProbeAll(ord, 3000); Cand pick = null;
+          for (int i = 0; i < ord.Count; i++) if (res[i] > 0 && ord[i].Key == first.Key) pick = ord[i];
+          for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
+          if (pick != null) { if (pick.Key != first.Key) Emit("route", "start: " + first.Name + " does not reach the relay, using " + pick.Name); first = pick; }
+        } catch { }
         on = true; Switch(first, "start", false); forced = true;
         new Thread(Watch) { IsBackground = true, Priority = ThreadPriority.AboveNormal }.Start();
       } catch (Exception e) { on = false; Emit("route", "route layer off: " + e.Message); }
@@ -877,10 +920,44 @@ namespace F__BUILD__ {
       if (tell) Emit("route", why + ": " + (oc != null ? oc.Name : "?") + " -> " + c.Name);
     }
 
+    // The live picture is an upload: the route that merely answers /health may be the slowest one (a VPN, a congested Wi-Fi). While someone watches, every 45 s the upload speed of
+    // the best few routes is measured and the stream moves to one that is clearly faster (1.6x and 3 Mbit/s more). ponytail: the current route is measured while the stream itself uses it, so it reads low: the margin covers that
+    public static volatile bool Streaming; public static string Token = ""; static DateTime lastOpt = DateTime.MinValue; public static string LastSpeeds = "";
+    static double Speed(Cand c, int bytes) {   // upload Mbit/s through this route, -1 when it fails
+      try {
+        var grp = Guid.NewGuid().ToString();
+        Func<int, double> post = (n) => {
+          var rq = (HttpWebRequest)WebRequest.Create("https://" + host + ":" + port + "/a/speed"); rq.Method = "POST";
+          rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = 9000; rq.ReadWriteTimeout = 9000; rq.KeepAlive = true; rq.ConnectionGroupName = grp; rq.UserAgent = "helpermcp-probe";
+          rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ContentLength = n; rq.AllowWriteStreamBuffering = false; rq.ServicePoint.Expect100Continue = false;
+          var sw = System.Diagnostics.Stopwatch.StartNew();
+          using (var st = rq.GetRequestStream()) { var b = new byte[16384]; for (int o = 0; o < n; o += b.Length) st.Write(b, 0, Math.Min(b.Length, n - o)); }
+          using (var r = (HttpWebResponse)rq.GetResponse()) { if ((int)r.StatusCode != 200) return -1; }
+          return sw.Elapsed.TotalSeconds;
+        };
+        post(4096);   // connection and TLS set-up, not counted
+        double secs = post(bytes); return secs > 0 ? bytes * 8 / 1e6 / secs : -1;
+      } catch (Exception e) { speedErr = e.Message; return -1; }
+    }
+    static string speedErr = "";
+    public static string Optimize(bool apply) {
+      var ord = Order(); var c = curC; if (c == null || ord.Count == 0) return "";
+      var l = new List<Cand>(); foreach (var o in ord) { if (l.Count < 5) l.Add(o); } if (!l.Exists(x => x.Key == c.Key)) l.Add(c);
+      var sp2 = new double[l.Count]; var sb = new StringBuilder(); int ci = -1;
+      for (int i = 0; i < l.Count; i++) { sp2[i] = Speed(l[i], 393216); if (l[i].Key == c.Key) ci = i; sb.Append(l[i].Name).Append(sp2[i] > 0 ? ": " + sp2[i].ToString("0.0") + " Mbit/s; " : ": FAIL (" + speedErr + "); "); }
+      LastSpeeds = sb.ToString();
+      int best = -1; for (int i = 0; i < l.Count; i++) if (sp2[i] > 0 && (best < 0 || sp2[i] > sp2[best])) best = i;
+      double cs = ci >= 0 && sp2[ci] > 0 ? sp2[ci] : 0;
+      if (apply && best >= 0 && best != ci && sp2[best] >= cs * 1.6 && sp2[best] - cs >= 3) Switch(l[best], "faster route (" + sp2[best].ToString("0.0") + " vs " + cs.ToString("0.0") + " Mbit/s upload)", true);
+      else if (apply) Emit("route", "upload speed: " + LastSpeeds);
+      return LastSpeeds;
+    }
+
     static void Watch() {
       DateTime better = DateTime.UtcNow; DateTime failTold = DateTime.MinValue;
       while (true) {
         wake.WaitOne(4000);
+        if (Streaming && (DateTime.UtcNow - lastOpt).TotalSeconds > 45) { lastOpt = DateTime.UtcNow; try { Optimize(true); } catch { } }
         bool f = forced; forced = false;
         if (!f && (DateTime.UtcNow - lastOk).TotalSeconds < 4) continue;
         var c = curC;
@@ -930,6 +1007,7 @@ namespace F__BUILD__ {
         if (a.Ms > 0) sb.Append("; relay ok ").Append(a.Ms).Append(" ms"); else if (a.Ms == -1) sb.Append("; relay FAIL");
         sb.Append('\n');
       }
+      if (LastSpeeds.Length > 0) sb.Append("last upload speeds: ").Append(LastSpeeds).Append('\n');
       lock (lk) { if (hist.Count > 0) { sb.Append("route log:\n"); foreach (var h in hist) sb.Append("  ").Append(h).Append('\n'); } }
       return sb.ToString().TrimEnd();
     }
@@ -978,10 +1056,10 @@ namespace K__BUILD__ {
         if (k == ConsoleKey.R && Paused) { SetPaused(false); return; }
         if (k == ConsoleKey.X) {
           Say(C("1;30;43", "  " + ConfirmEnd + "  ")); var k2 = Console.ReadKey(true).Key;
-          if (k2 == ConsoleKey.Y || k2 == ConsoleKey.Enter) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); }   // only now the session is over, for good
+          if (k2 == ConsoleKey.Y) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); }   // only now the session is over, for good
           return;
         }
-        if (k == ConsoleKey.Escape || k == ConsoleKey.N || k == ConsoleKey.Enter) return;
+        if (k == ConsoleKey.B || k == ConsoleKey.Backspace) return;   // back is [B]: Esc opens the menu, so a second Esc must not close it again (it only confused people); Enter / N no longer count
       }
     }
     public static void Start() {
@@ -1494,7 +1572,28 @@ function Do-Scroll($a) {
 }
 
 function Pin-Caret { try { $c = [V__BUILD__.Caret]::Get(); if ($c) { Overlay-Send "pin $($c[0] + 2) $($c[1] + $c[2])" } } catch { } }   # the arrow sits right under the caret
+function Find-WindowHandle($w) {   # a window by a part of its title or by pid: the biggest visible one
+    $pr = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero -and ($(if ("$w" -match '^\d+$') { $_.Id -eq [int]$w } else { $_.MainWindowTitle -like "*$w*" -or $_.ProcessName -like "*$w*" })) })
+    if (-not $pr.Count) { throw "No window matches '$w' (ui_tree without arguments lists the windows)" }
+    $pr[0]
+}
+function Fg-Report {   # where the keys really go: the window in front, and whether it is out of reach because it runs as administrator
+    $f = ([V__BUILD__.Kb]::Fg()) -split '\|'; $t = [string]$f[0]; $pid_ = [uint32]$f[1]; $w = " [window in front: '$(Cut $t 50)']"
+    if (-not (Test-Admin) -and [V__BUILD__.Kb]::Elevated($pid_)) { $w += ' WARNING: it runs as administrator and this helper does not, so Windows throws away typed keys and clicks: util elevate restarts the helper as administrator' }
+    $w
+}
 function Do-TypeText($a) {
+    if ($a.window) {
+        $wp = Find-WindowHandle $a.window; $h = $wp.MainWindowHandle; $tx = ([string]$a.text) -replace "`r`n", "`n"
+        if ($a.background) {
+            if (-not (Test-Admin) -and [V__BUILD__.Kb]::Elevated([uint32]$wp.Id)) { throw "'$($wp.MainWindowTitle)' runs as administrator: input from this helper is dropped (util elevate)" }
+            $cls = [V__BUILD__.Kb]::TypeTo($h, $tx)
+            return @{ text = "typed $($tx.Length) characters into '$(Cut $wp.MainWindowTitle 50)' in the background (control $cls, the focus and the window order were not touched). Not every program accepts this: if the text did not appear, repeat without background." }
+        }
+        $ok = [V__BUILD__.Kb]::Activate($h); if (-not $ok) { Start-Sleep -Milliseconds 200; $ok = [V__BUILD__.Kb]::Activate($h) }
+        if (-not $ok) { throw "could not bring '$($wp.MainWindowTitle)' to the front$(Fg-Report)" }
+        Start-Sleep -Milliseconds 120
+    }
     $c0 = $null; try { $c0 = [V__BUILD__.Caret]::Get() } catch { }
     $tr = if ($c0) { @(($c0[0] - 300), ($c0[1] - 40), 1100, ($c0[2] + 80)) } else { [V__BUILD__.Probe]::FgRect() }   # the line being typed, or the window that has the focus
     $am = Arrow-Mask; $pb = Probe-Take $tr (@(Caret-Mask $c0) + $am)
@@ -1511,7 +1610,7 @@ function Do-TypeText($a) {
     Pin-Caret; Start-Sleep -Milliseconds 350
     $c1 = $null; try { $c1 = [V__BUILD__.Caret]::Get() } catch { }
     $after = Probe-Take $tr (@(Caret-Mask $c0) + @(Caret-Mask $c1) + $am)
-    @{ text = Probe-Report $pb $after 'typing' (Caret-Moved $c0 $c1) }
+    @{ text = (Probe-Report $pb $after 'typing' (Caret-Moved $c0 $c1)) + (Fg-Report) }
 }
 
 $Vk = @{ ctrl = 0x11; control = 0x11; alt = 0x12; shift = 0x10; win = 0x5B; windows = 0x5B; enter = 0x0D; return = 0x0D
@@ -1525,7 +1624,8 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
         $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
         $script:OkRGB = $rgb; Overlay-Send "color $($rgb[0]) $($rgb[1]) $($rgb[2])"; $out += 'colour set'
     }
-    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send "note $nt"; Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown' }
+    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send "note $nt"; Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown'
+        if ($script:Phase -in 'done', 'hold') { $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status; $out += 'new task started' } }   # a new note after task_done is a new task: the label shows it and the clock starts again, it used to stay on "finished"
     @{ text = $(if ($out) { $out -join ', ' } else { 'nothing to change' }) }
 }
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
@@ -2766,7 +2866,7 @@ foreach ($scr in [Windows.Forms.Screen]::AllScreens) {
     $win.Show(); Click-Through $win; $mons += $m
 }
 function Label-Text { switch ($script:state) { 'lost' { $lostLabel } 'wait' { $waitLabel } 'paused' { $pausedLabel } 'hold' { $holdLabel } 'done' { $doneLabel } 'away' { $awayLabel } default { if ($script:note) { $script:note } else { $label } } } }
-function Clock-Text { if ($script:state -in 'ok', 'away') { $s = [int]$script:clockT.Elapsed.TotalSeconds; if ($s -ge 3600) { '{0}:{1:00}:{2:00}' -f [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } else { '{0:00}:{1:00}' -f [Math]::Floor($s / 60), ($s % 60) } } else { '' } }
+function Clock-Text { if ($script:state -in 'ok', 'away', 'done') { $s = $(if ($script:state -eq 'done' -and $null -ne $script:doneSec) { $script:doneSec } else { [int]$script:clockT.Elapsed.TotalSeconds }); if ($s -ge 3600) { '{0}:{1:00}:{2:00}' -f [Math]::Floor($s / 3600), [Math]::Floor(($s % 3600) / 60), ($s % 60) } else { '{0:00}:{1:00}' -f [Math]::Floor($s / 60), ($s % 60) } } else { '' } }
 $script:clockT = [Diagnostics.Stopwatch]::StartNew(); $script:lastSec = -1
 $script:busy = $false; $script:capHide = $false
 $script:busyOff = New-Object Windows.Threading.DispatcherTimer; $script:busyOff.Interval = [TimeSpan]::FromMilliseconds(2500); $script:busyOff.Add_Tick({ $script:busyOff.Stop(); Set-Busy $false })
@@ -2938,7 +3038,7 @@ function Type-Offset($now) {   # where the arrow stands while text is typed: it 
 function On-Line($line) {
     $f = $line.Trim() -split '\s+'; $now = $clock.Elapsed.TotalSeconds
     if (-not $f -or -not $f[0]) { return }
-    if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; $script:state = $f[1]; Apply-State }; return }
+    if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; if ($f[1] -eq 'done') { $script:doneSec = [int]$script:clockT.Elapsed.TotalSeconds } else { $script:doneSec = $null }; $script:state = $f[1]; Apply-State }; return }
     if ($f[0] -eq 'color' -and $f.Count -ge 4) { $script:okC = C ([int]$f[1]) ([int]$f[2]) ([int]$f[3]); Apply-State; foreach ($m in $mons) { if ($script:busy) { $m.shadow.Color = (Cur) } }; return }
     if ($f[0] -eq 'note') { $script:note = $line.Trim().Substring(4).Trim(); Apply-State; return }
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
@@ -3469,12 +3569,12 @@ function Start-Helper {
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
-    [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
+    [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     Play-Sound 'ok'
     Start-Overlay
     Overlay-Send 'state wait'
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
-    $k::MenuRun = (T 'Меню:  [P] пауза    [X] завершить сеанс    [Esc] назад' 'Menu:  [P] pause    [X] end the session    [Esc] back'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] завершить сеанс    [Esc] назад' 'Paused.  [R] continue    [X] end the session    [Esc] back')
+    $k::MenuRun = (T 'Меню:  [P] пауза    [X] завершить сеанс    [B] назад' 'Menu:  [P] pause    [X] end the session    [B] back'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] завершить сеанс    [B] назад' 'Paused.  [R] continue    [X] end the session    [B] back')
     $k::ConfirmEnd = (T 'Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет' 'End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no')
     $k::StPaused = (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'); $k::Continuing = (T 'продолжаем' 'continuing')
     $k::StRestore = ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…')); $k::StRestoreOk = $false

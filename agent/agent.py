@@ -18,8 +18,8 @@ T = {
     "st_conn": ("Подключаюсь к серверу…", "Connecting to the server…"), "st_wait": ("Ожидание помощника… он подключается по коду", "Waiting for the helper to connect with the code…"),
     "st_ok": ("Помощник подключён", "Helper connected"), "st_lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
     "overlay_wait": ("Ожидание помощника…", "Waiting for the helper…"),
-    "menu_run": ("Меню:  [P] пауза    [X] завершить сеанс    [Esc] назад", "Menu:  [P] pause    [X] end the session    [Esc] back"),
-    "menu_paused": ("Пауза.  [R] продолжить    [X] завершить сеанс    [Esc] назад", "Paused.  [R] continue    [X] end the session    [Esc] back"),
+    "menu_run": ("Меню:  [P] пауза    [X] завершить сеанс    [B] назад", "Menu:  [P] pause    [X] end the session    [B] back"),
+    "menu_paused": ("Пауза.  [R] продолжить    [X] завершить сеанс    [B] назад", "Paused.  [R] continue    [X] end the session    [B] back"),
     "confirm_end": ("Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет", "End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no"),
     "st_paused": ("Пауза: помощник ждёт. Esc — меню", "Paused: the helper is waiting. Esc = menu"),
     "persist_q": ("Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]: ", "Keep this session through internet loss and reboots (the code stays the same)? [Y/n]: "),
@@ -892,9 +892,9 @@ def esc_menu(fd):
         if k == "x":
             print(c("1;30;43", "  " + t("confirm_end") + "  "), flush=True)
             k2 = key()
-            if k2 in ("y", "\n", "\r"): end_final(); return
+            if k2 == "y": end_final(); return
             print(c("2", "  …"), flush=True); return
-        if k in ("esc", "n", "\n", "\r"): return
+        if k in ("b", "\x7f", "\x08"): return   # back is [B]: Esc opens the menu, a second Esc must not close it
 
 
 def run_cmd(cmd, tmo=5):

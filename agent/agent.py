@@ -1450,7 +1450,7 @@ def util(a):
         dest = os.path.expanduser(a.get("dest") or os.path.splitext(path)[0])
         with zipfile.ZipFile(path) as z: z.extractall(dest)
         return {"text": "extracted to " + dest}
-    if op in ("reg_get", "reg_set", "reg_find", "crash", "recent", "ffind", "elevate", "shortcut"): raise RuntimeError(op + " is Windows only")
+    if op in ("reg_get", "reg_set", "reg_find", "crash", "recent", "ffind", "elevate", "browser", "bsod", "health", "shortcut"): raise RuntimeError(op + " is Windows only")
     raise RuntimeError("unknown op " + op)
 
 

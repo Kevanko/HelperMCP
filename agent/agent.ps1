@@ -2066,7 +2066,7 @@ function Do-FsOp($a) {
 }
 
 # ---- ready-made operations: right on the first try, no quoting
-$ReadOnlyUtil = 'apps', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
+$ReadOnlyUtil = 'apps', 'browser', 'bsod', 'health', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
 function Installed-Apps($q) {   # "name|version|publisher" from the uninstall keys (fast, no WMI Win32_Product)
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and (-not $q -or $_.DisplayName -like "*$q*" -or $_.PSChildName -like "*$q*") } |
@@ -2147,6 +2147,127 @@ function Reg-Find($root, $text, $what, $max) {   # keys / value names / data und
     ($(if ($r.Count) { $r } else { "nothing matches '$text' under $root" }) + $(if ($script:rfTimeout) { @('(stopped after 25 s: narrow the path)') } else { @() })) -join "`n"
 }
 function Test-Admin { ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
+function Browser-Report($max) {   # extensions per browser profile (what they may read, how big) and how much memory / CPU each kind of browser process takes; no deep scans, a few seconds
+    $out = @(); $hasAll = '<all_urls>', '*://*/*', 'http://*/*', 'https://*/*'
+    $roots = [ordered]@{ Chrome = "$env:LOCALAPPDATA\Google\Chrome\User Data"; Edge = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"; Brave = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"; Opera = "$env:APPDATA\Opera Software\Opera Stable"; Yandex = "$env:LOCALAPPDATA\Yandex\YandexBrowser\User Data" }
+    $rows = @()
+    foreach ($b in $roots.Keys) {
+        if (-not (Test-Path $roots[$b])) { continue }
+        $profs = @(Get-ChildItem $roots[$b] -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' }); if (-not $profs.Count -and (Test-Path "$($roots[$b])\Extensions")) { $profs = @(Get-Item $roots[$b]) }
+        foreach ($pr in $profs) {
+            $state = @{}; foreach ($pf in 'Secure Preferences', 'Preferences') { try { $j = Get-Content (Join-Path $pr.FullName $pf) -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json; foreach ($x in $j.extensions.settings.PSObject.Properties) { if ($null -ne $x.Value.state -and -not $state.ContainsKey($x.Name)) { $state[$x.Name] = $x.Value.state } } } catch { } }
+            foreach ($ed in Get-ChildItem (Join-Path $pr.FullName 'Extensions') -Directory -ErrorAction SilentlyContinue) {
+                $vd = Get-ChildItem $ed.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (-not $vd) { continue }
+                try { $m = Get-Content (Join-Path $vd.FullName 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { continue }
+                $nm = [string]$m.name
+                if ($nm -like '__MSG_*') { $key = $nm.Trim('_') -replace '^MSG_', ''; foreach ($loc in @($m.default_locale, 'ru', 'en', 'en_US') | Where-Object { $_ }) { $mf = Join-Path $vd.FullName "_locales\$loc\messages.json"; if (Test-Path $mf) { try { $ms = Get-Content $mf -Raw -Encoding UTF8 | ConvertFrom-Json; $hit = $ms.PSObject.Properties | Where-Object { $_.Name -ieq $key } | Select-Object -First 1; if ($hit) { $nm = [string]$hit.Value.message; break } } catch { } } } }
+                $perm = @($m.permissions) + @($m.host_permissions) + @($m.optional_host_permissions); $flags = @()
+                if (@($perm | Where-Object { $hasAll -contains $_ }).Count -or @($m.content_scripts | ForEach-Object { $_.matches } | Where-Object { $hasAll -contains $_ }).Count) { $flags += 'reads all sites' }
+                if ($perm -contains 'webRequest' -or $perm -contains 'webRequestBlocking') { $flags += 'sees every request' }
+                if ($m.background -or $perm -contains 'background') { $flags += 'background' }
+                if ($perm -contains 'clipboardRead') { $flags += 'clipboard' }
+                $mb = [math]::Round(((Get-ChildItem $vd.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum) / 1MB, 1)
+                $on = $state[$ed.Name]; $stt = if ($on -eq 0 -or $on -eq 5) { 'off' } else { 'on' }
+                $score = $(if ($stt -eq 'on') { 10 } else { 0 }) + $flags.Count * 2 + [math]::Min($mb, 20) / 4
+                $rows += [pscustomobject]@{ score = $score; line = "$b/$($pr.Name) [$stt] $(Cut $nm 40) v$($m.version) $mb MB" + $(if ($flags.Count) { ' - ' + ($flags -join ', ') } else { '' }) }
+            }
+        }
+    }
+    $ff = Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles'
+    if (Test-Path $ff) { foreach ($pr in Get-ChildItem $ff -Directory -ErrorAction SilentlyContinue) { try { $j = Get-Content (Join-Path $pr.FullName 'extensions.json') -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json; foreach ($ad in $j.addons | Where-Object { $_.type -eq 'extension' -and -not $_.location.StartsWith('app-') -and $_.location -ne 'app-system-defaults' }) { $rows += [pscustomobject]@{ score = $(if ($ad.active) { 10 } else { 0 }); line = "Firefox/$($pr.Name -replace '^.*\.', '') [$(if ($ad.active) { 'on' } else { 'off' })] $(Cut $ad.defaultLocale.name 40) v$($ad.version)" } } } catch { } } }
+    $r = @($rows | Sort-Object score -Descending | Select-Object -First $max)
+    $out += "== extensions ($($rows.Count) found; heaviest / most powerful first: enabled, reads all sites, size)"; $out += $(if ($r.Count) { $r.line } else { 'no browser extensions found' })
+    $out += ''; $out += '== browser processes'
+    $cim = @{}; foreach ($pc in Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe' OR Name='brave.exe' OR Name='opera.exe' OR Name='browser.exe' OR Name='firefox.exe'" -ErrorAction SilentlyContinue) { $cim[[int]$pc.ProcessId] = $pc.CommandLine }
+    $pr2 = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $cim.ContainsKey($_.Id) })
+    if (-not $pr2.Count) { $out += 'no browser is running' }
+    foreach ($g in ($pr2 | Group-Object ProcessName)) {
+        $kinds = $g.Group | Group-Object { $c = [string]$cim[$_.Id]; if ($c -match '--type=([\w-]+)') { $t = $Matches[1]; if ($c -match '--extension-process') { 'extension' } else { $t } } else { 'main' } }
+        $out += "$($g.Name): $($g.Count) processes, $([int](($g.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB)) MB; " + (($kinds | Sort-Object Count -Descending | ForEach-Object { "$($_.Name) x$($_.Count) $([int](($_.Group | Measure-Object WorkingSet64 -Sum).Sum / 1MB)) MB" }) -join ', ')
+        $out += '  biggest: ' + (($g.Group | Sort-Object WorkingSet64 -Descending | Select-Object -First 4 | ForEach-Object { $c = [string]$cim[$_.Id]; $k = if ($c -match '--type=([\w-]+)') { $Matches[1] } else { 'main' }; "pid $($_.Id) $k $([int]($_.WorkingSet64 / 1MB)) MB cpu $([int]$_.CPU)s" }) -join '; ')
+    }
+    $out += '(the exact CPU of one extension is only in the browser''s own task manager, Shift+Esc)'
+    $out -join "`n"
+}
+$BugNames = @{ 0x0A = 'IRQL_NOT_LESS_OR_EQUAL|a driver touched memory at too high a priority: usually a driver or RAM'; 0x18 = 'REFERENCE_BY_POINTER|a driver broke object counting'; 0x1A = 'MEMORY_MANAGEMENT|bad RAM or a driver: run Windows Memory Diagnostic'; 0x1E = 'KMODE_EXCEPTION_NOT_HANDLED|a driver crashed: look at the driver named in the dump'
+    0x24 = 'NTFS_FILE_SYSTEM|disk or file system errors: chkdsk, check the disk'; 0x3B = 'SYSTEM_SERVICE_EXCEPTION|a driver or a system call failed: graphics and antivirus drivers first'; 0x4E = 'PFN_LIST_CORRUPT|bad RAM or a driver'; 0x50 = 'PAGE_FAULT_IN_NONPAGED_AREA|bad RAM, a faulty driver or disk'
+    0x77 = 'KERNEL_STACK_INPAGE_ERROR|disk, cable or controller could not read memory from the pagefile'; 0x7A = 'KERNEL_DATA_INPAGE_ERROR|disk / cable / controller problem'; 0x7E = 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED|a driver crashed'; 0x7F = 'UNEXPECTED_KERNEL_MODE_TRAP|RAM, overheating, overclocking or a driver'
+    0x9C = 'MACHINE_CHECK_EXCEPTION|CPU / hardware error: overheating, overclocking, power'; 0x9F = 'DRIVER_POWER_STATE_FAILURE|a driver did not wake / sleep a device: USB, network, GPU drivers, power settings'; 0xA0 = 'INTERNAL_POWER_ERROR|power management'; 0xBE = 'ATTEMPTED_WRITE_TO_READONLY_MEMORY|a driver'
+    0xC2 = 'BAD_POOL_CALLER|a driver misused memory'; 0xC4 = 'DRIVER_VERIFIER_DETECTED_VIOLATION|Driver Verifier found a bad driver'; 0xC5 = 'DRIVER_CORRUPTED_EXPOOL|a driver damaged memory'; 0xCE = 'DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS|a driver'
+    0xD1 = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL|a driver (often network or graphics)'; 0xEA = 'THREAD_STUCK_IN_DEVICE_DRIVER|the graphics driver hung: update or clean-install it, check GPU temperature / overclock'; 0xEF = 'CRITICAL_PROCESS_DIED|a critical Windows process died: disk, drivers, corrupt system files (sfc /scannow)'; 0xF4 = 'CRITICAL_OBJECT_TERMINATION|a critical process or the disk is gone: check the disk and cables'
+    0xFC = 'ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY|a driver or RAM'; 0x101 = 'CLOCK_WATCHDOG_TIMEOUT|a CPU core did not answer: overclock, undervolt, BIOS, CPU'; 0x109 = 'CRITICAL_STRUCTURE_CORRUPTION|RAM, a driver or malware'; 0x116 = 'VIDEO_TDR_FAILURE|the graphics driver could not recover: driver, overclock, temperature, power supply'
+    0x117 = 'VIDEO_TDR_TIMEOUT_DETECTED|the graphics driver hung: driver, overclock, temperature'; 0x119 = 'VIDEO_SCHEDULER_INTERNAL_ERROR|graphics driver / GPU'; 0x124 = 'WHEA_UNCORRECTABLE_ERROR|a hardware error (CPU, RAM, GPU, PCIe): overclock, temperature, power; see the WHEA events'; 0x133 = 'DPC_WATCHDOG_VIOLATION|a driver or disk stalled the system (often an SSD / storage driver or firmware)'
+    0x139 = 'KERNEL_SECURITY_CHECK_FAILURE|a driver or RAM corrupted memory'; 0x13A = 'KERNEL_MODE_HEAP_CORRUPTION|a driver'; 0x154 = 'UNEXPECTED_STORE_EXCEPTION|SSD or its driver / firmware'; 0x1000007E = 'SYSTEM_THREAD_EXCEPTION_NOT_HANDLED_M|a driver crashed'; 0x1000007F = 'UNEXPECTED_KERNEL_MODE_TRAP_M|RAM / overheating / driver' }
+function Bsod-Report($days) {   # blue screens: the code and parameters read from the dump header, what they usually mean, what happened right before; the exact driver only when a debugger (cdb) is installed
+    $since = (Get-Date).AddDays(-$days); $out = @(); $files = @()
+    foreach ($d in 'C:\Windows\Minidump') { if (Test-Path $d) { $files += Get-ChildItem $d -File -Filter *.dmp -ErrorAction SilentlyContinue } }
+    if (Test-Path 'C:\Windows\MEMORY.DMP') { $files += Get-Item 'C:\Windows\MEMORY.DMP' }
+    $files = @($files | Where-Object { $_.LastWriteTime -gt $since } | Sort-Object LastWriteTime -Descending | Select-Object -First 6)
+    $bc = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; StartTime = $since } -ErrorAction SilentlyContinue | Select-Object -First 6)
+    $k41 = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 41; StartTime = $since } -ErrorAction SilentlyContinue | Select-Object -First 6)
+    if (-not $files.Count -and -not $bc.Count -and -not $k41.Count) { return "no blue screens, bugchecks or unexpected shutdowns in the last $days days" }
+    $cdb = (Get-Command cdb.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source); if (-not $cdb) { $cdb = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe', 'C:\Program Files\Windows Kits\10\Debuggers\x64\cdb.exe' -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName }
+    foreach ($f in $files) {
+        $b = New-Object byte[] 0x60; $fs = [IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite'); try { [void]$fs.Read($b, 0, 0x60) } finally { $fs.Close() }
+        $sig = [Text.Encoding]::ASCII.GetString($b, 0, 8)
+        $out += "== $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) $($f.FullName) ($([int]($f.Length / 1MB)) MB)"
+        if ($sig -ne 'PAGEDU64') { $out += "  not a 64-bit Windows dump header ($sig)"; continue }
+        $code = [BitConverter]::ToUInt32($b, 0x38); $p = 0..3 | ForEach-Object { '0x{0:X}' -f [BitConverter]::ToUInt64($b, 0x40 + 8 * $_) }
+        $e = $BugNames[[int]$code]; $nm, $why = if ($e) { $e -split '\|', 2 } else { 'unknown code', 'look the code up at learn.microsoft.com/windows-hardware/drivers/debugger/bug-check-code-reference2' }
+        $out += "  bugcheck 0x$('{0:X}' -f $code) $nm"; $out += "  meaning: $why"; $out += "  parameters: $($p -join ', ')"
+        if ($cdb -and $f.Length -lt 600MB) {
+            $o = & $cdb -z $f.FullName -c '!analyze -v; q' 2>&1 | Out-String; $keep = @($o -split "`r?`n" | Where-Object { $_ -match '^(MODULE_NAME|IMAGE_NAME|FAULTING_MODULE|PROCESS_NAME|FAILURE_BUCKET_ID|SYMBOL_NAME|STACK_COMMAND):' } | Select-Object -First 8)
+            if ($keep.Count) { $out += '  debugger says:'; $out += $keep | ForEach-Object { "    $_" } }
+        }
+    }
+    if (-not $cdb) { $out += ''; $out += 'driver name: no debugger (cdb) on this PC, so only the code is read; winget install Microsoft.WinDbg gives the exact driver' }
+    foreach ($e in ($bc | Select-Object -First 3)) { $out += ''; $out += "event $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')): " + (Cut ($e.Message -replace '\s+', ' ') 260) }
+    $t0 = if ($bc.Count) { $bc[0].TimeCreated } elseif ($k41.Count) { $k41[0].TimeCreated } else { $null }
+    if ($t0) {
+        $ids = @{ 'disk' = 'disk'; 'Ntfs' = 'file system'; 'stornvme' = 'NVMe'; 'storahci' = 'SATA'; 'nvlddmkm' = 'NVIDIA driver'; 'amdkmdap' = 'AMD driver'; 'Display' = 'display driver'; 'Microsoft-Windows-WHEA-Logger' = 'hardware error (WHEA)'; 'Microsoft-Windows-Kernel-Power' = 'power'; 'Microsoft-Windows-DriverFrameworks-UserMode' = 'user-mode driver' }
+        $pre = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2, 3; StartTime = $t0.AddMinutes(-15); EndTime = $t0.AddMinutes(1) } -MaxEvents 40 -ErrorAction SilentlyContinue | Where-Object { $ids.ContainsKey($_.ProviderName) -or $_.ProviderName -match 'volmgr|Kernel' } | Select-Object -First 10)
+        $out += ''; $out += "in the 15 minutes before ($($t0.ToString('HH:mm:ss'))): " + $(if ($pre.Count) { '' } else { 'nothing from disk, GPU, power or hardware (WHEA) sources' })
+        foreach ($e in $pre) { $out += "  $($e.TimeCreated.ToString('HH:mm:ss')) $($e.ProviderName) #$($e.Id): " + (Cut ($e.Message -replace '\s+', ' ') 150) }
+    }
+    $out -join "`n"
+}
+function Health-Report($what) {   # a quick health check, each part reads logs or counters (no scans): boot time, disks, heat and throttling, driver / update problems
+    $out = @(); $all = (-not $what -or $what -eq 'all')
+    if ($all -or $what -eq 'boot') {
+        $out += '== boot'
+        $lg = 'Microsoft-Windows-Diagnostics-Performance/Operational'
+        $bt = @(Get-WinEvent -FilterHashtable @{ LogName = $lg; Id = 100; StartTime = (Get-Date).AddDays(-14) } -MaxEvents 5 -ErrorAction SilentlyContinue)
+        if ($bt.Count) { foreach ($e in $bt) { $x = [xml]$e.ToXml(); $d = @{}; foreach ($n in $x.Event.EventData.Data) { $d[$n.Name] = $n.'#text' }; $out += "$($e.TimeCreated.ToString('yyyy-MM-dd HH:mm')) boot $([math]::Round([double]$d.BootTime / 1000, 1)) s (main path $([math]::Round([double]$d.MainPathBootTime / 1000, 1)) s, after login $([math]::Round([double]$d.BootPostBootTime / 1000, 1)) s)" } } else { $out += 'no boot-time events (the log is off or Windows was not restarted lately)' }
+        $sl = @(Get-WinEvent -FilterHashtable @{ LogName = $lg; Id = 101, 102, 103, 106; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 60 -ErrorAction SilentlyContinue | ForEach-Object { $x = [xml]$_.ToXml(); $d = @{}; foreach ($n in $x.Event.EventData.Data) { $d[$n.Name] = $n.'#text' }; [pscustomobject]@{ t = [double]$d.TotalTime; n = $(if ($d.FriendlyName) { $d.FriendlyName } elseif ($d.Name) { $d.Name } else { $d.FileName }); k = $(switch ($_.Id) { 101 { 'app' } 102 { 'driver' } 103 { 'service' } default { 'device' } }); when = $_.TimeCreated } })
+        if ($sl.Count) { $out += 'slowed the start the most (last 7 days):'; $out += $sl | Sort-Object t -Descending | Select-Object -First 8 | ForEach-Object { "  $($_.k) $($_.n): +$([math]::Round($_.t / 1000, 1)) s ($($_.when.ToString('MM-dd')))" } }
+    }
+    if ($all -or $what -eq 'disks') {
+        $out += ''; $out += '== disks'
+        foreach ($pd in Get-PhysicalDisk -ErrorAction SilentlyContinue) {
+            $rc = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+            $out += "$($pd.FriendlyName) $($pd.MediaType) $([int]($pd.Size / 1GB)) GB: health $($pd.HealthStatus)" + $(if ($rc) { (@(if ($null -ne $rc.Temperature) { "temp $($rc.Temperature) C" }; if ($null -ne $rc.Wear) { "wear $($rc.Wear)%" }; if ($null -ne $rc.PowerOnHours) { "power-on $($rc.PowerOnHours) h" }; if ($rc.ReadErrorsTotal) { "READ ERRORS $($rc.ReadErrorsTotal)" }; if ($rc.WriteErrorsTotal) { "WRITE ERRORS $($rc.WriteErrorsTotal)" }) | ForEach-Object { ', ' + $_ }) -join '' } else { ' (no SMART counters from this disk)' })
+        }
+        $de = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'disk', 'Ntfs', 'stornvme', 'storahci', 'volmgr'; Level = 1, 2, 3; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue)
+        $out += $(if ($de.Count) { 'disk errors, 14 days: ' + (($de | Group-Object { "$($_.ProviderName) #$($_.Id)" } | Sort-Object Count -Descending | Select-Object -First 6 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ') + ' (bad blocks / cable / controller / power)' } else { 'no disk or file-system errors in 14 days' })
+        foreach ($v in Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) { $out += "$($v.DriveLetter): $([int]($v.SizeRemaining / 1GB)) GB free of $([int]($v.Size / 1GB)) GB" + $(if ($v.Size -and $v.SizeRemaining / $v.Size -lt 0.1) { '  <- under 10% free' } else { '' }) }
+    }
+    if ($all -or $what -eq 'heat') {
+        $out += ''; $out += '== heat and throttling'
+        $cp = Get-CimInstance Win32_Processor | Select-Object -First 1; $out += "CPU $($cp.Name): now $($cp.CurrentClockSpeed) MHz of $($cp.MaxClockSpeed) MHz max, load $($cp.LoadPercentage)%"
+        try { $tz = @(Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -ErrorAction Stop); $out += 'ACPI thermal zones: ' + (($tz | ForEach-Object { [math]::Round($_.CurrentTemperature / 10 - 273.15) } ) -join ', ') + ' C (the board reports them; often not the CPU core)' } catch { $out += 'CPU temperature: Windows does not expose it on this board (needs a sensor program)' }
+        $nv = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+        if ($nv) { $o = & nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm,clocks_throttle_reasons.active --format=csv,noheader 2>&1; $out += "GPU: $o (throttle reasons: 0x0 = none, 0x4 = power, 0x8 = slowdown by heat / hardware, 0x20 = thermal)" }
+        $pw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = (Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue); $out += $(if ($pw.Count) { "the firmware limited the CPU speed $($pw.Count) times in 7 days (heat, power limit or battery saver)" } else { 'no CPU speed limits by the firmware in 7 days' })
+    }
+    if ($all -or $what -eq 'drivers') {
+        $out += ''; $out += '== drivers and updates'
+        $tdr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue); $out += $(if ($tdr.Count) { "the graphics driver stopped answering and was reset $($tdr.Count) times in 14 days (last $($tdr[0].TimeCreated.ToString('MM-dd HH:mm'))): driver, overclock, heat, power" } else { 'no graphics driver resets in 14 days' })
+        $bad = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Error' }); $out += $(if ($bad.Count) { 'devices with a problem: ' + (($bad | Select-Object -First 8 | ForEach-Object { "$($_.FriendlyName) ($($_.InstanceId.Split('\')[0]))" }) -join '; ') } else { 'no devices in the error state' })
+        $wu = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20; StartTime = (Get-Date).AddDays(-14) } -MaxEvents 5 -ErrorAction SilentlyContinue); $out += $(if ($wu.Count) { 'failed updates: ' + (($wu | ForEach-Object { Cut ($_.Message -replace '\s+', ' ') 110 }) -join ' | ') } else { 'no failed Windows updates in 14 days' })
+        $wh = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue); $out += $(if ($wh.Count) { "hardware errors (WHEA) $($wh.Count) times in 14 days: CPU / RAM / GPU / PCIe, check overclock and temperatures" } else { 'no hardware (WHEA) errors in 14 days' })
+    }
+    $out -join "`n"
+}
 function Do-Util($a) {
     $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
     switch ($op) {
@@ -2168,6 +2289,9 @@ function Do-Util($a) {
             Start-Process cmd.exe -WindowStyle Hidden -ArgumentList ('/c ping -n 6 127.0.0.1 >nul & taskkill /PID ' + $PID + ' /F')   # this helper steps aside once the elevated one has taken the session over
             return @{ text = 'the helper restarts as administrator and continues this session (about 5-10 s: wait_online, then sysinfo). If the admin account is another user, a new code is shown on the friend screen instead. After a reboot it starts normally again (not elevated).' }
         }
+        'browser' { return @{ text = (Browser-Report $(if ($a.max) { [int]$a.max } else { 25 })) } }
+        'bsod' { return @{ text = (Bsod-Report $(if ($val -match '^\d+$') { [int]$val } else { 60 })) } }
+        'health' { return @{ text = (Health-Report $name) } }
         'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
         { $_ -in 'install', 'uninstall' } {
             if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }

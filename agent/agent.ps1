@@ -2066,7 +2066,7 @@ function Do-FsOp($a) {
 }
 
 # ---- ready-made operations: right on the first try, no quoting
-$ReadOnlyUtil = 'apps', 'browser', 'bsod', 'health', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
+$ReadOnlyUtil = 'apps', 'threats', 'browser', 'bsod', 'health', 'crash', 'recent', 'reg_find', 'env_get', 'reg_get', 'clipboard_get', 'net_test', 'ports'
 function Installed-Apps($q) {   # "name|version|publisher" from the uninstall keys (fast, no WMI Win32_Product)
     $keys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     Get-ItemProperty $keys -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -and (-not $q -or $_.DisplayName -like "*$q*" -or $_.PSChildName -like "*$q*") } |
@@ -2268,6 +2268,61 @@ function Health-Report($what) {   # a quick health check, each part reads logs o
     } catch { $out += "  this part failed: $($_.Exception.Message) [$((([string]$_.InvocationInfo.Line).Trim() + ' ').Substring(0, 70).Trim())]" } }
     $out -join "`n"
 }
+function Threats-Report($days) {   # read-only, facts only: what the antivirus found, whether its protection was weakened, exclusions, who logged in from outside, what was installed lately; no guessing from file names
+    $since = (Get-Date).AddDays(-$days); $out = @(); $flags = 0; $admin = Test-Admin
+    $mark = { param($t) "! $t" }
+    $out += '== antivirus'
+    try {
+        $st = Get-MpComputerStatus -ErrorAction Stop
+        $out += "Defender: antivirus $(if ($st.AntivirusEnabled) { 'on' } else { 'OFF' }), real-time $(if ($st.RealTimeProtectionEnabled) { 'on' } else { 'OFF' }), behaviour monitor $(if ($st.BehaviorMonitorEnabled) { 'on' } else { 'OFF' }), tamper protection $(if ($st.IsTamperProtected) { 'on' } else { 'off' }); signatures from $($st.AntivirusSignatureLastUpdated.ToString('yyyy-MM-dd'))"
+        if (-not $st.RealTimeProtectionEnabled -or -not $st.AntivirusEnabled) { $out += (& $mark 'Defender protection is switched off (another antivirus may have taken over: see below)') }
+        if (((Get-Date) - $st.AntivirusSignatureLastUpdated).TotalDays -gt 7) { $out += (& $mark "virus signatures are $([int]((Get-Date) - $st.AntivirusSignatureLastUpdated).TotalDays) days old") }
+    } catch { $out += 'Defender: not readable (' + (Cut $_.Exception.Message 80) + ')' }
+    try { $av = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -ErrorAction Stop); $out += 'registered antivirus: ' + (($av | ForEach-Object { $_.displayName }) -join ', ') } catch { }
+    $out += ''; $out += "== what the antivirus found ($days days)"
+    try {
+        $th = @{}; foreach ($t in @(Get-MpThreat -ErrorAction SilentlyContinue)) { $th[[string]$t.ThreatID] = $t.ThreatName }
+        $det = @(Get-MpThreatDetection -ErrorAction Stop | Where-Object { $_.InitialDetectionTime -gt $since } | Sort-Object InitialDetectionTime -Descending | Select-Object -First 10)
+        if ($det.Count) { foreach ($d in $det) { $out += (& $mark "$($d.InitialDetectionTime.ToString('yyyy-MM-dd HH:mm')) $($th[[string]$d.ThreatID]) $(if ($d.ActionSuccess) { '(removed / quarantined)' } else { '(ACTION FAILED, still there?)' }) $(Cut (@($d.Resources) -join '; ') 160)") } } else { $out += 'nothing detected' }
+    } catch { $out += 'detection history: not readable (' + (Cut $_.Exception.Message 80) + ')' }
+    $ch = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 5001, 5010, 5012, 5007; StartTime = $since } -MaxEvents 80 -ErrorAction SilentlyContinue)
+    $off = @($ch | Where-Object { $_.Id -in 5001, 5010, 5012 }); $exc = @($ch | Where-Object { $_.Id -eq 5007 -and $_.Message -match 'Exclusions' })
+    if ($off.Count) { $out += (& $mark "protection was switched off $($off.Count) time(s), last $($off[0].TimeCreated.ToString('yyyy-MM-dd HH:mm')) (real-time / scanning)") }
+    if ($exc.Count) { $out += (& $mark "exclusions were changed $($exc.Count) time(s), last $($exc[0].TimeCreated.ToString('yyyy-MM-dd HH:mm')): " + (Cut (($exc[0].Message -replace '\s+', ' ')) 200)) }
+    $out += ''; $out += '== exclusions (what the antivirus does not look at)'
+    try {
+        $mp = Get-MpPreference -ErrorAction Stop; $items = @(); foreach ($k in 'ExclusionPath', 'ExclusionProcess', 'ExclusionExtension') { foreach ($v in @($mp.$k)) { if ($v -and $v -notmatch 'Must be an administrator') { $items += [pscustomobject]@{ k = $k -replace '^Exclusion', ''; v = [string]$v } } } }
+        if ($mp.ExclusionPath -and "$($mp.ExclusionPath)" -match 'Must be an administrator') { $out += 'needs administrator to read (util elevate)' }
+        elseif (-not $items.Count) { $out += 'none' }
+        else { foreach ($i in $items | Select-Object -First 25) { $risky = $i.k -eq 'Path' -and ($i.v -match '^[A-Za-z]:\\?$' -or $i.v -match '\\(Temp|Downloads|AppData(\\Roaming|\\Local)?)\\?$' -or $i.v -match '^[A-Za-z]:\\Users\\[^\\]+\\?$' -or $i.v -match '^[A-Za-z]:\\Windows\\?$') -or ($i.k -eq 'Extension' -and $i.v -match '^\.?(exe|dll|ps1|bat|scr)$'); $out += $(if ($risky) { & $mark "$($i.k): $($i.v)  (very wide: anything dropped there is never scanned)" } else { "$($i.k): $($i.v)" }) } }
+    } catch { $out += 'not readable (' + (Cut $_.Exception.Message 80) + ')' }
+    $out += ''; $out += "== logins from outside ($days days)"
+    $rdp = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue).fDenyTSConnections
+    $out += "Remote Desktop: $(if ($rdp -eq 0) { 'ENABLED' } else { 'off' })"; if ($rdp -eq 0) { $out += (& $mark 'Remote Desktop is enabled: make sure that is intended') }
+    if (-not $admin) { $out += 'the security log needs administrator to read (util elevate)' }
+    else {
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = @{}; $bad = @{}; $n = 0
+        foreach ($e in Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4624, 4625; StartTime = $since } -MaxEvents 2500 -ErrorAction SilentlyContinue) {
+            if ($sw.Elapsed.TotalSeconds -gt 12) { break }; $n++
+            $x = [xml]$e.ToXml(); $d = @{}; foreach ($q in $x.Event.EventData.Data) { $d[$q.Name] = $q.'#text' }
+            $ip = [string]$d.IpAddress; if (-not $ip -or $ip -in '-', '::1', '127.0.0.1') { if ($e.Id -eq 4624 -and $d.LogonType -ne '10') { continue } }
+            if ($e.Id -eq 4625) { $bad["$ip $($d.TargetUserName)"]++ } elseif ($d.LogonType -in '3', '10') { $key = "type $($d.LogonType) $ip $($d.TargetUserName)"; $ok[$key] = $e.TimeCreated }
+        }
+        $pub = { param($ip) $ip -and $ip -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|fe80|fc|fd|::1|127\.|-)' }
+        if ($ok.Count) { foreach ($k in $ok.Keys | Select-Object -First 8) { $ip = ($k -split ' ')[2]; $line = "login $k, last $($ok[$k].ToString('MM-dd HH:mm'))"; $out += $(if (& $pub $ip) { & $mark "$line  (from the internet)" } elseif ($k -match '^type 10') { & $mark "$line  (remote desktop)" } else { $line }) } } else { $out += 'no remote or network logins' }
+        if ($bad.Count) { $tot = ($bad.Values | Measure-Object -Sum).Sum; $out += $(if ($tot -ge 20) { & $mark "$tot failed logins (password guessing?): " + (($bad.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 4 | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ') } else { "$tot failed logins: " + (($bad.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 4 | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ') }) }
+        $out += "(read $n log records in $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s)"
+    }
+    $out += ''; $out += "== installed lately ($days days)"
+    $seen = @{}; $sv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7045; StartTime = $since } -MaxEvents 80 -ErrorAction SilentlyContinue | ForEach-Object { $x = [xml]$_.ToXml(); $d = @{}; foreach ($q in $x.Event.EventData.Data) { $d[$q.Name] = $q.'#text' }; if (-not $seen[$d.ServiceName]) { $seen[$d.ServiceName] = 1; "$($_.TimeCreated.ToString('MM-dd HH:mm')) service $($d.ServiceName): $(Cut $d.ImagePath 120)" } })
+    $out += $(if ($sv.Count) { $sv } else { 'no new services' })
+    $tk = @(Get-ChildItem 'C:\Windows\System32\Tasks' -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.CreationTime -gt $since -and $_.FullName -notmatch '\\Tasks\\Microsoft\\' } | Sort-Object CreationTime -Descending | Select-Object -First 12 | ForEach-Object { "$($_.CreationTime.ToString('MM-dd HH:mm')) task $($_.FullName.Substring(25))" })
+    $out += $(if ($tk.Count) { $tk } else { 'no new scheduled tasks outside Microsoft''s own' })
+    $su = @(foreach ($d in "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup", "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp") { Get-ChildItem $d -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $since -and $_.Name -ne 'desktop.ini' } | ForEach-Object { "$($_.LastWriteTime.ToString('MM-dd HH:mm')) startup folder: $($_.FullName)" } })
+    if ($su.Count) { $out += $su }
+    $flags = @($out | Where-Object { $_ -like '! *' }).Count; $out = @("== verdict: $flags item(s) marked ! to look at (only facts the system itself reports, nothing is guessed from a file name; a detection on a command line can also be a false alarm)") + $out
+    $out -join "`n"
+}
 function Do-Util($a) {
     $op = [string]$a.op; $name = [string]$a.name; $val = [string]$a.value; $p = [string]$a.path
     switch ($op) {
@@ -2292,6 +2347,7 @@ function Do-Util($a) {
         'browser' { return @{ text = (Browser-Report $(if ($a.max) { [int]$a.max } else { 25 })) } }
         'bsod' { return @{ text = (Bsod-Report $(if ($val -match '^\d+$') { [int]$val } else { 60 })) } }
         'health' { return @{ text = (Health-Report $name) } }
+        'threats' { return @{ text = (Threats-Report $(if ($val -match '^\d+$') { [int]$val } else { 14 })) } }
         'apps' { $L = @(Installed-Apps $name); return @{ text = $(if ($L.Count) { ($L | Select-Object -First 60) -join "`n" } else { "no installed program matches '$name'" }) } }
         { $_ -in 'install', 'uninstall' } {
             if (-not (Resolve-Exe 'winget')) { throw "'winget' is not recognized: winget is missing on this PC" }

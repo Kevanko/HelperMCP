@@ -194,6 +194,7 @@ if (useps) {   // registry search, crash report, run history (Windows only)
   assert.match(txt(await tool('util', { session: code, op: 'browser' })), /== extensions[\s\S]*== browser processes/);
   assert.match(txt(await tool('util', { session: code, op: 'bsod', value: '1' })), /bugcheck 0x|no blue screens/);
   const hl = txt(await tool('util', { session: code, op: 'health' })); for (const h of ['== boot', '== disks', '== heat and throttling', '== drivers and updates']) assert.ok(hl.includes(h), 'health has ' + h + ': ' + hl.slice(0, 300));
+  const thr = txt(await tool('util', { session: code, op: 'threats', value: '1' })); for (const h of ['== verdict', '== antivirus', '== exclusions', '== installed lately']) assert.ok(thr.includes(h), 'threats has ' + h + ': ' + thr.slice(0, 300));
   console.log('reg_find / crash / recent / ffind ok' + (/needs administrator/.test(ff) ? ' (not administrator: ffind refused)' : ''));
 }
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);

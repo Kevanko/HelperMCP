@@ -920,8 +920,8 @@ namespace F__BUILD__ {
       if (tell) Emit("route", why + ": " + (oc != null ? oc.Name : "?") + " -> " + c.Name);
     }
 
-    // The live picture is an upload: the route that merely answers /health may be the slowest one (a VPN, a congested Wi-Fi). While someone watches, every 45 s the upload speed of
-    // the best few routes is measured and the stream moves to one that is clearly faster (1.6x and 3 Mbit/s more). ponytail: the current route is measured while the stream itself uses it, so it reads low: the margin covers that
+    // The live picture is an upload: the route that merely answers /health may be the slowest one (a VPN, a congested Wi-Fi). While someone watches, every 2 minutes the upload speed of
+    // the best three routes is measured (silently: the numbers are only in the network report, a line appears when the stream moves) and the stream moves to one that is clearly faster (1.6x and 3 Mbit/s more). ponytail: the current route is measured while the stream itself uses it, so it reads low: the margin covers that
     public static volatile bool Streaming; public static string Token = ""; static DateTime lastOpt = DateTime.MinValue; public static string LastSpeeds = "";
     static double Speed(Cand c, int bytes) {   // upload Mbit/s through this route, -1 when it fails
       try {
@@ -942,14 +942,13 @@ namespace F__BUILD__ {
     static string speedErr = "";
     public static string Optimize(bool apply) {
       var ord = Order(); var c = curC; if (c == null || ord.Count == 0) return "";
-      var l = new List<Cand>(); foreach (var o in ord) { if (l.Count < 5) l.Add(o); } if (!l.Exists(x => x.Key == c.Key)) l.Add(c);
+      var l = new List<Cand>(); foreach (var o in ord) { if (l.Count < 3) l.Add(o); } if (!l.Exists(x => x.Key == c.Key)) l.Add(c);
       var sp2 = new double[l.Count]; var sb = new StringBuilder(); int ci = -1;
       for (int i = 0; i < l.Count; i++) { sp2[i] = Speed(l[i], 393216); if (l[i].Key == c.Key) ci = i; sb.Append(l[i].Name).Append(sp2[i] > 0 ? ": " + sp2[i].ToString("0.0") + " Mbit/s; " : ": FAIL (" + speedErr + "); "); }
       LastSpeeds = sb.ToString();
       int best = -1; for (int i = 0; i < l.Count; i++) if (sp2[i] > 0 && (best < 0 || sp2[i] > sp2[best])) best = i;
       double cs = ci >= 0 && sp2[ci] > 0 ? sp2[ci] : 0;
       if (apply && best >= 0 && best != ci && sp2[best] >= cs * 1.6 && sp2[best] - cs >= 3) Switch(l[best], "faster route (" + sp2[best].ToString("0.0") + " vs " + cs.ToString("0.0") + " Mbit/s upload)", true);
-      else if (apply) Emit("route", "upload speed: " + LastSpeeds);
       return LastSpeeds;
     }
 
@@ -957,7 +956,7 @@ namespace F__BUILD__ {
       DateTime better = DateTime.UtcNow; DateTime failTold = DateTime.MinValue;
       while (true) {
         wake.WaitOne(4000);
-        if (Streaming && (DateTime.UtcNow - lastOpt).TotalSeconds > 45) { lastOpt = DateTime.UtcNow; try { Optimize(true); } catch { } }
+        if (Streaming && (DateTime.UtcNow - lastOpt).TotalSeconds > 120) { lastOpt = DateTime.UtcNow; try { Optimize(true); } catch { } }
         bool f = forced; forced = false;
         if (!f && (DateTime.UtcNow - lastOk).TotalSeconds < 4) continue;
         var c = curC;
@@ -3593,8 +3592,8 @@ function Start-Helper {
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); $script:FinalEnd = $true; return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
-                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
-                            [K__BUILD__.Keys]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
+                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
+                            [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }
                     }

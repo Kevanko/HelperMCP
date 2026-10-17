@@ -1531,7 +1531,7 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
 function Do-TaskDone($a) {
     $script:Phase = 'done'; Overlay-Send 'state done'
-    if ($script:Persist) { try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }; Write-AgentLog 'task done: autostart removed (a reboot will not bring the console back)' }   # a finished job should not reappear after the PC restarts; a new command re-arms it (below)
+    if ($script:Persist) { try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }; try { if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue } } catch { }; Write-AgentLog 'task done: autostart removed (a reboot will not bring the console back)' }   # a finished job should not reappear after the PC restarts; a new command re-arms it (below)
     Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' }
 }
 function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
@@ -2941,7 +2941,19 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
         [void](New-Item $StateDir -ItemType Directory -Force)
         $f = Join-Path $StateDir 'agent.ps1'
         [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))   # the one-liner runs from memory: keep a copy
-        Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $f + '"')
+        $cmd = '-NoProfile -ExecutionPolicy Bypass -File "' + $f + '"'
+        $tcmd = '/c if exist "' + $SessionFile + '" powershell.exe ' + $cmd   # the task only starts the helper while a kept session exists (a task made as administrator cannot be removed by a normal helper)
+        if (Test-Admin) {   # started as administrator: from now on it also starts as administrator at logon (a task with the highest rights; the Run entry would start it twice, so it goes)
+            try {
+                $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                Register-ScheduledTask -TaskName 'HelperMCP' -Force -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $tcmd) -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) `
+                    -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest) `
+                    -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)) | Out-Null
+                Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
+                Write-AgentLog 'autostart installed (logon task, administrator)'; return
+            } catch { Write-AgentLog "logon task failed, using the Run entry: $_" }
+        } elseif (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Write-AgentLog 'autostart: the administrator logon task is already there'; return }
+        Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe ' + $cmd)
         try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }   # Task Manager's "Startup apps" switch would otherwise keep it off after a reboot
         Write-AgentLog 'autostart installed'
     } catch { Write-AgentLog "autostart failed: $_" }
@@ -2949,6 +2961,7 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
 function Forget-Session {
     foreach ($f in $SessionFile, (Join-Path $StateDir 'agent.ps1')) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
     try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }
+    try { if (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction Stop } } catch { Write-AgentLog "cannot remove the logon task (needs administrator): $_" }
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }

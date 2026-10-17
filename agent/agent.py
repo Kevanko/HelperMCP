@@ -389,6 +389,42 @@ def _ui_c(n): return int(n["x"] + n["w"] / 2), int(n["y"] + n["h"] / 2)
 def _ui_sc(cx, cy): return int((cx - ORIGIN[0]) / SCALE), int((cy - ORIGIN[1]) / SCALE)   # real pixels -> screenshot pixels
 
 
+def _ui_ocr(rect):
+    """the text of a window that shows no controls (a game, a self-drawn window), read from its picture by tesseract when it is installed: lines {t, x, y, w, h} in real pixels"""
+    exe = shutil.which("tesseract")
+    if not exe: raise RuntimeError("OCR needs tesseract (sudo apt install tesseract-ocr); until then use screenshot.")
+    import gi; gi.require_version("GdkPixbuf", "2.0"); from gi.repository import GdkPixbuf
+    d = tempfile.mkdtemp()
+    try:
+        pb = GdkPixbuf.Pixbuf.new_from_file(capture_file(d)); x, y, w, h = rect
+        x, y = max(0, x), max(0, y); w, h = min(w, pb.get_width() - x), min(h, pb.get_height() - y)
+        if w < 8 or h < 8: return []
+        png = os.path.join(d, "w.png"); pb.new_subpixbuf(x, y, w, h).savev(png, "png", [], [])
+        out = subprocess.run([exe, png, "stdout", "--psm", "11", "tsv"], capture_output=True, text=True, timeout=60).stdout
+    finally: shutil.rmtree(d, ignore_errors=True)
+    lines = {}
+    for ln in out.splitlines()[1:]:
+        c = ln.split("\t")
+        if len(c) < 12 or not c[11].strip() or float(c[10]) < 30: continue
+        l, t, wd, ht = int(c[6]), int(c[7]), int(c[8]), int(c[9])
+        o = lines.setdefault(tuple(c[2:5]), {"w": [], "x0": l, "y0": t, "x1": l + wd, "y1": t + ht})
+        o["w"].append(c[11]); o["x0"] = min(o["x0"], l); o["y0"] = min(o["y0"], t); o["x1"] = max(o["x1"], l + wd); o["y1"] = max(o["y1"], t + ht)
+    return [{"t": " ".join(o["w"]), "x": x + o["x0"], "y": y + o["y0"], "w": o["x1"] - o["x0"], "h": o["y1"] - o["y0"]} for o in lines.values()]
+
+
+def _ui_rect(w):
+    r = w.get_component_iface().get_extents(0)   # 0 = screen coordinates
+    return r.x, r.y, r.width, r.height
+
+
+def _ui_ocr_find(At, name, window):
+    w, an, title = _ui_window(At, window); o = _ui_ocr(_ui_rect(w)); low = name.lower()
+    hit = [l for l in o if l["t"].strip().lower() == low] or [l for l in o if low in l["t"].lower()]
+    if not hit: return None
+    if len(hit) > 1: raise RuntimeError(f"Several texts on the screen match '{name}': " + "; ".join(f'"{cut(l["t"], 40)}" at ' + "%d,%d" % _ui_sc(l["x"] + l["w"] // 2, l["y"] + l["h"] // 2) for l in hit[:6]) + ". Use click {x,y} on the one you mean.")
+    return hit[0]
+
+
 def ui_tree(a):
     At = _atspi(); w, an, title = _ui_window(At, a.get("window")); nodes = _ui_walk(At, w)
     UI["cache"] = []; mx = int(a.get("max") or 120); q = (a.get("query") or "").lower(); allv = bool(a.get("all"))
@@ -400,8 +436,15 @@ def ui_tree(a):
         if shown >= mx: continue
         shown += 1; UI["cache"].append(n["acc"]); sx, sy = _ui_sc(*_ui_c(n))
         lines.append(f'{shown} {n["type"]}' + (f' "{cut(n["name"], 70)}"' if n["name"] else "") + (f' ="{cut(n["val"], 60)}"' if n["val"] else "") + f" @{sx},{sy}" + "".join(" " + f for f in n["flags"]))
-    if not shown:
-        return {"text": "\n".join(lines) + "\nnothing readable here" + (" (this window exposes no controls: a game, a custom-drawn app, or accessibility is off for it)" if len(nodes) <= 1 else f" matches '{q}'") + ": use screenshot."}
+    if not shown or (a.get("ocr") and not q):
+        empty = not shown and not q
+        head = "\n".join(lines) + ("\nnothing readable here" + (" (this window exposes no controls: a game, a custom-drawn app, or accessibility is off for it)" if empty else f" matches '{q}'") if not shown else "")
+        if empty or a.get("ocr"):
+            try:
+                o = _ui_ocr(_ui_rect(w))
+                return {"text": head + ("\ntext read from the picture (OCR; click {x,y} or ui_click {name:\"text\"} presses it):\n" + "\n".join('ocr "%s" @%d,%d' % (cut(l["t"], 70), *_ui_sc(l["x"] + l["w"] // 2, l["y"] + l["h"] // 2)) for l in o[:mx]) if o else "\nOCR found no text either: use screenshot.")}
+            except Exception as e: return {"text": head + "\n" + str(e)}
+        return {"text": head + ": use screenshot."}
     if total > shown: lines.append(f"... {total - shown} more (use query or max)")
     return {"text": "\n".join(lines)}
 
@@ -447,7 +490,18 @@ def _ui_do(acc):
 
 
 def ui_click(a):
-    At = _atspi(); d, n = _ui_pick(At, a, a.get("type")); sx, sy = _ui_sc(*_ui_c(n))
+    At = _atspi()
+    try: d, n = _ui_pick(At, a, a.get("type"))
+    except RuntimeError as e:
+        if not str(e).startswith("No control named") or a.get("id"): raise
+        try: o = _ui_ocr_find(At, a["name"], a.get("window"))
+        except RuntimeError as e2:
+            if str(e2).startswith("Several texts"): raise
+            o = None
+        if not o: raise
+        sx, sy = _ui_sc(o["x"] + o["w"] // 2, o["y"] + o["h"] // 2)
+        return {"text": f"no control of that name, but the text '{o['t']}' is on the screen (OCR): clicked it; " + click({"x": sx, "y": sy, "button": "right" if a.get("right") else "left", "double": bool(a.get("double"))})["text"]}
+    sx, sy = _ui_sc(*_ui_c(n))
     if a.get("right") or a.get("double"): return {"text": f"{d}: " + click({"x": sx, "y": sy, "button": "right" if a.get("right") else "left", "double": bool(a.get("double"))})["text"]}
     if not n["enabled"]: raise RuntimeError("the control is disabled")
     overlay_send("active"); glide(sx, sy); overlay_send(f"click {sx} {sy} left")

@@ -2233,15 +2233,15 @@ function Bsod-Report($days) {   # blue screens: the code and parameters read fro
 }
 function Health-Report($what) {   # a quick health check, each part reads logs or counters (no scans): boot time, disks, heat and throttling, driver / update problems
     $out = @(); $all = (-not $what -or $what -eq 'all')
-    if ($all -or $what -eq 'boot') {
+    if ($all -or $what -eq 'boot') { try {
         $out += '== boot'
         $lg = 'Microsoft-Windows-Diagnostics-Performance/Operational'
         $bt = @(Get-WinEvent -FilterHashtable @{ LogName = $lg; Id = 100; StartTime = (Get-Date).AddDays(-14) } -MaxEvents 5 -ErrorAction SilentlyContinue)
         if ($bt.Count) { foreach ($e in $bt) { $x = [xml]$e.ToXml(); $d = @{}; foreach ($n in $x.Event.EventData.Data) { $d[$n.Name] = $n.'#text' }; $out += "$($e.TimeCreated.ToString('yyyy-MM-dd HH:mm')) boot $([math]::Round([double]$d.BootTime / 1000, 1)) s (main path $([math]::Round([double]$d.MainPathBootTime / 1000, 1)) s, after login $([math]::Round([double]$d.BootPostBootTime / 1000, 1)) s)" } } else { $out += 'no boot-time events (the log is off or Windows was not restarted lately)' }
         $sl = @(Get-WinEvent -FilterHashtable @{ LogName = $lg; Id = 101, 102, 103, 106; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 60 -ErrorAction SilentlyContinue | ForEach-Object { $x = [xml]$_.ToXml(); $d = @{}; foreach ($n in $x.Event.EventData.Data) { $d[$n.Name] = $n.'#text' }; [pscustomobject]@{ t = [double]$d.TotalTime; n = $(if ($d.FriendlyName) { $d.FriendlyName } elseif ($d.Name) { $d.Name } else { $d.FileName }); k = $(switch ($_.Id) { 101 { 'app' } 102 { 'driver' } 103 { 'service' } default { 'device' } }); when = $_.TimeCreated } })
         if ($sl.Count) { $out += 'slowed the start the most (last 7 days):'; $out += $sl | Sort-Object t -Descending | Select-Object -First 8 | ForEach-Object { "  $($_.k) $($_.n): +$([math]::Round($_.t / 1000, 1)) s ($($_.when.ToString('MM-dd')))" } }
-    }
-    if ($all -or $what -eq 'disks') {
+    } catch { $out += "  this part failed: $($_.Exception.Message) [$((([string]$_.InvocationInfo.Line).Trim() + ' ').Substring(0, 70).Trim())]" } }
+    if ($all -or $what -eq 'disks') { try {
         $out += ''; $out += '== disks'
         foreach ($pd in Get-PhysicalDisk -ErrorAction SilentlyContinue) {
             $rc = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
@@ -2250,22 +2250,22 @@ function Health-Report($what) {   # a quick health check, each part reads logs o
         $de = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'disk', 'Ntfs', 'stornvme', 'storahci', 'volmgr'; Level = 1, 2, 3; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue)
         $out += $(if ($de.Count) { 'disk errors, 14 days: ' + (($de | Group-Object { "$($_.ProviderName) #$($_.Id)" } | Sort-Object Count -Descending | Select-Object -First 6 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ') + ' (bad blocks / cable / controller / power)' } else { 'no disk or file-system errors in 14 days' })
         foreach ($v in Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' }) { $out += "$($v.DriveLetter): $([int]($v.SizeRemaining / 1GB)) GB free of $([int]($v.Size / 1GB)) GB" + $(if ($v.Size -and $v.SizeRemaining / $v.Size -lt 0.1) { '  <- under 10% free' } else { '' }) }
-    }
-    if ($all -or $what -eq 'heat') {
+    } catch { $out += "  this part failed: $($_.Exception.Message) [$((([string]$_.InvocationInfo.Line).Trim() + ' ').Substring(0, 70).Trim())]" } }
+    if ($all -or $what -eq 'heat') { try {
         $out += ''; $out += '== heat and throttling'
         $cp = Get-CimInstance Win32_Processor | Select-Object -First 1; $out += "CPU $($cp.Name): now $($cp.CurrentClockSpeed) MHz of $($cp.MaxClockSpeed) MHz max, load $($cp.LoadPercentage)%"
         try { $tz = @(Get-CimInstance -Namespace root/wmi MSAcpi_ThermalZoneTemperature -ErrorAction Stop); $out += 'ACPI thermal zones: ' + (($tz | ForEach-Object { [math]::Round($_.CurrentTemperature / 10 - 273.15) } ) -join ', ') + ' C (the board reports them; often not the CPU core)' } catch { $out += 'CPU temperature: Windows does not expose it on this board (needs a sensor program)' }
         $nv = Get-Command nvidia-smi -ErrorAction SilentlyContinue
         if ($nv) { $o = & nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm,clocks_throttle_reasons.active --format=csv,noheader 2>&1; $out += "GPU: $o (throttle reasons: 0x0 = none, 0x4 = power, 0x8 = slowdown by heat / hardware, 0x20 = thermal)" }
         $pw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Kernel-Processor-Power'; Id = 37; StartTime = (Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue); $out += $(if ($pw.Count) { "the firmware limited the CPU speed $($pw.Count) times in 7 days (heat, power limit or battery saver)" } else { 'no CPU speed limits by the firmware in 7 days' })
-    }
-    if ($all -or $what -eq 'drivers') {
+    } catch { $out += "  this part failed: $($_.Exception.Message) [$((([string]$_.InvocationInfo.Line).Trim() + ' ').Substring(0, 70).Trim())]" } }
+    if ($all -or $what -eq 'drivers') { try {
         $out += ''; $out += '== drivers and updates'
         $tdr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Display'; Id = 4101; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue); $out += $(if ($tdr.Count) { "the graphics driver stopped answering and was reset $($tdr.Count) times in 14 days (last $($tdr[0].TimeCreated.ToString('MM-dd HH:mm'))): driver, overclock, heat, power" } else { 'no graphics driver resets in 14 days' })
         $bad = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Error' }); $out += $(if ($bad.Count) { 'devices with a problem: ' + (($bad | Select-Object -First 8 | ForEach-Object { "$($_.FriendlyName) ($($_.InstanceId.Split('\')[0]))" }) -join '; ') } else { 'no devices in the error state' })
         $wu = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20; StartTime = (Get-Date).AddDays(-14) } -MaxEvents 5 -ErrorAction SilentlyContinue); $out += $(if ($wu.Count) { 'failed updates: ' + (($wu | ForEach-Object { Cut ($_.Message -replace '\s+', ' ') 110 }) -join ' | ') } else { 'no failed Windows updates in 14 days' })
         $wh = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue); $out += $(if ($wh.Count) { "hardware errors (WHEA) $($wh.Count) times in 14 days: CPU / RAM / GPU / PCIe, check overclock and temperatures" } else { 'no hardware (WHEA) errors in 14 days' })
-    }
+    } catch { $out += "  this part failed: $($_.Exception.Message) [$((([string]$_.InvocationInfo.Line).Trim() + ' ').Substring(0, 70).Trim())]" } }
     $out -join "`n"
 }
 function Do-Util($a) {

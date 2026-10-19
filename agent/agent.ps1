@@ -902,7 +902,18 @@ namespace F__BUILD__ {
         rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using (var r = (HttpWebResponse)rq.GetResponse()) return (int)r.StatusCode == 200 ? (int)Math.Max(1, sw.ElapsedMilliseconds) : -1;
-      } catch { return -1; }
+      } catch (Exception e) { lock (why) why[c.Key] = Reason(e); return -1; }
+    }
+    static readonly Dictionary<string, string> why = new Dictionary<string, string>();   // why the last probe of a route failed: "no route" alone tells nobody what to fix
+    static string Reason(Exception e) {
+      var we = e as WebException; if (we == null) return e.GetType().Name;
+      string st = we.Status.ToString(); var se = we.InnerException as SocketException; if (se == null && we.InnerException != null) se = we.InnerException.InnerException as SocketException;
+      if (we.Response != null) st = "HTTP " + (int)((HttpWebResponse)we.Response).StatusCode;
+      return se != null ? st + "/" + se.SocketErrorCode : st;
+    }
+    static string Port443() {   // is the same host reachable on 443 (the VPN port)? tells "the internet is down" from "only this port is filtered"
+      try { var ip = Dns.GetHostAddresses(host); var t = new TcpClient(ip[0].AddressFamily); var ar = t.BeginConnect(ip[0], 443, null, null); bool ok = ar.AsyncWaitHandle.WaitOne(3000) && t.Connected; try { t.Close(); } catch { } return "port 443 of " + ip[0] + (ok ? " reachable" : " NOT reachable"); }
+      catch (Exception e) { return "port 443: " + Reason(e); }
     }
 
     static int[] ProbeAll(List<Cand> l, int ms) {
@@ -969,7 +980,7 @@ namespace F__BUILD__ {
           var ord = Order(); var res = ProbeAll(ord, 4000); Cand pick = null;
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
           if (pick != null) Switch(pick, "relay unreachable", true);
-          else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) sb.Append(ord[i].Name).Append(" FAIL; "); Emit("route", "no route reaches the relay: " + sb); }
+          else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) { string w; lock (why) why.TryGetValue(ord[i].Key, out w); sb.Append(ord[i].Name).Append(" FAIL").Append(w != null ? " (" + w + ")" : "").Append("; "); } Emit("route", "no route reaches the relay: " + sb + Port443()); }
         } catch (Exception e) { Emit("route", "route check failed: " + e.Message); }
       }
     }

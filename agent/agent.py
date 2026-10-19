@@ -574,8 +574,27 @@ KEYS = {"enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escap
         "left": "Left", "right": "Right", "up": "Up", "down": "Down", "insert": "Insert"}
 
 
+MODS.update({"lshift": "Shift_L", "rshift": "Shift_R", "lctrl": "Control_L", "rctrl": "Control_R", "lalt": "Alt_L", "ralt": "Alt_R", "altgr": "ISO_Level3_Shift",
+             "lwin": "Super_L", "rwin": "Super_R"})
+KEYS.update({"capslock": "Caps_Lock", "caps": "Caps_Lock", "numlock": "Num_Lock", "scrolllock": "Scroll_Lock", "printscreen": "Print", "prtsc": "Print",
+             "pause": "Pause", "menu": "Menu", "apps": "Menu", "ins": "Insert", "volumeup": "XF86AudioRaiseVolume", "volumedown": "XF86AudioLowerVolume", "mute": "XF86AudioMute",
+             "multiply": "KP_Multiply", "add": "KP_Add", "subtract": "KP_Subtract", "decimal": "KP_Decimal", "divide": "KP_Divide"})
+KEYS.update({f"num{i}": f"KP_{i}" for i in range(10)}); KEYS.update({f"numpad{i}": f"KP_{i}" for i in range(10)})
+KEYS.update({";": "semicolon", "=": "equal", ",": "comma", "-": "minus", ".": "period", "/": "slash", "[": "bracketleft", "\\": "backslash", "]": "bracketright", "'": "apostrophe", "`": "grave"})
+
+
+def _norm_key(name):   # "RShift", "shift_right", "Right-Shift", "RShiftKey" name the same key
+    k = re.sub(r"[\s_\-]", "", name.lower()) if len(name) > 1 else name.lower()
+    if len(k) > 3 and k.endswith("key"): k = k[:-3]
+    m = re.fullmatch(r"(shift|ctrl|control|alt|win|windows)(left|right)", k) or re.fullmatch(r"(left|right)(shift|ctrl|control|alt|win|windows)", k)
+    if m:
+        g = m.groups(); side, base = (g[1], g[0]) if g[1] in ("left", "right") else (g[0], g[1])
+        base = {"control": "ctrl", "windows": "win"}.get(base, base); return ("r" if side == "right" else "l") + base
+    return k
+
+
 def keysym(name):
-    X = xlib(); n = MODS.get(name.lower()) or KEYS.get(name.lower()) or name
+    X = xlib(); name = _norm_key(name); n = MODS.get(name.lower()) or KEYS.get(name.lower()) or name
     for cand in (n, n.capitalize(), n.upper(), n.lower()):
         ks = X["x"].XStringToKeysym(cand.encode())
         if ks: return ks

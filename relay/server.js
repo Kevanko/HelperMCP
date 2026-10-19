@@ -125,7 +125,7 @@ async function humanLook(code, color, note) {
 }
 async function pushLook(code, s) {
   const l = lookOf(s);
-  try { return String((await call(code, 'look', { ...l, force: true })).text || 'ok'); }
+  try { return String((await call(code, 'look', { ...l, force: true }, 20_000, { human: true })).text || 'ok'); }   // human: it must pass while the session is paused or the operator has the control
   catch (e) { if (/Unknown tool|not available/i.test(e.message)) return 'noted (this agent is too old to show it: the user can restart the helper to update it)'; throw e; }
 }
 // the AI's screenshots: smaller by default, and an unchanged screen costs a line instead of a picture
@@ -215,7 +215,7 @@ const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
-  if (s.paused && tool !== 'bye' && !(opts.human && (tool === 'screenshot' || tool === 'stream'))) {   // the live viewer keeps showing the screen while it is paused
+  if (s.paused && tool !== 'bye' && !(opts.human && (tool === 'screenshot' || tool === 'stream' || tool === 'look'))) {   // the live viewer keeps showing the screen while it is paused
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
   if (takenOver(s) && !opts.human && tool !== 'bye') {
@@ -494,7 +494,7 @@ const tools = [
   { name: 'scroll', agent: true, description: 'Scroll the mouse wheel (positive amount = down, negative = up), optionally at (x,y) in screenshot coordinates.',
     props: { amount: { type: 'integer', description: 'wheel notches, default 3' }, x: num('x'), y: num('y') } },
   { name: 'type_text', agent: true, description: 'Type text at the current keyboard focus. The answer names the window that was in front and warns when it runs as administrator (the helper is then ignored). Windows: window (part of its title, process name or pid) brings that window to the front first; with background=true the text goes to that window\'s focused control WITHOUT taking the focus or changing the window order (classic Win32 / Electron programs; not games or some modern apps: then retry without background).', props: { text: str('Text'), window: str('Windows: window title part / process / pid to type into'), background: { type: 'boolean', description: 'Windows: type without bringing the window to the front' } }, required: ['text'] },
-  { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc".', props: { keys: str('Key combo') }, required: ['keys'] },
+  { name: 'press_key', agent: true, description: 'Press a key combo like "enter", "ctrl+c", "alt+f4", "win+r", "ctrl+shift+esc". Also lshift/rshift, lctrl/rctrl, lalt/ralt, lwin/rwin, insert, capslock, printscreen, menu, num0-num9, f1-f24, volumeup/volumedown/mute and punctuation (, . ; - = / [ ] \). Side names are forgiving (rshift = shiftright = right_shift). Any other key: vk0x2D (virtual-key code, Windows).', props: { keys: str('Key combo') }, required: ['keys'] },
   { name: 'actions', agent: true, ms: (a) => 30000 + (a.steps || []).length * 20000,
     description: 'A short sequence of small GUI steps done as ONE action the friend confirms once (move + click, click + type, drag, scroll, key presses). Prefer this over separate click / move / type_text calls. Coordinates are screenshot pixels. Stops at the first failing step.',
     props: { steps: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'object', properties: {

@@ -1615,7 +1615,22 @@ function Do-TypeText($a) {
 $Vk = @{ ctrl = 0x11; control = 0x11; alt = 0x12; shift = 0x10; win = 0x5B; windows = 0x5B; enter = 0x0D; return = 0x0D
     esc = 0x1B; escape = 0x1B; tab = 0x09; space = 0x20; backspace = 0x08; delete = 0x2E; del = 0x2E; home = 0x24; end = 0x23
     pageup = 0x21; pagedown = 0x22; left = 0x25; up = 0x26; right = 0x27; down = 0x28 }
-1..12 | ForEach-Object { $Vk["f$_"] = 0x6F + $_ }
+1..24 | ForEach-Object { $Vk["f$_"] = 0x6F + $_ }
+0..9 | ForEach-Object { $Vk["num$_"] = 0x60 + $_; $Vk["numpad$_"] = 0x60 + $_ }
+$Vk += @{ numenter = 0x0D; browserback = 0xA6; browserforward = 0xA7; browserrefresh = 0xA8; browserhome = 0xAC; sleep = 0x5F; select = 0x29; help = 0x2F; lshift = 0xA0; rshift = 0xA1; lctrl = 0xA2; rctrl = 0xA3; lalt = 0xA4; ralt = 0xA5; lwin = 0x5B; rwin = 0x5C; altgr = 0xA5; menu = 0x5D; apps = 0x5D; insert = 0x2D; ins = 0x2D
+    capslock = 0x14; caps = 0x14; numlock = 0x90; scrolllock = 0x91; printscreen = 0x2C; prtsc = 0x2C; pause = 0x13; 'break' = 0x03; clear = 0x0C
+    multiply = 0x6A; add = 0x6B; subtract = 0x6D; decimal = 0x6E; divide = 0x6F; volumeup = 0xAF; volumedown = 0xAE; mute = 0xAD; playpause = 0xB3; nexttrack = 0xB0; prevtrack = 0xB1 }
+$VkChar = @{ ';' = 0xBA; '=' = 0xBB; ',' = 0xBC; '-' = 0xBD; '.' = 0xBE; '/' = 0xBF; '`' = 0xC0; '[' = 0xDB; '\' = 0xDC; ']' = 0xDD; "'" = 0xDE }
+$VkExt = @(0xA3, 0xA5, 0x5C, 0x5D, 0x2D, 0x2E, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x6F, 0x90)   # right-hand and navigation keys need the "extended" flag, otherwise Windows takes the numpad twin
+function Key-Code($name) {   # "RShift", "shift_right", "Right-Shift", "RShiftKey", "num5" ... all name the same keys
+    $k = ($name.ToLower() -replace '[\s_\-]', ''); if ($k.Length -gt 3 -and $k.EndsWith('key')) { $k = $k.Substring(0, $k.Length - 3) }
+    if ($Vk.ContainsKey($k)) { return [int]$Vk[$k] }
+    if ($k -match '^(shift|ctrl|control|alt|win|windows)(left|right)$') { $b = $Matches[1] -replace '^control$', 'ctrl' -replace '^windows$', 'win'; return [int]$Vk[$(if ($Matches[2] -eq 'right') { 'r' } else { 'l' }) + $b] }
+    if ($k -match '^(left|right)(shift|ctrl|control|alt|win|windows)$') { $b = $Matches[2] -replace '^control$', 'ctrl' -replace '^windows$', 'win'; return [int]$Vk[$(if ($Matches[1] -eq 'right') { 'r' } else { 'l' }) + $b] }
+    if ($k -match '^vk(?:0x)?([0-9a-f]{1,2})$') { return [Convert]::ToInt32($Matches[1], 16) }   # any other key by its virtual-key code, e.g. vk0x2D or vk2d
+    if ($k.Length -eq 1) { if ($VkChar.ContainsKey($k)) { return [int]$VkChar[$k] }; if ($k -match '[a-z0-9]') { return [int][char]$k.ToUpper() } }
+    throw "Unknown key '$name'. Names: letters, digits, f1-f24, num0-num9, enter esc tab space backspace delete insert home end pageup pagedown arrows, shift/ctrl/alt/win (lshift rshift lctrl rctrl lalt ralt lwin rwin), capslock numlock scrolllock printscreen pause menu, volumeup volumedown mute, browserback browserforward browserrefresh browserhome, vk0x2D (any key by its virtual-key code), punctuation ; = , - . / [ \ ] and the apostrophe. Join with +"
+}
 function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it) and a short note in the label
     $out = @()
     if ($a.color -and "$($a.color)" -match '^#?([0-9a-fA-F]{6})$') {
@@ -1623,7 +1638,7 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
         $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
         $script:OkRGB = $rgb; Overlay-Send "color $($rgb[0]) $($rgb[1]) $($rgb[2])"; $out += 'colour set'
     }
-    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send "note $nt"; Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown'
+    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send ("note64 " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nt))); Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown'
         if ($script:Phase -in 'done', 'hold') { $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status; $out += 'new task started' } }   # a new note after task_done is a new task: the label shows it and the clock starts again, it used to stay on "finished"
     @{ text = $(if ($out) { $out -join ', ' } else { 'nothing to change' }) }
 }
@@ -1645,14 +1660,11 @@ function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch
 function Do-PressKey($a) {
     $kc = $null; try { $kc = [V__BUILD__.Caret]::Get() } catch { }; $kr = [V__BUILD__.Probe]::FgRect(); $am = Arrow-Mask; $pb = Probe-Take $kr (@(Caret-Mask $kc) + $am)
     Overlay-Send 'typing'; Pin-Caret
-    $codes = foreach ($k in $a.keys.ToLower().Split('+')) {
-        if ($Vk.ContainsKey($k)) { [byte]$Vk[$k] }
-        elseif ($k.Length -eq 1) { [byte][char]$k.ToUpper() }
-        else { throw "Unknown key '$k'" }
-    }
-    $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 0, [UIntPtr]::Zero) }
+    $parts = @("$($a.keys)".Split('+')); if ("$($a.keys)".EndsWith('++')) { $parts = @("$($a.keys)".Substring(0, "$($a.keys)".Length - 2).Split('+') + '+') }   # "ctrl++" is ctrl and the plus key
+    $codes = @(foreach ($k in $parts) { if ($k -eq '+') { 0xBB } else { Key-Code $k.Trim() } })
+    foreach ($c in $codes) { $ex = $(if ($VkExt -contains $c) { 1 } else { 0 }); [H.U__BUILD__]::keybd_event([byte]$c, 0, $ex, [UIntPtr]::Zero) }
     [array]::Reverse($codes)
-    $codes | ForEach-Object { [H.U__BUILD__]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }
+    foreach ($c in $codes) { $ex = $(if ($VkExt -contains $c) { 3 } else { 2 }); [H.U__BUILD__]::keybd_event([byte]$c, 0, $ex, [UIntPtr]::Zero) }
     Start-Sleep -Milliseconds 450
     $kc2 = $null; try { $kc2 = [V__BUILD__.Caret]::Get() } catch { }
     @{ text = Probe-Report $pb (Probe-Take $kr (@(Caret-Mask $kc) + @(Caret-Mask $kc2) + $am)) "key press ($($a.keys))" (Caret-Moved $kc $kc2) }
@@ -2319,7 +2331,8 @@ function Bsod-Report($days) {   # blue screens: the code and parameters read fro
             if ($keep.Count) { $out += '  debugger says:'; $out += $keep | ForEach-Object { "    $_" } }
         }
     }
-    if (-not $cdb) { $out += ''; $out += 'driver name: no debugger (cdb) on this PC, so only the code is read; winget install Microsoft.WinDbg gives the exact driver' }
+    if (-not $files.Count) { $out += "no crash dump files in the last $days days: $($k41.Count) unexpected shutdown(s) (Kernel-Power 41) and $($bc.Count) bugcheck event(s) are in the log. A power cut, a hang or a hard reset leaves no dump; a real blue screen without a dump means dumps are switched off (System Properties > Startup and Recovery)" }
+    elseif (-not $cdb) { $out += ''; $out += 'driver name: no debugger (cdb) on this PC, so only the code is read; winget install Microsoft.WinDbg gives the exact driver' }
     foreach ($e in ($bc | Select-Object -First 3)) { $out += ''; $out += "event $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')): " + (Cut ($e.Message -replace '\s+', ' ') 260) }
     $t0 = if ($bc.Count) { $bc[0].TimeCreated } elseif ($k41.Count) { $k41[0].TimeCreated } else { $null }
     if ($t0) {
@@ -3039,7 +3052,7 @@ function On-Line($line) {
     if (-not $f -or -not $f[0]) { return }
     if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; if ($f[1] -eq 'done') { $script:doneSec = [int]$script:clockT.Elapsed.TotalSeconds } else { $script:doneSec = $null }; $script:state = $f[1]; Apply-State }; return }
     if ($f[0] -eq 'color' -and $f.Count -ge 4) { $script:okC = C ([int]$f[1]) ([int]$f[2]) ([int]$f[3]); Apply-State; foreach ($m in $mons) { if ($script:busy) { $m.shadow.Color = (Cur) } }; return }
-    if ($f[0] -eq 'note') { $script:note = $line.Trim().Substring(4).Trim(); Apply-State; return }
+    if ($f[0] -eq 'note64') { $script:note = $(if ($f.Count -gt 1) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($f[1])) } else { '' }); Apply-State; return }   # base64: stdin is read in the console code page (cp866), so Russian text came out as hieroglyphs
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
     if ($f[0] -eq 'uncap') { $script:capHide = $false; foreach ($m in $mons) { $m.win.Opacity = 1 }; $rwin.Opacity = 1; return }
@@ -3159,6 +3172,7 @@ function Start-Overlay {
         $psi.EnvironmentVariables['HM_HOLD'] = (T 'Помощник на паузе, вернётся' 'The helper is on hold, back soon'); $psi.EnvironmentVariables['HM_DONE'] = (T 'Готово: помощник закончил' 'Done: the helper has finished'); $psi.EnvironmentVariables['HM_AWAY'] = (T 'Помощник давно ничего не делает' 'The helper has been quiet for a while')
         $script:OverlayProc = [Diagnostics.Process]::Start($psi)
         $script:OverlayIn = $script:OverlayProc.StandardInput; $script:OverlayIn.AutoFlush = $true
+        $script:OverlayIn.WriteLine('')   # a UTF-8 parent writes a BOM first: it would spoil the first command
     } catch { }   # a missing overlay must never block the help session
 }
 

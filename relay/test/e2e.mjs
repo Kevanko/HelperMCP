@@ -192,7 +192,7 @@ if (useps) {   // registry search, crash report, run history (Windows only)
   const ff = txt(await tool('util', { session: code, op: 'ffind', name: uniq, value: 'new' }));
   assert.ok(ff.includes(uniq) || /needs administrator/.test(ff), 'ffind finds the new file on any disk, or says it needs administrator: ' + ff);
   assert.match(txt(await tool('util', { session: code, op: 'browser' })), /== extensions[\s\S]*== browser processes/);
-  assert.match(txt(await tool('util', { session: code, op: 'bsod', value: '1' })), /bugcheck 0x|no blue screens/);
+  assert.match(txt(await tool('util', { session: code, op: 'bsod', value: '1' })), /bugcheck 0x|no blue screens|no crash dump files/);
   const hl = txt(await tool('util', { session: code, op: 'health' })); for (const h of ['== boot', '== disks', '== heat and throttling', '== drivers and updates']) assert.ok(hl.includes(h), 'health has ' + h + ': ' + hl.slice(0, 300));
   const thr = txt(await tool('util', { session: code, op: 'threats', value: '1' })); for (const h of ['== verdict', '== antivirus', '== exclusions', '== installed lately']) assert.ok(thr.includes(h), 'threats has ' + h + ': ' + thr.slice(0, 300));
   assert.match(txt(await tool('util', { session: code, op: 'appinfo', name: 'notepad' })), /notepad\.exe/i);

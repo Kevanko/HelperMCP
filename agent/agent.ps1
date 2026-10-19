@@ -755,6 +755,7 @@ namespace F__BUILD__ {
     static readonly AutoResetEvent wake = new AutoResetEvent(false);
     static readonly IWebProxy sp = WebRequest.GetSystemWebProxy();
     static Uri relay; static string host, lastIp, blockFile; static int port; static volatile bool on, forced;
+    const int AltPort = 9444; static volatile bool alt;   // the relay is also served on 9444 next to the VPN front: when the provider filters 8444 the same TLS goes to 9444, chosen by the hop (the caller still says 8444)
     static volatile Hop cur; static Cand curC; static DateTime lastOk = DateTime.MinValue, since = DateTime.UtcNow; static int switches;
     public static readonly IWebProxy Proxy = new RP();
 
@@ -781,6 +782,7 @@ namespace F__BUILD__ {
         var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time
         try {   // but never trust it blindly: every route is asked at once (up to 3 s), the saved one wins when it answers, otherwise the first that does. Starting on a dead route cost several "Connecting" rounds
           var res = ProbeAll(ord, 3000); Cand pick = null;
+          if (!Array.Exists(res, x => x > 0)) { alt = true; res = ProbeAll(ord, 3000); if (Array.Exists(res, x => x > 0)) Emit("route", "relay port " + port + " does not answer on any route, using port " + AltPort); else alt = false; }
           for (int i = 0; i < ord.Count; i++) if (res[i] > 0 && ord[i].Key == first.Key) pick = ord[i];
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
           if (pick != null) { if (pick.Key != first.Key) Emit("route", "start: " + first.Name + " does not reach the relay, using " + pick.Name); first = pick; }
@@ -882,8 +884,8 @@ namespace F__BUILD__ {
         var line = Encoding.ASCII.GetString(buf, 0, Math.Min(n, 400)).Split('\n')[0].Trim(); var p = line.Split(' ');
         if (p.Length < 2 || p[0] != "CONNECT") { Say(c, "HTTP/1.1 405 Method Not Allowed\r\n\r\n"); return; }
         int ci = p[1].LastIndexOf(':'); string th = p[1].Substring(0, ci); int tp = int.Parse(p[1].Substring(ci + 1));
-        if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || tp != port) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }   // not an open proxy: the relay and nothing else
-        u = Dial(h, th, tp); try { lastIp = ((IPEndPoint)u.RemoteEndPoint).Address.ToString(); } catch { }
+        if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || (tp != port && tp != AltPort)) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }   // not an open proxy: the relay and nothing else
+        u = Dial(h, th, tp == port && alt ? AltPort : tp); try { lastIp = ((IPEndPoint)u.RemoteEndPoint).Address.ToString(); } catch { }
         Say(c, "HTTP/1.1 200 Connection established\r\n\r\n"); c.ReceiveTimeout = 0;
         lock (h.Conns) { h.Conns.Add(c); h.Conns.Add(u); }
         var uu = u; new Thread(() => Pump(uu, c)) { IsBackground = true }.Start(); Pump(c, u);
@@ -897,6 +899,7 @@ namespace F__BUILD__ {
     static void CloseAll(Hop h) { lock (h.Conns) { foreach (var s in h.Conns.ToArray()) { try { s.Close(); } catch { } } h.Conns.Clear(); } }   // the old route may be a black hole: break what is stuck on it now
 
     static int Probe(Cand c, int ms) {
+      if (alt && c.Sys) return -1;
       try {
         var rq = (HttpWebRequest)WebRequest.Create("https://" + host + ":" + port + "/health");
         rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
@@ -979,6 +982,12 @@ namespace F__BUILD__ {
         try {
           var ord = Order(); var res = ProbeAll(ord, 4000); Cand pick = null;
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
+          if (pick == null) {   // nothing on this port: the provider may filter the port, not the connection. Try the other one (the link is down anyway, so flipping disturbs nothing)
+            alt = !alt; var r2 = ProbeAll(ord, 4000);
+            for (int i = 0; i < ord.Count && pick == null; i++) if (r2[i] > 0) pick = ord[i];
+            if (pick != null) { Switch(pick, "relay port " + (alt ? port : AltPort) + " is filtered, now port " + (alt ? AltPort : port), true); continue; }
+            alt = !alt;
+          }
           if (pick != null) Switch(pick, "relay unreachable", true);
           else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) { string w; lock (why) why.TryGetValue(ord[i].Key, out w); sb.Append(ord[i].Name).Append(" FAIL").Append(w != null ? " (" + w + ")" : "").Append("; "); } Emit("route", "no route reaches the relay: " + sb + Port443()); }
         } catch (Exception e) { Emit("route", "route check failed: " + e.Message); }
@@ -994,7 +1003,7 @@ namespace F__BUILD__ {
       } catch { }
     }
 
-    public static string Status() { lock (lk) { return on ? "via " + (curC != null ? curC.Name : "?") + " since " + since.ToLocalTime().ToString("HH:mm:ss") + ", " + (switches - 1) + " switch(es)" : "normal connection (route layer off)"; } }
+    public static string Status() { lock (lk) { return on ? "via " + (curC != null ? curC.Name : "?") + (alt ? " (relay port " + AltPort + ")" : "") + " since " + since.ToLocalTime().ToString("HH:mm:ss") + ", " + (switches - 1) + " switch(es)" : "normal connection (route layer off)"; } }
 
     // every adapter, with a relay check through each one that is up and has a gateway
     public static string Report(bool probe) {

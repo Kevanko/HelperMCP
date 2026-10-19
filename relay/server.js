@@ -690,7 +690,8 @@ function bodyBuf(req, limit) {
 }
 const body = async (req, limit) => (await bodyBuf(req, limit)).toString('utf8');
 const baseUrl = (req) => PUBLIC_URL || `${req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http')}://${req.headers.host}`;
-const clientIp = (req) => req.socket.remoteAddress;
+// behind the front (nginx on this host also serves the relay on the VPN port): the real address comes from X-Forwarded-For, trusted only when the connection itself is local or private (a direct visitor has a public address and cannot forge it)
+const clientIp = (req) => { const a = req.socket.remoteAddress || '', x = req.headers['x-forwarded-for']; return x && /^(::ffff:)?(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)|^::1$/.test(a) ? String(x).split(',')[0].trim() : a; };
 const PKG_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')).version; } catch { return '?'; } })();
 
 function script(req, res, file) {

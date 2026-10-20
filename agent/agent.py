@@ -18,9 +18,9 @@ T = {
     "st_conn": ("Подключаюсь к серверу…", "Connecting to the server…"), "st_wait": ("Ожидание помощника… он подключается по коду", "Waiting for the helper to connect with the code…"),
     "st_ok": ("Помощник подключён", "Helper connected"), "st_lost": ("Связь потеряна, переподключение…", "Connection lost, reconnecting…"),
     "overlay_wait": ("Ожидание помощника…", "Waiting for the helper…"),
-    "menu_run": ("Меню:  [P] пауза    [X] завершить сеанс    [B] назад", "Menu:  [P] pause    [X] end the session    [B] back"),
-    "menu_paused": ("Пауза.  [R] продолжить    [X] завершить сеанс    [B] назад", "Paused.  [R] continue    [X] end the session    [B] back"),
-    "confirm_end": ("Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет", "End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no"),
+    "menu_run": ("Меню:  [P] пауза    [X] выход (сразу)    [Esc] закрыть меню", "Menu:  [P] pause    [X] exit (now)    [Esc] close the menu"),
+    "menu_paused": ("Пауза.  [R] продолжить    [X] выход (сразу)    [Esc] закрыть меню", "Paused.  [R] continue    [X] exit (now)    [Esc] close the menu"),
+    "confirm_end": ("Сеанс завершён. Код больше не работает.", "Session ended. The code no longer works."),
     "st_paused": ("Пауза: помощник ждёт. Esc — меню", "Paused: the helper is waiting. Esc = menu"),
     "persist_q": ("Сохранять сеанс при потере интернета и после перезагрузки (код не изменится)? [Д/н]: ", "Keep this session through internet loss and reboots (the code stays the same)? [Y/n]: "),
     "overlay_paused": ("Пауза", "Paused"), "resuming": ("Продолжаю прошлый сеанс", "Resuming the previous session"),
@@ -908,12 +908,8 @@ def esc_menu(fd):
         k = key()
         if k == "p" and not PAUSED.is_set(): set_paused(True); return
         if k == "r" and PAUSED.is_set(): set_paused(False); return
-        if k == "x":
-            print(c("1;30;43", "  " + t("confirm_end") + "  "), flush=True)
-            k2 = key()
-            if k2 == "y": end_final(); return
-            print(c("2", "  …"), flush=True); return
-        if k in ("b", "\x7f", "\x08"): return   # back is [B]: Esc opens the menu, a second Esc must not close it
+        if k == "x": end_final(); print(c("1;30;43", "  " + t("confirm_end") + "  "), flush=True); return   # X ends at once, no second question; Esc + X is already two deliberate keys
+        if k in ("b", "\x7f", "\x08", "esc"): return   # close the menu: Esc opens it and Esc (or B) closes it; X is the only key that ends, so a stray Esc never does
 
 
 def run_cmd(cmd, tmo=5):

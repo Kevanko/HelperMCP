@@ -591,14 +591,14 @@ namespace F__BUILD__ {
       rq.Method = "POST"; rq.SendChunked = true; rq.AllowWriteStreamBuffering = false; rq.Timeout = 15000; rq.ReadWriteTimeout = 20000; rq.KeepAlive = false;
       rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ServicePoint.Expect100Continue = false;
       using (var st = rq.GetRequestStream()) {
-        int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty;
+        int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty; double interval = 66;   // ms between frames: 66 = 15 fps on a fast link, grows when the link is slow so frames do not pile up (the lag people saw)
         try { Sys.Snap(10); } catch { } var lastSys = DateTime.UtcNow;   // primes the CPU counters
         while (run) {
           var t0 = DateTime.UtcNow;
           if (mon != curMon) {
             curMon = mon; var scr = System.Windows.Forms.Screen.AllScreens;
             area = curMon >= 0 && curMon < scr.Length ? scr[curMon].Bounds : System.Windows.Forms.SystemInformation.VirtualScreen;
-            sc = Math.Max(1.0, Math.Max(area.Width / 1920.0, area.Height / 1200.0)); fw = (int)(area.Width / sc); fh = (int)(area.Height / sc); pa = null;
+            sc = Math.Max(1.0, Math.Max(area.Width / 1366.0, area.Height / 900.0)); fw = (int)(area.Width / sc); fh = (int)(area.Height / sc); pa = null;
           }
           Bitmap frame;
           try {
@@ -646,12 +646,15 @@ namespace F__BUILD__ {
               using (var m = new MemoryStream()) { Put16(m, meta.Length); m.Write(meta, 0, meta.Length); m.Write(j, 0, j.Length); var b = m.ToArray(); Send(st, 'K', b); sent = b.Length; }
               key = false; lastKey = DateTime.UtcNow;
             } else if (tiles != null) { Send(st, 'T', tiles); sent = tiles.Length; }
-            var wms = (DateTime.UtcNow - tw0).TotalMilliseconds;   // a slow link shows up as a slow write: lower the quality, raise it again when it is fast
-            if (sent > 0) { if (wms > 250 && q > 30) q -= 10; else if (wms < 60 && q < 60) q += 5; }
+            var wms = (DateTime.UtcNow - tw0).TotalMilliseconds;   // a slow link shows up as a slow write: lower the quality AND slow the frame rate, so the socket never backs up (which is what felt like lag)
+            if (sent > 0) {
+              if (wms > 200 && q > 25) q -= 10; else if (wms < 60 && q < 62) q += 5;
+              interval = Math.Min(500, Math.Max(66, wms * 1.3));   // send no faster than the link drains: fast -> 15 fps, a 300 ms write -> ~2.5 fps instead of a growing backlog
+            } else interval = Math.Min(interval, 100);   // nothing changed: poll gently
             var tmp = pa; pa = ca; ca = tmp;
           }
           if ((DateTime.UtcNow - lastSys).TotalMilliseconds >= 2000) { lastSys = DateTime.UtcNow; try { Send(st, 'S', Encoding.UTF8.GetBytes(Sys.Snap(10))); } catch (IOException) { throw; } catch { } }   // the live System panel
-          var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(5, 66 - spent));
+          var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(5, interval - spent));
         }
       }
       try { rq.GetResponse().Close(); } catch { }
@@ -1073,12 +1076,8 @@ namespace K__BUILD__ {
         var k = Console.ReadKey(true).Key;
         if (k == ConsoleKey.P && !Paused) { SetPaused(true); return; }
         if (k == ConsoleKey.R && Paused) { SetPaused(false); return; }
-        if (k == ConsoleKey.X) {
-          Say(C("1;30;43", "  " + ConfirmEnd + "  ")); var k2 = Console.ReadKey(true).Key;
-          if (k2 == ConsoleKey.Y) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); }   // only now the session is over, for good
-          return;
-        }
-        if (k == ConsoleKey.B || k == ConsoleKey.Backspace) return;   // back is [B]: Esc opens the menu, so a second Esc must not close it again (it only confused people); Enter / N no longer count
+        if (k == ConsoleKey.X) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(C("1;30;43", "  " + ConfirmEnd + "  ")); return; }   // X ends the session at once, no second question (the user asked for a clean exit); Esc + X is already two deliberate keys
+        if (k == ConsoleKey.B || k == ConsoleKey.Backspace || k == ConsoleKey.Escape) return;   // close the menu: Esc opens it and Esc (or B) closes it, the natural thing; X is the only key that ends, so a stray Esc never does
       }
     }
     public static void Start() {
@@ -3607,8 +3606,8 @@ function Start-Helper {
     Start-Overlay
     Overlay-Send 'state wait'
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
-    $k::MenuRun = (T 'Меню:  [P] пауза    [X] завершить сеанс    [B] назад' 'Menu:  [P] pause    [X] end the session    [B] back'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] завершить сеанс    [B] назад' 'Paused.  [R] continue    [X] end the session    [B] back')
-    $k::ConfirmEnd = (T 'Завершить сеанс полностью? Код перестанет работать, понадобится новый.   [Y] да   [N] нет' 'End the session completely? The code stops working and a new one is needed.   [Y] yes   [N] no')
+    $k::MenuRun = (T 'Меню:  [P] пауза    [X] выход (сразу)    [Esc] закрыть меню' 'Menu:  [P] pause    [X] exit (now)    [Esc] close the menu'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] выход (сразу)    [Esc] закрыть меню' 'Paused.  [R] continue    [X] exit (now)    [Esc] close the menu')
+    $k::ConfirmEnd = (T 'Сеанс завершён. Код больше не работает.' 'Session ended. The code no longer works.')
     $k::StPaused = (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'); $k::Continuing = (T 'продолжаем' 'continuing')
     $k::StRestore = ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…')); $k::StRestoreOk = $false
     if ($r.resumed -and $saved) { $script:OperatorSeen = $true; Overlay-Send 'state ok'; Show-Status }

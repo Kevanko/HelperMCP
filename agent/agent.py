@@ -702,19 +702,21 @@ def make_wav(notes, sr=22050):
     for f, st, du, amp in notes:
         i0 = int(st * sr)
         for i in range(int(du * sr)):
-            tt = i / sr; env = (1 - math.exp(-tt * 400)) * math.exp(-tt * 5.5)
-            v = amp * env * (math.sin(2 * math.pi * f * tt) + 0.28 * math.sin(2 * math.pi * 2 * f * tt) + 0.08 * math.sin(2 * math.pi * 3.01 * f * tt))
+            tt = i / sr; tail = min(1.0, max(0.0, (du - tt) / 0.08)); env = (1 - math.exp(-tt * 90)) * math.exp(-tt * 3.4) * tail   # soft: 12 ms attack, long fade, no click
+            v = amp * env * (math.sin(2 * math.pi * f * tt) + 0.1 * math.sin(2 * math.pi * 2 * f * tt))
             if i0 + i < len(buf): buf[i0 + i] += v
     bio = io.BytesIO(); w = wave.open(bio, "wb"); w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr)
     w.writeframes(b"".join(struct.pack("<h", max(-32000, min(32000, int(v * 22000)))) for v in buf)); w.close()
     return bio.getvalue()
 
 
-SOUNDS = {"ask": [(784.0, 0.0, 0.55, 0.5), (1046.5, 0.16, 0.7, 0.5)], "ok": [(523.25, 0.0, 0.5, 0.4), (659.25, 0.12, 0.5, 0.4), (783.99, 0.24, 0.7, 0.4)]}
+SOUNDS = {"ask": [(587.33, 0.0, 0.7, 0.16), (783.99, 0.2, 0.9, 0.16)], "ok": [(523.25, 0.0, 0.7, 0.16), (659.25, 0.18, 0.7, 0.16), (783.99, 0.36, 1.0, 0.16)]}
 SOUND_FILES = {}
+LOOK = {"glow": False, "sound": False}   # both off until the admin panel (a new link's default) or the AI switches them on
 
 
 def play(kind):
+    if not LOOK["sound"]: return
     try:
         if kind not in SOUND_FILES:
             f = os.path.join(tempfile.gettempdir(), f"helpermcp-{kind}-{os.getpid()}.wav"); open(f, "wb").write(make_wav(SOUNDS[kind])); SOUND_FILES[kind] = f; TMP.append(f)
@@ -1774,13 +1776,14 @@ away_label = sys.argv[8] if len(sys.argv) > 8 else "The helper has been quiet fo
 note = ""
 BLUE, ORANGE, VIOLET, GREEN = (0x4C / 255, 0x8D / 255, 0xFF / 255), (1.0, 0x8A / 255, 0x1E / 255), (0.66, 0.5, 1.0), (61 / 255, 220 / 255, 132 / 255)
 OKC = BLUE   # the AI may pick its own colour (set_look)
+GLOW = {"on": False}
 WARN = ("lost", "wait", "paused", "hold", "away")
 disp = Gdk.Display.get_default()
 scr = disp.get_default_screen()
 if not scr.is_composited() or scr.get_rgba_visual() is None:
     sys.exit(0)                      # without compositing transparent windows would be opaque black boxes: show nothing
 state = "ok"                         # ok | lost (connection to the relay) | wait (nobody has connected with the code yet)
-S_DEPTH = 70                         # glow depth in px
+S_DEPTH = 34                         # glow depth in px (thin and soft; the glow is off unless switched on)
 
 def col(): return ORANGE if state in WARN else GREEN if state == "done" else OKC
 
@@ -1806,7 +1809,7 @@ def build_glow(W, H, rgb):
     R, G, B = rgb
     def fade(d):
         t = (d + 0.5) / S_DEPTH
-        return 0.59 + (0.18 - 0.59) * t / 0.35 if t <= 0.35 else 0.18 * (1 - (t - 0.35) / 0.65)
+        return 0.45 * (0.59 + (0.18 - 0.59) * t / 0.35 if t <= 0.35 else 0.18 * (1 - (t - 0.35) / 0.65))
     prof = [(int(255 * fade(d)) << 24) | (int(R * 255 * fade(d)) << 16) | (int(G * 255 * fade(d)) << 8) | int(B * 255 * fade(d)) for d in range(S_DEPTH)]
     px = array("I", bytes(4 * W * H))
     for y in range(H):
@@ -1837,7 +1840,10 @@ def make_monitor(mon):
         if k not in cache: cache[k] = build_glow(W, H, k)
         return cache[k][0]
     def draw(_, cr):
-        cr.set_operator(cairo.OPERATOR_SOURCE); cr.set_source_surface(surf(), 0, 0); cr.paint()
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        if not GLOW["on"] or state in WARN: cr.set_source_rgba(0, 0, 0, 0)   # no edge glow unless switched on, and none while waiting / paused / offline
+        else: cr.set_source_surface(surf(), 0, 0)
+        cr.paint()
     w.connect("draw", draw); w.show_all(); click_through(w); glows.append(w)
     # GNOME Shell draws its panel / dock above every normal window, so the glow would vanish under it. Where the panel takes space
     # (work area smaller than the monitor) an override-redirect strip repeats the same glow right over the panel, so the light runs
@@ -2171,6 +2177,7 @@ def on_line(line):
     if f[0] == "color" and len(f) >= 4:
         global OKC
         OKC = (int(f[1]) / 255, int(f[2]) / 255, int(f[3]) / 255); [w.queue_draw() for w in glows + pills]; return
+    if f[0] == "glow" and len(f) > 1: GLOW["on"] = f[1] == "1"; [w.queue_draw() for w in glows]; return
     if f[0] == "note":
         global note
         note = line.strip()[4:].strip(); [w.queue_draw() for w in pills]; return
@@ -2297,6 +2304,8 @@ TOOLS = dict(fsop=fsop, sysdata=sysdata, agent_log=agent_log, actions=actions, m
 PHASE = {"p": "ok", "last": time.time()}
 def look(a):
     out = []
+    if a.get("glow") is not None: LOOK["glow"] = bool(a["glow"]); overlay_send("glow %d" % LOOK["glow"]); out.append("glow " + ("on" if LOOK["glow"] else "off"))
+    if a.get("sound") is not None: LOOK["sound"] = bool(a["sound"]); out.append("sound " + ("on" if LOOK["sound"] else "off")); LOOK["sound"] and play("ok")
     import re as _re
     m = _re.match(r"^#?([0-9a-fA-F]{6})$", str(a.get("color") or ""))
     if m:
@@ -2432,9 +2441,11 @@ def main():
     copied = copy_clip(code)
     if sys.stdout.isatty(): header(code, copied, mode)
     else: print(f"\n  {t('banner')}  {code}\n  {t('tell')}\n", flush=True)
+    lk = reg.get("look") or {}; LOOK["glow"] = bool(lk.get("glow")); LOOK["sound"] = bool(lk.get("sound"))   # the admin panel decides what a new link starts with (both off by default)
     play("ok")
     if sys.stdin.isatty(): threading.Thread(target=key_pump, daemon=True).start()
     overlay_send("state wait")
+    if LOOK["glow"]: overlay_send("glow 1")
     if reg.get("resumed") and saved: OP["seen"] = True; overlay_send("state ok"); show_status()
     pool = ThreadPoolExecutor(max_workers=8)
     fails, delay = 0, 1.0

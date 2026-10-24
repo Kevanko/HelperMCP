@@ -411,6 +411,14 @@ console.log('look controls ok');
   assert.equal((await A('open', { method: 'POST', headers: { cookie: ck, 'content-type': 'application/json' }, body: JSON.stringify({ code }) })).status, 403, 'a POST without the CSRF header is refused');
   assert.equal((await A('open', { method: 'POST', headers: { ...H, origin: 'http://evil.example' }, body: JSON.stringify({ code }) })).status, 403, 'a foreign Origin is refused');
   const op = await (await A('open', { method: 'POST', headers: H, body: JSON.stringify({ code }) })).json(); assert.ok(/\/v\/[0-9a-f]+#c=[0-9a-f]+$/.test(op.control), 'open gives a control link');
+  // the edge glow and the sounds are off for every new link unless the admin turns them on; a session can be switched on its own
+  assert.deepEqual(await (await A('settings', { method: 'POST', headers: H, body: '{}' })).json(), { glow: false, sound: false }, 'glow and sound are off by default');
+  assert.equal(list.find((x) => x.code === code).glow, false); assert.equal(list.find((x) => x.code === code).sound, false);
+  assert.equal((await A('look', { method: 'POST', headers: H, body: JSON.stringify({ code, glow: true, sound: true }) })).status, 200);
+  const lst2 = await (await A('sessions', { headers: { cookie: ck } })).json(); assert.equal(lst2.find((x) => x.code === code).glow, true, 'the session glow is switched on'); assert.equal(lst2.find((x) => x.code === code).sound, true);
+  assert.deepEqual(await (await A('settings', { method: 'POST', headers: H, body: JSON.stringify({ glow: true }) })).json(), { glow: true, sound: false }, 'the default for new links can be changed');
+  await A('settings', { method: 'POST', headers: H, body: JSON.stringify({ glow: false }) });
+  console.log('glow / sound switches ok');
   assert.match((await (await A('report?days=1', { headers: { cookie: ck } })).json()).text, /calls|Nothing in the log/);
   assert.equal((await A('password', { method: 'POST', headers: H, body: JSON.stringify({ old: 'nope', new: 'a-long-new-password' }) })).status, 401);
   assert.equal((await A('password', { method: 'POST', headers: H, body: JSON.stringify({ old: cred.password, new: 'a-long-new-password' }) })).status, 200);

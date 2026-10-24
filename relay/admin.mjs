@@ -80,7 +80,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     if (api === 'sessions') {
       send(res, 200, [...d.sessions].map(([code, s]) => ({
         code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, online: now - s.lastSeen < d.ONLINE_MS, paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
-        last_seen_s: Math.round((now - s.lastSeen) / 1000), created: s.created, ip: s.ip, running: s.pending.size, queued: s.queue.length, note: s.note || '', color: s.lookForce || s.lookColor || '',
+        last_seen_s: Math.round((now - s.lastSeen) / 1000), created: s.created, ip: s.ip, running: s.pending.size, queued: s.queue.length, note: s.note || '', color: s.lookForce || s.lookColor || '', ...d.effLook(s),
         recent: (s.log || []).slice(-6).map((l) => ({ ago_s: Math.round((now - l.t) / 1000), tool: l.tool, args: l.args })),
       })).sort((a, b) => Number(b.online) - Number(a.online) || a.last_seen_s - b.last_seen_s)); return true;
     }
@@ -104,7 +104,11 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     }
     if (api === 'look') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
-      try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b.color, b.note) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
+      try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b.color, b.note, b.glow, b.sound) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
+    }
+    if (api === 'settings') {   // what a NEW link starts with: edge glow and sounds (both off unless turned on here)
+      { if (typeof b.glow === 'boolean') d.settings.glow = b.glow; if (typeof b.sound === 'boolean') d.settings.sound = b.sound; if (typeof b.glow === 'boolean' || typeof b.sound === 'boolean') { d.save(); d.audit('admin_settings', { glow: d.settings.glow, sound: d.settings.sound }); } }
+      send(res, 200, { glow: d.settings.glow, sound: d.settings.sound }); return true;
     }
     if (api === 'mode') {   // confirm / auto / unattended, pushed to the live agent; never reachable by the AI
       const code = String(b.code || '').toUpperCase(), mode = String(b.mode || '');

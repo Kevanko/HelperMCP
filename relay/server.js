@@ -48,15 +48,19 @@ const unseal = (buf) => {
   return Buffer.concat([d.update(buf.subarray(31)), d.final()]).toString('utf8');
 };
 let saveTimer = null;
+// what a new link starts with (changed in the admin panel): the edge glow and the sounds are OFF unless someone turns them on; a session can override it
+const settings = { glow: false, sound: false };
+const effLook = (s) => ({ glow: s.glow ?? settings.glow, sound: s.sound ?? settings.sound });
 function save() {
   if (!STATE_FILE || saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
       const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, events: (s.events || []).slice(-30) })),
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, glow: s.glow, sound: s.sound, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
         devices: [...devices].map(([dh, code]) => ({ dh, code })),
+        settings,
         ended: [...ended].filter(([, t]) => Date.now() - t < 3600_000).map(([code, t]) => ({ code, t })),   // an ended session stays ended across a relay restart: its agent must not slip back in
       };
       fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -116,16 +120,18 @@ function lookOf(s) {
   return { color: s.lookForce || (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };   // a colour picked by a person wins over the plan's
 }
 // a person changes the glow colour or the task text from the viewer / the admin panel
-async function humanLook(code, color, note) {
+async function humanLook(code, color, note, glow, sound) {
   const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
   if (color !== undefined && color !== '') { if (!/^#[0-9a-f]{6}$/i.test(color)) throw new Error('bad colour (use #RRGGBB)'); s.lookForce = color.toLowerCase(); }
   if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').slice(0, 90); s.lastNoteAt = 0; }
-  evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', by: 'operator' } }); save();
+  if (typeof glow === 'boolean') s.glow = glow;
+  if (typeof sound === 'boolean') s.sound = sound;
+  evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', glow: effLook(s).glow, sound: effLook(s).sound, by: 'operator' } }); save();
   return pushLook(String(code).toUpperCase(), s);
 }
 async function pushLook(code, s) {
   const l = lookOf(s);
-  try { return String((await call(code, 'look', { ...l, force: true }, 20_000, { human: true })).text || 'ok'); }   // human: it must pass while the session is paused or the operator has the control
+  try { return String((await call(code, 'look', { ...l, ...effLook(s), force: true }, 20_000, { human: true })).text || 'ok'); }   // human: it must pass while the session is paused or the operator has the control
   catch (e) { if (/Unknown tool|not available/i.test(e.message)) return 'noted (this agent is too old to show it: the user can restart the helper to update it)'; throw e; }
 }
 // the AI's screenshots: smaller by default, and an unchanged screen costs a line instead of a picture
@@ -388,7 +394,7 @@ const tools = [
     } },
   { name: 'set_look', session: true,
     description: 'How your presence looks to the user (the glow and the label on a PC or a phone, and the live viewer). "note" (up to 90 chars): a short line of what you are doing right now, e.g. "Checking the subscription again in 5 min"; keep it current (at most once per 30 s). "stage": move to stage N of your plan (its colour and title show). "color" (#RRGGBB): your colour when you have no plan, chosen once per session.',
-    props: { note: str('short status line'), stage: { type: 'integer', minimum: 0, description: 'index of the plan stage you start now' }, color: str('#RRGGBB, once per session (without a plan)') },
+    props: { note: str('short status line'), stage: { type: 'integer', minimum: 0, description: 'index of the plan stage you start now' }, color: str('#RRGGBB, once per session (without a plan)'), glow: { type: 'boolean', description: 'turn the soft edge glow on the screen on or off (it is off by default: turn it on only when the user wants to see that you are working)' }, sound: { type: 'boolean', description: 'turn the soft sounds on or off (off by default; the user is bothered by sounds: ask or have them enable it)' } },
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session');
       const now = Date.now();
@@ -397,6 +403,8 @@ const tools = [
         const n = Math.max(0, Math.min(s.plan.stages.length - 1, Number(a.stage) || 0));
         if (n !== s.plan.current) { if (!s.plan.done.includes(s.plan.current) && n > s.plan.current) s.plan.done.push(s.plan.current); s.plan.current = n; s.plan.at = now; }
       }
+      if (typeof a.glow === 'boolean') s.glow = a.glow;
+      if (typeof a.sound === 'boolean') s.sound = a.sound;
       if (a.color && !s.lookColor && /^#?[0-9a-f]{6}$/i.test(a.color)) s.lookColor = '#' + String(a.color).replace('#', '');   // the colour is fixed after the first time
       evPush(s, { t: now, type: 'look', data: { note: s.note || '', stage: s.plan ? s.plan.current : null } }); save();
       return { text: await pushLook(c, s) };
@@ -927,7 +935,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, settings, effLook, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => Date.now() - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1050,7 +1058,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (vw[2] === '/look') {   // glow colour and the task text (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}');
-        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note) }); } catch (e) { return json(res, 400, { error: e.message }); }
+        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note, b.glow, b.sound) }); } catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (vw[2] === '/sysdata') {   // the System tabs: JSON from the agent (control link only: command lines and startup entries are not for view-only guests)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
@@ -1150,7 +1158,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         old.lastSeen = Date.now(); old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
-        return json(res, 200, { code: want, token: info.resume_token, resumed: true });
+        return json(res, 200, { code: want, token: info.resume_token, resumed: true, look: effLook(old) });
       }
       const dh = info.device_id ? sha(String(info.device_id).slice(0, 300)) : null;   // a persistent per-install identity (like an AnyDesk/RustDesk ID): the same device always gets the same code back
       let code = want && !old ? want : null;   // same code after a server reset
@@ -1164,7 +1172,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       });
       sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
-      return json(res, 200, { code, token });
+      return json(res, 200, { code, token, look: effLook(s) });
     }
 
     if (p.startsWith('/a/')) {
@@ -1249,6 +1257,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
     for (const x of st.ended || []) ended.set(x.code, x.t);
+    if (st.settings) { settings.glow = !!st.settings.glow; settings.sound = !!st.settings.sound; }
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }
 }

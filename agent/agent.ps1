@@ -149,7 +149,7 @@ namespace V__BUILD__ {
   public static class Unglow {   // the edge glow is a known translucent layer: take it out of a screenshot by arithmetic instead of hiding it (no blinking)
     public static void Run(byte[] px, int w, int h, int cx, int cy, int[] mons, int s, int[] cols) {
       var a8 = new int[s];
-      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; double a = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); a8[d] = (int)(255 * a); }
+      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; double a = 0.45 * (t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65)); a8[d] = (int)(255 * a); }   // 0.45: the same shape as the overlay's glow (O.Glow.Make), softer
       Func<int, int, int> depth = (sx, sy) => {
         for (int m = 0; m + 3 < mons.Length; m += 4) {
           int mx = mons[m], my = mons[m + 1], mw = mons[m + 2], mh = mons[m + 3];
@@ -181,8 +181,9 @@ namespace V__BUILD__ {
   }
 }
 "@
+$script:GlowOn = $false; $script:SoundOn = $false   # the edge glow and the sounds are off until the relay (admin panel) or the AI switches them on
 $script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
-$GlowDepth = [int](70 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))
+$GlowDepth = [int](34 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))   # the edge glow is thin and soft; off unless switched on
 # ---- did an action change anything? A coarse picture around the target and of the whole screen before and after (the overlay's own label and glow are left out)
 function Probe-Mask { $m = @(); foreach ($scr in [Windows.Forms.Screen]::AllScreens) { $b = $scr.Bounds; $d = $GlowDepth + 2
         $m += $b.X, $b.Y, $b.Width, $d; $m += $b.X, ($b.Y + $b.Height - $d), $b.Width, $d; $m += $b.X, $b.Y, $d, $b.Height; $m += ($b.X + $b.Width - $d), $b.Y, $d, $b.Height
@@ -197,7 +198,7 @@ function Probe-Take($rect, $extra) {   # $rect = x, y, w, h of the part that mat
 }
 function Arrow-Mask { $p = [Windows.Forms.Cursor]::Position; @(($p.X - 110), ($p.Y - 110), 260, 260) }   # the AI's arrow where the mouse rests (it slides to the caret while typing)
 function Around($x, $y, $w, $h) { @([int]($x - $w / 2), [int]($y - $h / 2), [int]$w, [int]$h) }
-function Caret-Mask($c) { if (-not $c) { return @() }; $k = $GlowDepth / 70.0   # the blinking caret, and the AI's arrow with its typing dots right under it
+function Caret-Mask($c) { if (-not $c) { return @() }; $k = $GlowDepth / 34.0   # the blinking caret, and the AI's arrow with its typing dots right under it
     @(($c[0] - 3), ($c[1] - 2), 8, ($c[2] + 4), ($c[0] - 8), ($c[1] + $c[2]), [int](110 * $k), [int](70 * $k)) }
 function Get-CaretSafe { try { [V__BUILD__.Caret]::Get() } catch { $null } }
 function Caret-Moved($c0, $c1) { ($c0 -and $c1 -and ([Math]::Abs($c0[0] - $c1[0]) + [Math]::Abs($c0[1] - $c1[1])) -gt 2) -or ([bool]$c0 -ne [bool]$c1) }
@@ -1090,8 +1091,8 @@ namespace K__BUILD__ {
       int sr = 22050; double total = 0; for (int i = 0; i < f.Length; i++) total = Math.Max(total, start[i] + dur[i]);
       int n = (int)(sr * (total + 0.1)); var buf = new double[n];
       for (int k = 0; k < f.Length; k++) { int i0 = (int)(start[k] * sr);
-        for (int i = 0; i < (int)(dur[k] * sr) && i0 + i < n; i++) { double t = (double)i / sr; double env = (1 - Math.Exp(-t * 400)) * Math.Exp(-t * 5.5);
-          buf[i0 + i] += amp * env * (Math.Sin(2 * Math.PI * f[k] * t) + 0.28 * Math.Sin(4 * Math.PI * f[k] * t) + 0.08 * Math.Sin(2 * Math.PI * 3.01 * f[k] * t)); } }
+        for (int i = 0; i < (int)(dur[k] * sr) && i0 + i < n; i++) { double t = (double)i / sr; double d_ = dur[k], tail = t > d_ - 0.08 ? Math.Max(0, (d_ - t) / 0.08) : 1; double env = (1 - Math.Exp(-t * 90)) * Math.Exp(-t * 3.4) * tail;   // 12 ms to full level, long soft fade, no click at the end
+          buf[i0 + i] += amp * env * (Math.Sin(2 * Math.PI * f[k] * t) + 0.1 * Math.Sin(4 * Math.PI * f[k] * t)); } }
       var ms = new MemoryStream(); var w = new BinaryWriter(ms);
       w.Write(new char[] { 'R', 'I', 'F', 'F' }); w.Write(36 + n * 2); w.Write(new char[] { 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ' }); w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(sr); w.Write(sr * 2); w.Write((short)2); w.Write((short)16);
       w.Write(new char[] { 'd', 'a', 't', 'a' }); w.Write(n * 2);
@@ -1139,7 +1140,7 @@ function Do-Screenshot-Inner($a) {
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
-    if (-not $view -and $script:OverlayProc -and -not $script:OverlayProc.HasExited) {
+    if (-not $view -and (Glow-Visible) -and $script:OverlayProc -and -not $script:OverlayProc.HasExited) {
         try {
             $rect = New-Object Drawing.Rectangle 0, 0, $s.Width, $s.Height; $bd = $bmp.LockBits($rect, 'ReadWrite', 'Format32bppArgb')
             $buf = New-Object byte[] ($bd.Stride * $s.Height); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $buf, 0, $buf.Length)
@@ -1650,8 +1651,11 @@ function Key-Code($name) {   # "RShift", "shift_right", "Right-Shift", "RShiftKe
     if ($k.Length -eq 1) { if ($VkChar.ContainsKey($k)) { return [int]$VkChar[$k] }; if ($k -match '[a-z0-9]') { return [int][char]$k.ToUpper() } }
     throw "Unknown key '$name'. Names: letters, digits, f1-f24, num0-num9, enter esc tab space backspace delete insert home end pageup pagedown arrows, shift/ctrl/alt/win (lshift rshift lctrl rctrl lalt ralt lwin rwin), capslock numlock scrolllock printscreen pause menu, volumeup volumedown mute, browserback browserforward browserrefresh browserhome, vk0x2D (any key by its virtual-key code), punctuation ; = , - . / [ \ ] and the apostrophe. Join with +"
 }
+function Glow-Visible { $script:GlowOn -and $script:Net -ne 'lost' -and -not [K__BUILD__.Keys]::Paused -and $script:OperatorSeen -and $script:Phase -notin 'hold', 'away' }   # is the edge glow really on the screen now (the overlay draws none while waiting, paused or offline)
 function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it) and a short note in the label
     $out = @()
+    if ($null -ne $a.glow) { $script:GlowOn = [bool]$a.glow; Overlay-Send ('glow ' + [int]$script:GlowOn); $out += $(if ($script:GlowOn) { 'glow on' } else { 'glow off' }) }
+    if ($null -ne $a.sound) { $script:SoundOn = [bool]$a.sound; $out += $(if ($script:SoundOn) { 'sound on' } else { 'sound off' }); if ($script:SoundOn) { Play-Sound 'ok' } }
     if ($a.color -and "$($a.color)" -match '^#?([0-9a-fA-F]{6})$') {
         $hx = $Matches[1]; $rgb = @([Convert]::ToInt32($hx.Substring(0, 2), 16), [Convert]::ToInt32($hx.Substring(2, 2), 16), [Convert]::ToInt32($hx.Substring(4, 2), 16))
         $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
@@ -2833,7 +2837,7 @@ namespace O {
     // alpha of every pixel is a fade of its distance to the NEAREST screen edge: no strips, nothing overlaps, no seams
     public static byte[] Make(int w, int h, int s, int r, int g, int b) {
       var px = new byte[w * h * 4]; var prof = new double[s];
-      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; prof[d] = t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65); }
+      for (int d = 0; d < s; d++) { double t = (d + 0.5) / s; prof[d] = 0.45 * (t <= 0.35 ? 0.59 + (0.18 - 0.59) * t / 0.35 : 0.18 * (1 - (t - 0.35) / 0.65)); }
       for (int y = 0; y < h; y++) { int dy = Math.Min(y, h - 1 - y);
         for (int x = 0; x < w; x++) { int d = Math.Min(dy, Math.Min(x, w - 1 - x)); if (d >= s) continue;
           double a = prof[d]; int i = (y * w + x) * 4; px[i] = (byte)(b * a); px[i + 1] = (byte)(g * a); px[i + 2] = (byte)(r * a); px[i + 3] = (byte)(255 * a); } }
@@ -2852,7 +2856,7 @@ Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSe
 $label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $pausedLabel = $env:HM_PAUSED; $ppid = [int]$env:HM_PPID
 $script:dpos = $null; $script:blendT = -1.0; $holdLabel = $env:HM_HOLD; $doneLabel = $env:HM_DONE; $awayLabel = $env:HM_AWAY; $script:note = ''; $script:pin = $null
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
-$script:state = 'ok'
+$script:state = 'ok'; $script:glowOn = $false
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
 $BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255; $GREEN = C 61 220 132; $script:okC = $BLUE
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
@@ -2912,11 +2916,11 @@ function Apply-State {
     $c = Cur; $key = "$($c.R),$($c.G),$($c.B)"   # the glow is cached per colour
     foreach ($m in $mons) {
         if (-not $m.cache.ContainsKey($key)) {
-            $px = [O.Glow]::Make($m.w, $m.h, [int](70 * $dpi), $c.R, $c.G, $c.B)
+            $px = [O.Glow]::Make($m.w, $m.h, [int](34 * $dpi), $c.R, $c.G, $c.B)
             $bs = [Windows.Media.Imaging.BitmapSource]::Create($m.w, $m.h, 96 * $dpi, 96 * $dpi, [Windows.Media.PixelFormats]::Pbgra32, $null, $px, $m.w * 4); $bs.Freeze()
             $m.cache[$key] = $bs
         }
-        $m.img.Source = $m.cache[$key]
+        $m.img.Source = $m.cache[$key]; $m.img.Opacity = $(if ($script:glowOn -and -not (Warn)) { 1 } else { 0 })   # no glow unless switched on, and none at all while waiting / paused / offline (the orange edge was the nuisance)
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
         $m.tb.Text = Label-Text; $m.tc.Text = Clock-Text; $m.tc.Visibility = $(if ($m.tc.Text) { 'Visible' } else { 'Collapsed' })
         if (Warn) {   # the orange dot pulses while the link is down or nobody has connected yet
@@ -3071,6 +3075,7 @@ function On-Line($line) {
     if (-not $f -or -not $f[0]) { return }
     if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; if ($f[1] -eq 'done') { $script:doneSec = [int]$script:clockT.Elapsed.TotalSeconds } else { $script:doneSec = $null }; $script:state = $f[1]; Apply-State }; return }
     if ($f[0] -eq 'color' -and $f.Count -ge 4) { $script:okC = C ([int]$f[1]) ([int]$f[2]) ([int]$f[3]); Apply-State; foreach ($m in $mons) { if ($script:busy) { $m.shadow.Color = (Cur) } }; return }
+    if ($f[0] -eq 'glow' -and $f.Count -gt 1) { $script:glowOn = ($f[1] -eq '1'); Apply-State; return }
     if ($f[0] -eq 'note64') { $script:note = $(if ($f.Count -gt 1) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($f[1])) } else { '' }); Apply-State; return }   # base64: stdin is read in the console code page (cp866), so Russian text came out as hieroglyphs
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
@@ -3260,10 +3265,11 @@ function Say-Step($name, $a) {
     else { Write-Host ('  -> ' + (T 'действия:' 'actions:')) -ForegroundColor Cyan; $i = 0; foreach ($x in $d) { $i++; Write-Host "       $i. $x" } }
 }
 function Play-Sound($kind) {
+    if (-not $script:SoundOn) { return }   # silent unless the admin panel or the AI switched sounds on
     try {
         if (-not $script:Snd.ContainsKey($kind)) {
-            $notes = if ($kind -eq 'ask') { @(@(784.0, 0.0, 0.55), @(1046.5, 0.16, 0.7)) } else { @(@(523.25, 0.0, 0.5), @(659.25, 0.12, 0.5), @(783.99, 0.24, 0.7)) }
-            $w = [K__BUILD__.Chime]::Make([double[]]($notes | ForEach-Object { $_[0] }), [double[]]($notes | ForEach-Object { $_[1] }), [double[]]($notes | ForEach-Object { $_[2] }), $(if ($kind -eq 'ask') { 0.5 } else { 0.4 }))
+            $notes = if ($kind -eq 'ask') { @(@(587.33, 0.0, 0.7), @(783.99, 0.2, 0.9)) } else { @(@(523.25, 0.0, 0.7), @(659.25, 0.18, 0.7), @(783.99, 0.36, 1.0)) }   # D5-G5 for a question, C5-E5-G5 for connected: gentle, low, unhurried
+            $w = [K__BUILD__.Chime]::Make([double[]]($notes | ForEach-Object { $_[0] }), [double[]]($notes | ForEach-Object { $_[1] }), [double[]]($notes | ForEach-Object { $_[2] }), 0.16)
             $script:Snd[$kind] = New-Object Media.SoundPlayer (New-Object IO.MemoryStream (, $w))
         }
         $script:Snd[$kind].Play()
@@ -3602,9 +3608,10 @@ function Start-Helper {
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
+    if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound }   # what the admin panel says a new link starts with (both off by default)
     Play-Sound 'ok'
     Start-Overlay
-    Overlay-Send 'state wait'
+    Overlay-Send 'state wait'; if ($script:GlowOn) { Overlay-Send 'glow 1' }
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
     $k::MenuRun = (T 'Меню:  [P] пауза    [X] выход (сразу)    [Esc] закрыть меню' 'Menu:  [P] pause    [X] exit (now)    [Esc] close the menu'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] выход (сразу)    [Esc] закрыть меню' 'Paused.  [R] continue    [X] exit (now)    [Esc] close the menu')
     $k::ConfirmEnd = (T 'Сеанс завершён. Код больше не работает.' 'Session ended. The code no longer works.')

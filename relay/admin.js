@@ -76,8 +76,9 @@
     const set = (c) => { col = c; picked = true; pick.value = c; show(); };
     const show = () => { sw.forEach((b, i) => b.classList.toggle('sel', SWATCH[i] === col)); pv.style.setProperty('--c', col || '#38ff7a'); pv.textContent = note.value.trim() || 'Task text appears here'; cnt.textContent = note.value.length + ' / 90'; };
     pick.addEventListener('input', () => set(pick.value)); note.addEventListener('input', show); show();
-    const body = el('div', { class: 'look' }, el('div', { class: 'row' }, el('label', { text: 'Glow colour' }), el('div', { class: 'sws' }, sw, pick)), el('div', { class: 'row' }, el('label', { text: 'Task text' }), note, cnt), el('div', { class: 'row' }, el('label', { text: 'Preview' }), pv));
-    return modal('Look of ' + s.code, body, { ok: 'Apply', onok: async () => { await call('look', { code: s.code, ...(picked ? { color: col } : {}), note: note.value }); return true; } });
+    const gl = el('input', { type: 'checkbox', id: 'lk-glow' }), sn = el('input', { type: 'checkbox', id: 'lk-snd' }); gl.checked = !!s.glow; sn.checked = !!s.sound;
+    const body = el('div', { class: 'look' }, el('div', { class: 'row' }, el('label', { text: 'Glow colour' }), el('div', { class: 'sws' }, sw, pick)), el('div', { class: 'row' }, el('label', { text: 'Task text' }), note, cnt), el('div', { class: 'row' }, el('label', { text: 'Preview' }), pv), el('div', { class: 'row' }, el('label', { class: 'chk', for: 'lk-glow' }, gl, ' Soft glow around the screen edges'), el('label', { class: 'chk', for: 'lk-snd' }, sn, ' Soft sounds (connect, question)')));
+    return modal('Look of ' + s.code, body, { ok: 'Apply', onok: async () => { await call('look', { code: s.code, ...(picked ? { color: col } : {}), note: note.value, glow: gl.checked, sound: sn.checked }); return true; } });
   }
   const MODES = [
     ['confirm', 'help', 'Confirm', 'The console asks before every action.'],
@@ -102,11 +103,18 @@
       el('div', { class: 'note', style: 'color:var(--mut)', text: 'No login yet? On the server run: helpermcp admin' })));
   }
 
+  function defaultsBar() {   // what a NEW link starts with; both are off until someone turns them on
+    const gl = el('input', { type: 'checkbox', id: 'df-glow', disabled: true }), sn = el('input', { type: 'checkbox', id: 'df-snd', disabled: true }), msg = el('span', { class: 'mut' });
+    const push = async () => { try { const j = await call('settings', { glow: gl.checked, sound: sn.checked }); gl.checked = j.glow; sn.checked = j.sound; msg.textContent = 'saved'; setTimeout(() => { msg.textContent = ''; }, 1500); } catch (e) { msg.textContent = e.message; } };
+    call('settings', {}).then((j) => { gl.checked = j.glow; sn.checked = j.sound; gl.disabled = sn.disabled = false; }).catch(() => {});
+    gl.addEventListener('change', push); sn.addEventListener('change', push);
+    return el('div', { class: 'defaults' }, el('b', { text: 'New links start with:' }), el('label', { class: 'chk', for: 'df-glow' }, gl, ' soft edge glow'), el('label', { class: 'chk', for: 'df-snd' }, sn, ' sounds'), msg, el('span', { class: 'mut', text: 'Off by default. Change a running session with Look.' }));
+  }
   async function panel(me) {
     const status = el('div', { class: 'cards' }), body = el('div');
     const TAB_ICON = { sessions: 'list', report: 'doc', account: 'lock' };
     const tabs = ['sessions', 'report', 'account'].map((t) => el('button', { class: t === tab ? 'on' : '', onclick: () => { tab = t; panel(me); } }, label(TAB_ICON[t], t[0].toUpperCase() + t.slice(1))));
-    app.replaceChildren(el('header', null, el('h1', { text: 'HelperMCP / admin' }), el('nav', null, tabs), el('span', { class: 'sp' }), el('span', { class: 'mut', text: me.user }), el('button', { onclick: async () => { try { await call('logout', {}); } catch (_) { /* gone */ } login(); } }, label('logout', 'Sign out'))), el('main', null, status, body));
+    app.replaceChildren(el('header', null, el('h1', { text: 'HelperMCP / admin' }), el('nav', null, tabs), el('span', { class: 'sp' }), el('span', { class: 'mut', text: me.user }), el('button', { onclick: async () => { try { await call('logout', {}); } catch (_) { /* gone */ } login(); } }, label('logout', 'Sign out'))), el('main', null, status, tab === 'sessions' ? defaultsBar() : null, body));
     clearInterval(timer);
     const guard = (e) => { if (e.status === 401) login('Signed out. Sign in again.'); else body.replaceChildren(el('div', { class: 'err', text: e.message })); };
     async function top() {

@@ -1,0 +1,10 @@
+{
+  "license": "MIT",
+  "framework": "net47",
+  "dll_sha256": "9c0ee9ec903a44f94e84369c1a961d8b16612a53837843559160a299aa58fd57",
+  "name": "YamlDotNet",
+  "source": "https://github.com/aaubry/YamlDotNet/tree/v18.1.0",
+  "package_url": "https://api.nuget.org/v3-flatcontainer/yamldotnet/18.1.0/yamldotnet.18.1.0.nupkg",
+  "version": "18.1.0",
+  "package_sha256": "59ffe65ade67ad9d886267f877b634a450363cb81b94e19db9ca4c36461416f6"
+}

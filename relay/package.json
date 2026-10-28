@@ -6,7 +6,12 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/e2e.mjs && node test/keep.mjs"
+    "test": "node test/input-privacy.mjs && node test/viewer-input.mjs && node test/viewer-stream.mjs && node test/control.mjs && node test/session-state.mjs && node test/e2e.mjs && node test/keep.mjs",
+    "test:privacy": "node test/input-privacy.mjs",
+    "test:video": "powershell -NoProfile -ExecutionPolicy Bypass -File test/video.ps1",
+    "test:control": "node test/viewer-input.mjs && node test/viewer-stream.mjs && node test/control.mjs && node test/session-state.mjs",
+    "test:profile": "powershell -NoProfile -ExecutionPolicy Bypass -File test/profile-runtime.ps1",
+    "test:network": "powershell -NoProfile -ExecutionPolicy Bypass -File test/input-privacy.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/pointer.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/keyboard.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/realtime.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/transfer.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/pointer-wrapper.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/viewer-native.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/network.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/profiles.ps1 && powershell -NoProfile -ExecutionPolicy Bypass -File test/recovery.ps1 && node test/network-e2e.mjs"
   },
   "engines": {
     "node": ">=18"
@@ -15,6 +20,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.0",
     "qrcode": "^1.5.4",
-    "zod": "^4.6.5"
+    "ws": "8.22.0",
+    "zod": "^4.6.6"
   }
 }

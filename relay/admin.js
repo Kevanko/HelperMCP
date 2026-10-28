@@ -1,7 +1,7 @@
 // HelperMCP admin panel (script from the server itself; no inline code). Everything shown comes through textContent.
 (function () {
   'use strict';
-  const app = document.getElementById('app'); let csrf = '', timer = null, tab = 'sessions';
+  const app = document.getElementById('app'); let csrf = '', timer = null, tab = 'sessions', refreshDevices = () => {};
   const el = (tag, props, ...kids) => {
     const e = document.createElement(tag);
     if (props) for (const k in props) { if (k === 'class') e.className = props[k]; else if (k === 'text') e.textContent = props[k]; else if (k === 'style') e.style.cssText = props[k]; else if (k.startsWith('on')) e.addEventListener(k.slice(2), props[k]); else if (props[k] != null && props[k] !== false) e.setAttribute(k, props[k] === true ? '' : props[k]); }
@@ -103,12 +103,12 @@
       el('div', { class: 'note', style: 'color:var(--mut)', text: 'No login yet? On the server run: helpermcp admin' })));
   }
 
-  function defaultsBar() {   // what a NEW link starts with; both are off until someone turns them on
+  function defaultsBar() {   // global actions; per-device toggles remain in the device row
     const gl = el('input', { type: 'checkbox', id: 'df-glow', disabled: true }), sn = el('input', { type: 'checkbox', id: 'df-snd', disabled: true }), msg = el('span', { class: 'mut' });
-    const push = async () => { try { const j = await call('settings', { glow: gl.checked, sound: sn.checked }); gl.checked = j.glow; sn.checked = j.sound; msg.textContent = 'saved'; setTimeout(() => { msg.textContent = ''; }, 1500); } catch (e) { msg.textContent = e.message; } };
+    const push = async (key) => { gl.disabled = sn.disabled = true; try { const j = await call('settings', { [key]: key === 'glow' ? gl.checked : sn.checked }); gl.checked = j.glow; sn.checked = j.sound; msg.textContent = 'Applied to all devices'; refreshDevices(); } catch (e) { msg.textContent = e.message; } finally { gl.disabled = sn.disabled = false; } };
     call('settings', {}).then((j) => { gl.checked = j.glow; sn.checked = j.sound; gl.disabled = sn.disabled = false; }).catch(() => {});
-    gl.addEventListener('change', push); sn.addEventListener('change', push);
-    return el('div', { class: 'defaults' }, el('b', { text: 'New links start with:' }), el('label', { class: 'chk', for: 'df-glow' }, gl, ' soft edge glow'), el('label', { class: 'chk', for: 'df-snd' }, sn, ' sounds'), msg, el('span', { class: 'mut', text: 'Off by default. Change a running session with Look.' }));
+    gl.addEventListener('change', () => push('glow')); sn.addEventListener('change', () => push('sound'));
+    return el('div', { class: 'defaults' }, el('b', { text: 'All devices' }), el('label', { class: 'chk', for: 'df-glow' }, gl, ' Glow'), el('label', { class: 'chk', for: 'df-snd' }, sn, ' Sound'), msg, el('span', { class: 'mut', text: 'Applies now and to new connections. Use the switches beside a device for a local change.' }));
   }
   async function panel(me) {
     const status = el('div', { class: 'cards' }), body = el('div');
@@ -128,17 +128,18 @@
           body.replaceChildren(rows.length ? el('table', null, el('thead', null, el('tr', null, ['', 'Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', ''].map((h) => el('th', { text: h })))),
             el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off' },
               el('td', { class: 'pv' }, previewTile(s)),
-              el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null),
+              el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null,
+                el('div', { class: 'device-switches', 'aria-label': 'This device only: ' + s.code }, ...['glow', 'sound','banner','timer'].map((key) => el('button', { class: 'device-toggle' + (s[key] ? ' on' : ''), 'aria-pressed': String(!!s[key]), title: 'Toggle ' + key + ' only on ' + s.code, onclick: async (e) => { e.currentTarget.disabled = true; try { await call('look', { code: s.code, [key]: !s[key] }); await draw(); } catch (err) { guard(err); } } }, ({glow:'Подсветка',sound:'Звук',banner:'Плашка',timer:'Таймер'}[key]) + ': ' + (s[key] ? 'вкл' : 'выкл'))))),
               el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os }), s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool + (r.args ? ' ' + r.args.slice(0, 40) : '')).join(' · ') }) : null),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
               el('td', null, el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
-              el('td', { text: ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
-              el('td', { class: 'ac' }, el('div', { class: 'acts' }, el('button', { class: 'go', title: 'open the live view', onclick: async () => { try { const j = await call('open', { code: s.code }); window.open(j.control, '_blank', 'noopener'); } catch (e) { guard(e); } } }, label('open', 'Open')),
-                el('button', { title: 'glow colour and task text', onclick: () => lookBox(s).catch(guard) }, label('eye', 'Look')),
+              el('td', { text: s.last_seen_s == null ? 'unknown' : ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
+              el('td', { class: 'ac' }, el('div', { class: 'acts' }, el('button', { class: 'go', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
+                el('button', { title: 'glow colour and task text for this device', onclick: () => lookBox(s).then(draw).catch(guard) }, label('eye', 'Look')),
                 el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End')))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
         } catch (e) { guard(e); }
       };
-      draw(); timer = setInterval(() => { draw(); top(); }, 3000);
+      refreshDevices = draw; draw(); timer = setInterval(() => { draw(); top(); }, 3000);
     } else if (tab === 'report') {
       const pre = el('pre', { text: 'loading…' }), sel = el('input', { type: 'number', min: 1, max: 60, value: 7, style: 'width:5rem' });
       const load = async () => { try { pre.textContent = (await call('report?days=' + (sel.value || 7))).text; } catch (e) { guard(e); } };

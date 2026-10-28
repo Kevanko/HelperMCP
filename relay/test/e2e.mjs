@@ -35,7 +35,9 @@ if (process.env.PORTABLE) {
   for (const k of Object.keys(agentEnv)) if (k.toUpperCase() === 'PATH') agentEnv[k] = agentEnv[k].split(path.delimiter).filter((p) => !/node/i.test(p)).join(path.delimiter);
 }
 const useps = (process.env.AGENT || (process.platform === 'win32' ? 'ps' : 'py')) === 'ps';
-const src = await (await fetch(BASE + (useps ? '/h' : '/p'))).text();
+const bootstrapBytes = await (await fetch(BASE + (useps ? '/h' : '/p'))).arrayBuffer();
+const src = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bootstrapBytes);
+assert.ok(!src.startsWith('\uFEFF'), 'in-memory bootstrap must not start with a file BOM');
 assert.ok(!src.includes('__RELAY__') || src.includes(BASE), 'relay URL must be baked in');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-'));
 const file = path.join(tmp, useps ? 'a.ps1' : 'a.py');
@@ -179,6 +181,17 @@ const nc = txt(await tool('system', { session: code, sections: ['network', 'conn
 assert.match(nc, /== network/); assert.match(nc, /== connections|== TCP connections/); assert.match(nc, /== reach/);
 if (useps) { assert.match(nc, /\[Up\]/, 'every adapter is listed with its state'); assert.match(nc, /agent link:/, 'the route layer reports the agent link'); assert.match(nc, /VPN \/ DPI-bypass/, 'reach names VPN / DPI tools'); }
 console.log('system network / connections / reach ok');
+if (useps) {
+  const report = JSON.parse(txt(await tool('net_check', { session: code, mode: 'sites', single_path: true, detail: true, urls: [BASE + '/health'], samples: 2, timeout_ms: 600 })));
+  assert.equal(report.results.length, 1);
+  assert.equal(report.results[0].route.index, 0);
+  assert.equal(report.results[0].samples.length, 2);
+  assert.ok(report.results[0].samples.every((s) => s.status === 200 && s.bytes === 2 && !s.error), JSON.stringify(report));
+  assert.equal(typeof report.cpu_after_pct, 'number');
+  const missing = await tool('net_check', { session: code, mode: 'sites', interface_index: 2147483647, urls: [BASE + '/health'] });
+  assert.ok(missing.isError); assert.match(txt(missing), /Adapter is down/);
+  console.log('net_check real Windows agent, HTTP payload, exact adapter rejection ok');
+}
 assert.match(txt(await tool('util', { session: code, op: 'env_get', name: 'PATH' })), useps ? /process: .+/ : /.+/);
 if (useps) {   // registry search, crash report, run history (Windows only)
   await tool('util', { session: code, op: 'reg_set', path: 'HKCU\\Software\\HmFindTest', name: 'hm_find_name', value: 'hm_find_data_77' });
@@ -234,6 +247,13 @@ if (useps) {
   assert.match(txt(await tool('ui_tree', { session: code, window: 'HM UI Test' })), /^window "HM UI Test clicked"/, 'ui_click pressed the real button');
   assert.match(txt(await tool('ui_set', { session: code, name: 'txtName', value: 'привет world', window: 'HM UI Test' })), /: set$/);
   assert.match(txt(await tool('ui_tree', { session: code, window: 'HM UI Test', query: 'txtName' })), /="привет world"/, 'ui_set value read back');
+  const privateInput = 'https://fixture.invalid/sub/opaque-private-input-value';
+  assert.match(txt(await tool('ui_set', { session: code, name: 'txtName', value: privateInput, window: 'HM UI Test' })), /: set$/);
+  const inputHistory = txt(await tool('session_log', { session: code }));
+  assert.ok(!inputHistory.includes('opaque-private-input') && !inputHistory.includes('fixture.invalid'), 'recent actions must hide input values before truncation');
+  await tool('report_miss', { session: code, wanted: 'privacy fixture', happened: 'explicit fixture marker' });
+  assert.ok(!txt(await tool('misses', { limit: 1 })).includes('opaque-private-input'), 'mistake trails must not retain private inputs');
+  assert.ok(!agentOut.includes(privateInput.slice(0, 35)), 'agent console must not preview private text');
   const ag = txt(await tool('ui_tree', { session: code, window: 'HM UI Test', query: 'Agree' })); const agId = /\n(\d+) check "Agree"/.exec(ag)[1];
   assert.match(txt(await tool('ui_click', { session: code, id: Number(agId) })), /toggled \(now on\)/);
   const bad = await raw('ui_click', { session: code, name: 'no-such-control-xyz', window: 'HM UI Test' }); assert.ok(bad.isError && /No control named/.test(txt(bad)), 'a missing control says so'); console.log('ui_tree / ui_click / ui_set ok');
@@ -302,6 +322,7 @@ relay.kill(); await new Promise((x) => setTimeout(x, 800));
 relay = await startRelay();
 const after = JSON.parse(txt(await tool('list_sessions')));
 assert.ok(after.some((x) => x.code === code), 'session must be restored from the state file');
+assert.match(txt(await tool('wait_online', { session: code, timeout_s: 30 })), /online/, 'restored state must wait for a real agent poll');
 assert.match(txt(await tool('run', { session: code, command: 'echo after-restart' })), /after-restart/);
 assert.match(await (await fetch(vurl0)).text(), /Remote screen/);
 console.log('relay restart: session + agent + viewer link survive ok');

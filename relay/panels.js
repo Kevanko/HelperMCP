@@ -203,8 +203,36 @@
   // ---- Network
   function Net(box) {
     const pre = el('pre', { class: 'find', style: 'flex:1;overflow:auto;margin:0' }), msg = msgBox();
-    box.append(el('div', { class: 'pb' }, el('button', { text: T('Adapters', 'Адаптеры'), onclick: () => load('adapters') }), el('button', { text: T('Test every adapter against the relay (4 s)', 'Проверить каждый адаптер до сервера (4 с)'), onclick: () => load('reach') }), el('span', { class: 'sp' })), pre, msg);
-    async function load(k) { pre.textContent = T('working…', 'проверяю…'); try { pre.textContent = await api(k); } catch (e) { pre.textContent = String(e.message || e); } }
+    const index = el('input', { type: 'number', min: 0, max: 2147483647, value: 0, style: 'width:5rem', 'aria-label': T('Adapter index (0: default)', 'Индекс адаптера (0: текущий маршрут)') });
+    const job = el('input', { type: 'text', maxlength: 24, placeholder: T('Recovery job ID', 'ID задания восстановления'), 'aria-label': T('Recovery job ID', 'ID задания восстановления'), style: 'width:15rem' });
+    box.append(el('div', { class: 'pb' }, el('button', { text: T('Adapters', 'Адаптеры'), onclick: () => load('adapters') }), el('button', { text: T('Relay by adapter', 'Связь с Helper'), onclick: () => load('reach') }), el('button', { text: T('Diagnose internet', 'Диагностика интернета'), onclick: () => load('netcheck') }), el('button', { text: T('Routes / DNS', 'Маршруты / DNS'), onclick: () => network('routes') })),
+      el('div', { class: 'pb' }, el('button', { text: T('Recovery jobs', 'Задания восстановления'), onclick: () => network('jobs') }), index, el('button', { text: T('Test recovery guard', 'Проверить защиту восстановления'), title: T('No network changes; elevated Helper required', 'Без изменения сети; нужны права администратора'), onclick: () => network('selftest') }), job, el('button', {text:T('Status','Статус'),onclick:()=>network('status')}), el('button', {text:T('Rollback','Откатить'),onclick:()=>network('rollback')})), pre, msg);
+    let busy = false;
+    async function network(kind) {
+      if (busy) return; busy = true; pre.textContent = T('working…', 'проверяю…');
+      try { const r = await post('/network', { kind, interface_index: Number(index.value || 0), job: job.value.trim() }); const d=JSON.parse(r.text); if(d.job)job.value=d.job; pre.textContent=JSON.stringify(d,null,2); }
+      catch(e){pre.textContent=String(e.message||e);}finally{busy=false;}
+    }
+    async function load(k) {
+      if (busy) return; busy = true;
+      pre.textContent = T('working…', 'проверяю…');
+      try {
+        const value = await api(k);
+        if (k !== 'netcheck') pre.textContent = value;
+        else {
+          const d = JSON.parse(value), lines = [T('Helper: ', 'Helper: ') + d.helper_path,
+            T('CPU before/after: ', 'CPU до/после: ') + d.cpu_before_pct + '% / ' + d.cpu_after_pct + '%',
+            T('VPN/filter processes: ', 'Процессы VPN/фильтров: ') + (d.tools || []).join(', '), ...d.notes, ''];
+          for (const r of d.results || []) {
+            lines.push(`${r.route.name} [if=${r.route.index}] → ${r.target.host}:${r.target.port}`);
+            for (const q of r.dns || []) lines.push(`  DNS ${q.server}: ${(q.addresses || []).join(', ')} ${q.error || ''} (${q.ms} ms)`);
+            for (const s of r.samples || []) lines.push(`  TCP ${s.tcp_ms} ms · TLS ${s.tls_ms} ms · HTTP ${s.status || '—'} · ${s.bytes} B · ${s.total_ms} ms · ${s.error ? s.stage + ': ' + s.error : s.stage}`);
+            lines.push(...r.findings.map((x) => '  ' + x), '');
+          }
+          pre.textContent = lines.join('\n');
+        }
+      } catch (e) { pre.textContent = String(e.message || e); } finally { busy = false; }
+    }
     load('adapters'); return { stop() {} };
   }
 
@@ -326,7 +354,7 @@
     async function download() {
       const n = one(); if (!n) { note(T('select one file or folder', 'выберите один файл или папку')); return; }
       note(T('preparing the link…', 'готовлю ссылку…'));
-      try { const j = await post('/get', { path: join(cwd, n) }); const u = (j.text || '').split(' ')[0]; if (/^https?:/.test(u)) { window.open(u, '_blank', 'noopener'); note(T('download started: ', 'скачивание: ') + n); } else note(j.text || 'failed'); } catch (e) { note(e.message); }
+      try { const j = await post('/get', { path: join(cwd, n) }); const u = new URL((j.text || '').split(/\s/)[0]); if(u.origin!==location.origin||u.username||u.password||!/^\/f\/[a-f0-9]{24}\//.test(u.pathname))throw Error(T('Untrusted download link','Недоверенная ссылка скачивания')); window.open(u.href, '_blank', 'noopener,noreferrer'); note(T('download started: ', 'скачивание: ') + n); } catch (e) { note(e.message); }
     }
     async function upload(files) {
       for (const f of files) { note(T('uploading ', 'загружаю ') + f.name + '…'); try { const r = await fetch(cfg.base + '/upload?name=' + encodeURIComponent(f.name) + '&dir=' + encodeURIComponent(cwd), { method: 'POST', headers: hdr(), body: f }), j = await r.json(); if (!r.ok) throw new Error(j.error); note(T('saved: ', 'сохранено: ') + j.path); } catch (e) { note(e.message); } }
@@ -365,6 +393,7 @@
     [...tabsEl.children].forEach((b) => b.classList.toggle('on', b.dataset.t === id));
   };
   P.close = () => { if (cur && cur.stop) cur.stop(); cur = null; drawer.hidden = true; body.replaceChildren(); };
+  P.suspend = () => { if (drawer) P.close(); ['bsys','bfil'].forEach((id) => { const b=$(id); if(b)b.disabled=true; }); };
 
   P.init = async function (c) {
     cfg = c; if (!cfg.CTL) return;

@@ -11,7 +11,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PORT = 18900 + Math.floor(Math.random() * 90), BASE = `http://127.0.0.1:${PORT}`, KEY = 'keep-test-key';
-const STATE = path.join(os.tmpdir(), `hm-keep-${PORT}.json`), SDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-keepstate-'));
+const SDIR = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-keepstate-')), STATE = path.join(SDIR, 'relay-state.json');
 const kids = [];
 const stop = () => kids.forEach((k) => { try { k.kill('SIGKILL'); } catch { /* gone */ } });
 process.on('exit', stop);

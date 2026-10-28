@@ -58,3 +58,5 @@ td.pv,th:first-child{width:1%;padding-right:.2rem}
 .modeopt.sel{border-color:var(--g);box-shadow:0 0 10px rgba(56,255,122,.15)}.modeopt.sel b{color:var(--g)}
 .defaults{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin:0 0 1rem;padding:.6rem .8rem;border:1px solid var(--line,#2a3a33);border-radius:8px}.chk{display:inline-flex;gap:.4rem;align-items:center;cursor:pointer}.look .chk{display:flex;margin-bottom:.35rem;color:inherit}
 .chk input{padding:0;width:auto}
+.device-switches{display:flex;gap:.35rem;margin-top:.4rem;flex-wrap:wrap}.device-toggle{font-size:11px;padding:.18rem .4rem;white-space:nowrap;color:var(--mut)}.device-toggle.on{color:var(--g);border-color:var(--line2)}button:disabled{opacity:.5;cursor:wait}.defaults>b{color:var(--g);margin-right:.3rem}
+.recent{max-width:24rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.defaults .mut{flex-basis:100%}.acts{gap:.3rem}

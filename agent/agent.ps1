@@ -1,4 +1,4 @@
-# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
+﻿# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
 #   [Net.ServicePointManager]::SecurityProtocol=3072; irm RELAY/h | iex
 $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session
 # Windows PowerShell 5.1 started from PowerShell 7 inherits a module path pointing at 7's modules and then fails to load even
@@ -7,7 +7,7 @@ if ($PSVersionTable.PSVersion.Major -le 5 -and "$env:PSModulePath" -match 'Power
 $RELAY = if ($env:HELPER_RELAY) { $env:HELPER_RELAY } else { '__RELAY__' }
 $ru = $env:HELPER_LANG -eq 'ru'   # the console speaks English; HELPER_LANG=ru for Russian
 function T($r, $e) { if ($ru) { $r } else { $e } }
-$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'fsop', 'util', 'ui_click', 'ui_set', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
+$AskTools = 'run', 'start_process', 'fetch_file', 'write_file', 'edit_file', 'push_file', 'fsop', 'util', 'net_recover', 'ui_click', 'ui_set', 'click', 'move', 'drag', 'type_text', 'press_key', 'scroll', 'actions', 'mcp_start', 'mcp_call'
 $NodeVersion = 'v22.11.0'; $NodeMin = 20   # Playwright & co. need Node >= 20
 $script:NodeDir = $null; $script:NodeBin = $null
 $script:TmpDirs = @(); $script:OverlayProc = $null; $script:OverlayIn = $null
@@ -35,6 +35,9 @@ Add-Type -Namespace H -Name U__BUILD__ -MemberDefinition @'
 [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr e);
 '@
 [void][H.U__BUILD__]::SetProcessDPIAware()   # real pixels, not scaled ones
+# Selecting text in the classic console otherwise suspends its writer and the
+# command loop. Remote input must not freeze when the console is clicked.
+try{$consoleInput=[H.U__BUILD__]::GetStdHandle(-10);$consoleMode=0;if([H.U__BUILD__]::GetConsoleMode($consoleInput,[ref]$consoleMode)){[void][H.U__BUILD__]::SetConsoleMode($consoleInput,($consoleMode -bor 0x80) -band (-bnot 0x40))}}catch{}
 Add-Type -ReferencedAssemblies Accessibility, System.Drawing -TypeDefinition @"
 using System; using System.Runtime.InteropServices;
 namespace V__BUILD__ {
@@ -181,7 +184,7 @@ namespace V__BUILD__ {
   }
 }
 "@
-$script:GlowOn = $false; $script:SoundOn = $false   # the edge glow and the sounds are off until the relay (admin panel) or the AI switches them on
+$script:GlowOn = $false; $script:SoundOn = $false;$script:BannerOn=$true;$script:TimerOn=$true
 $script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
 $GlowDepth = [int](34 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))   # the edge glow is thin and soft; off unless switched on
 # ---- did an action change anything? A coarse picture around the target and of the whole screen before and after (the overlay's own label and glow are left out)
@@ -216,7 +219,21 @@ function Probe-Report($before, $after, $what, $moved) {   # -> a short line for 
 Add-Type -ReferencedAssemblies System.Drawing, System.Windows.Forms -TypeDefinition @"
 using System; using System.IO; using System.Text; using System.Text.RegularExpressions; using System.Collections.Generic; using System.Diagnostics; using System.Runtime.InteropServices;
 using System.Drawing; using System.Drawing.Imaging; using System.Net; using System.Net.Sockets; using System.Net.NetworkInformation; using System.Threading;
+__NETWORK_SHARED_CS__
+__VIDEO_SHARED_CS__
 namespace F__BUILD__ {
+  public sealed class ApiReply { public int StatusCode;public string Content; }
+  public static class RelayApi {
+    public static ApiReply Request(string url,byte[] body,string encoding,string token,int seconds) {
+      var rq=(HttpWebRequest)WebRequest.Create(url);rq.Proxy=Route.Proxy;
+      rq.Method=body==null?"GET":"POST";rq.Timeout=seconds*1000;rq.ReadWriteTimeout=seconds*1000;
+      rq.ServicePoint.Expect100Continue=false;rq.ServicePoint.UseNagleAlgorithm=false;rq.ServicePoint.ConnectionLimit=16;
+      rq.AutomaticDecompression=DecompressionMethods.GZip|DecompressionMethods.Deflate;
+      if(!string.IsNullOrEmpty(token))rq.Headers["Authorization"]="Bearer "+token;
+      if(body!=null){rq.ContentType="application/json; charset=utf-8";rq.ContentLength=body.Length;if(!string.IsNullOrEmpty(encoding))rq.Headers["Content-Encoding"]=encoding;using(var output=rq.GetRequestStream())output.Write(body,0,body.Length);}
+      using(var response=(HttpWebResponse)rq.GetResponse())using(var input=new StreamReader(response.GetResponseStream(),Encoding.UTF8))return new ApiReply{StatusCode=(int)response.StatusCode,Content=input.ReadToEnd()};
+    }
+  }
   public static class Fs {
     static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "__pycache__", "`$Recycle.Bin", "System Volume Information" };
     public static string Human(long n) { double d = n; string[] u = { "B", "K", "M", "G", "T" }; int i = 0; while (d >= 1024 && i < 4) { d /= 1024; i++; } return i == 0 ? n + "B" : d.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + u[i]; }
@@ -388,7 +405,7 @@ namespace F__BUILD__ {
     [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
     [StructLayout(LayoutKind.Sequential)] struct PERFINFO { public uint cb; public UIntPtr CommitTotal, CommitLimit, CommitPeak, PhysicalTotal, PhysicalAvailable, SystemCache, KernelTotal, KernelPaged, KernelNonpaged, PageSize; public uint HandleCount, ProcessCount, ThreadCount; }
     [DllImport("psapi.dll")] static extern bool GetPerformanceInfo(out PERFINFO p, int size);
-    [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
+    [DllImport("kernel32.dll")] public static extern ulong GetTickCount64();
 
     static Dictionary<int, int[]> Toolhelp() {   // pid -> { parent pid, threads }
       var d = new Dictionary<int, int[]>(); thNames = new Dictionary<int, string>(); var h = CreateToolhelp32Snapshot(2, 0); if (h == (IntPtr)(-1)) return d;
@@ -544,14 +561,20 @@ namespace F__BUILD__ {
     }
   }
 
-  // The live picture for the viewer, like a video call: its own thread films the screen ~15 times a second, compares it with the last frame in
-  // 64x64 tiles and sends only the tiles that changed (a full picture when much changed, on request and every 10 s) over one long upload.
-  // ponytail: JPEG tiles, not H.264; a portable ffmpeg (gdigrab + libx264 -tune zerolatency) could feed V frames the same way if more is needed
+  // Capture and encoding run independently of command polling. Windows H.264
+  // carries motion; JPEG tiles remain available when video is unsupported.
   public static class Live {
     public static string Relay, Token; public static volatile string Err = "";
-    static volatile bool run, key; static volatile int mon = -1; static Thread th;
+    public static volatile bool Video;
+    static int streamId,streamErrors;static string streamError="";
+    static volatile bool run, key; static volatile int mon = -1; static Thread th;static volatile HttpWebRequest activeRequest;
+    static int statsBusy; static string stats;
+    static void RefreshStats() {
+      if(Interlocked.CompareExchange(ref statsBusy,1,0)!=0)return;
+      ThreadPool.QueueUserWorkItem(delegate { try { Interlocked.Exchange(ref stats,Sys.Snap(10)); } catch { } finally { Interlocked.Exchange(ref statsBusy,0); } });
+    }
     public static void Start(int m) { if (m != mon) key = true; mon = m; run = true; Route.Streaming = true; if (th == null || !th.IsAlive) { th = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.BelowNormal }; th.Start(); } }
-    public static void Stop() { run = false; Route.Streaming = false; }
+    public static void Stop() { run = false; Route.Streaming = false;var request=activeRequest;if(request!=null)try{request.Abort();}catch{} }
     public static void Key() { key = true; }
     public static bool Running { get { return th != null && th.IsAlive && run; } }
 
@@ -560,13 +583,17 @@ namespace F__BUILD__ {
       for (int i = 0; i < scr.Length; i++) { var b = scr[i].Bounds; if (i > 0) sb.Append(','); sb.Append('[').Append(b.X).Append(',').Append(b.Y).Append(',').Append(b.Width).Append(',').Append(b.Height).Append(',').Append(scr[i].Primary ? 1 : 0).Append(']'); }
       return sb.Append(']').ToString();
     }
-    static void Loop() { while (run) { try { Session(); } catch (Exception e) { Err = e.Message; } if (run) Thread.Sleep(1000); } }
+    static void Loop() { while (run) { try { Session(); } catch (Exception e) { if(run){streamErrors++;streamError=e.GetType().Name+":"+e.HResult.ToString("x8");Err = e.Message;} } if (run) Thread.Sleep(1000); } }
 
     static ImageCodecInfo Jpg = Array.Find(ImageCodecInfo.GetImageEncoders(), c => c.MimeType == "image/jpeg");
-    static byte[] Jpeg(Bitmap b, long q) { using (var ms = new MemoryStream()) { var ep = new EncoderParameters(1); ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, q); b.Save(ms, Jpg, ep); return ms.ToArray(); } }
+    static byte[] Jpeg(Bitmap b, long q) { using (var ms = new MemoryStream()) using(var ep = new EncoderParameters(1)) { ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, q); b.Save(ms, Jpg, ep); return ms.ToArray(); } }
     static void Put16(MemoryStream m, int v) { m.WriteByte((byte)(v >> 8)); m.WriteByte((byte)v); }
     static void Put32(MemoryStream m, int v) { m.WriteByte((byte)(v >> 24)); m.WriteByte((byte)(v >> 16)); m.WriteByte((byte)(v >> 8)); m.WriteByte((byte)v); }
-    static void Send(Stream st, char type, byte[] p) { var h = new byte[] { (byte)(p.Length >> 24), (byte)(p.Length >> 16), (byte)(p.Length >> 8), (byte)p.Length, (byte)type }; st.Write(h, 0, 5); st.Write(p, 0, p.Length); st.Flush(); }
+    static void Send(Stream st, char type, byte[] p) {
+      // One write avoids a separate tiny TLS record for every frame header.
+      var packet = new byte[p.Length + 5]; packet[0]=(byte)(p.Length>>24);packet[1]=(byte)(p.Length>>16);packet[2]=(byte)(p.Length>>8);packet[3]=(byte)p.Length;packet[4]=(byte)type;
+      Buffer.BlockCopy(p,0,packet,5,p.Length);st.Write(packet,0,packet.Length);st.Flush();
+    }
 
     [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public int x, y; }
     [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHot, yHot; public IntPtr hbmMask, hbmColor; }
@@ -586,33 +613,164 @@ namespace F__BUILD__ {
       for (int y = y0; y < y1; y++) { int i = y * w + x0, e = y * w + x1; for (; i < e; i++) if (a[i] != b[i]) return true; }
       return false;
     }
+    static string H264Codec(byte[] data){for(int i=0;i+7<data.Length;i++)if(data[i]==0&&data[i+1]==0&&data[i+2]==1&&(data[i+3]&31)==7)return "avc1."+data[i+4].ToString("x2")+data[i+5].ToString("x2")+data[i+6].ToString("x2");return null;}
+    static bool H264Key(byte[] data){for(int i=0;i+3<data.Length;i++)if(data[i]==0&&data[i+1]==0&&data[i+2]==1&&(data[i+3]&31)==5)return true;return false;}
 
+    sealed class DesktopCopy : IDisposable {
+      [DllImport("d3d11.dll")]static extern int D3D11CreateDevice(IntPtr adapter,int driver,IntPtr software,uint flags,IntPtr levels,uint count,uint sdk,out IntPtr device,out uint feature,out IntPtr context);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int GetAdapter(IntPtr self,out IntPtr adapter);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int GetOutput(IntPtr self,uint index,out IntPtr output);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int Description(IntPtr self,IntPtr desc);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int Duplicate(IntPtr self,IntPtr device,out IntPtr duplicate);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int Acquire(IntPtr self,uint timeout,IntPtr info,out IntPtr resource);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int ReleaseFrame(IntPtr self);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate void TextureDescription(IntPtr self,out TextureDesc desc);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int CreateTexture(IntPtr self,ref TextureDesc desc,IntPtr initial,out IntPtr texture);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate void CopyResource(IntPtr self,IntPtr target,IntPtr source);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int MapResource(IntPtr self,IntPtr resource,uint subresource,int type,uint flags,out Mapped mapped);
+      [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate void UnmapResource(IntPtr self,IntPtr resource,uint subresource);
+      [StructLayout(LayoutKind.Sequential)]struct TextureDesc {public uint Width,Height,Mips,Array,Format,SampleCount,SampleQuality,Usage,Bind,Access,Misc;}
+      [StructLayout(LayoutKind.Sequential)]struct Mapped {public IntPtr Data;public uint RowPitch,DepthPitch;}
+      static T Fn<T>(IntPtr obj,int slot){return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(obj),slot*IntPtr.Size),typeof(T));}
+      static void Check(int hr){Marshal.ThrowExceptionForHR(hr);}
+      IntPtr device,context,dup,stage,info;Acquire acquire;ReleaseFrame release;CopyResource copy;MapResource map;UnmapResource unmap;
+      readonly Rectangle area;bool hasFrame;int[] pixels;public bool SeparatePointer;public bool HasColor {get{if(pixels==null)return false;for(int i=0;i<pixels.Length;i+=997)if((pixels[i]&0xffffff)!=0)return true;return false;}}
+      public DesktopCopy(Rectangle area){this.area=area;IntPtr dxdev=IntPtr.Zero,adapter=IntPtr.Zero,output=IntPtr.Zero,output1=IntPtr.Zero,desc=IntPtr.Zero;
+        try{uint level;Check(D3D11CreateDevice(IntPtr.Zero,1,IntPtr.Zero,0x20,IntPtr.Zero,0,7,out device,out level,out context));
+          Guid id=new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");Check(Marshal.QueryInterface(device,ref id,out dxdev));Check(Fn<GetAdapter>(dxdev,7)(dxdev,out adapter));
+          desc=Marshal.AllocHGlobal(128);bool found=false;
+          for(uint n=0;n<32;n++){if(Fn<GetOutput>(adapter,7)(adapter,n,out output)<0)break;Check(Fn<Description>(output,7)(output,desc));
+            var bounds=Rectangle.FromLTRB(Marshal.ReadInt32(desc,64),Marshal.ReadInt32(desc,68),Marshal.ReadInt32(desc,72),Marshal.ReadInt32(desc,76));
+            if(bounds==area&&Marshal.ReadInt32(desc,84)==1){found=true;break;}Marshal.Release(output);output=IntPtr.Zero;}
+          if(!found)throw new NotSupportedException("Desktop duplication needs one unrotated output");
+          id=new Guid("00cddea8-939b-4b83-a340-a685226666cc");Check(Marshal.QueryInterface(output,ref id,out output1));Check(Fn<Duplicate>(output1,22)(output1,device,out dup));
+          acquire=Fn<Acquire>(dup,8);release=Fn<ReleaseFrame>(dup,14);copy=Fn<CopyResource>(context,47);map=Fn<MapResource>(context,14);unmap=Fn<UnmapResource>(context,15);info=Marshal.AllocHGlobal(128);pixels=new int[checked(area.Width*area.Height)];
+        }catch{Dispose();throw;}finally{if(desc!=IntPtr.Zero)Marshal.FreeHGlobal(desc);foreach(var p in new[]{output1,output,adapter,dxdev})if(p!=IntPtr.Zero)Marshal.Release(p);}
+      }
+      public bool Capture(Bitmap target){IntPtr resource=IntPtr.Zero,texture=IntPtr.Zero;int hr=acquire(dup,hasFrame?0u:100u,info,out resource);
+        if(hr==unchecked((int)0x887A0027)){if(hasFrame)Write(target);return hasFrame;}Check(hr);SeparatePointer=Marshal.ReadInt32(info,36)!=0;
+        try{Guid id=new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");Check(Marshal.QueryInterface(resource,ref id,out texture));
+          if(stage==IntPtr.Zero){TextureDesc d;Fn<TextureDescription>(texture,10)(texture,out d);if(d.Width!=area.Width||d.Height!=area.Height||d.Format!=87||d.SampleCount!=1)throw new NotSupportedException("Unexpected desktop texture");d.Mips=1;d.Array=1;d.Usage=3;d.Bind=0;d.Access=0x20000;d.Misc=0;Check(Fn<CreateTexture>(device,5)(device,ref d,IntPtr.Zero,out stage));}
+          copy(context,stage,texture);Mapped mapped;Check(map(context,stage,0,1,0,out mapped));
+          try{if(mapped.RowPitch<target.Width*4||mapped.RowPitch>1000000)throw new InvalidOperationException("Invalid desktop pitch");
+            if(mapped.RowPitch==target.Width*4)Marshal.Copy(mapped.Data,pixels,0,pixels.Length);
+            else for(int y=0;y<target.Height;y++)Marshal.Copy(IntPtr.Add(mapped.Data,checked((int)(y*mapped.RowPitch))),pixels,y*target.Width,target.Width);
+          }finally{unmap(context,stage,0);}hasFrame=true;Write(target);return true;
+        }finally{if(texture!=IntPtr.Zero)Marshal.Release(texture);if(resource!=IntPtr.Zero)Marshal.Release(resource);Check(release(dup));}
+      }
+      void Write(Bitmap target){var bits=target.LockBits(new Rectangle(0,0,target.Width,target.Height),ImageLockMode.WriteOnly,PixelFormat.Format32bppRgb);try{if(bits.Stride==target.Width*4)Marshal.Copy(pixels,0,bits.Scan0,pixels.Length);else for(int y=0;y<target.Height;y++)Marshal.Copy(pixels,y*target.Width,IntPtr.Add(bits.Scan0,y*bits.Stride),target.Width);}finally{target.UnlockBits(bits);}}
+      public void Dispose(){if(info!=IntPtr.Zero){Marshal.FreeHGlobal(info);info=IntPtr.Zero;}foreach(var p in new[]{stage,dup,context,device})if(p!=IntPtr.Zero)Marshal.Release(p);stage=dup=context=device=IntPtr.Zero;}
+    }
+    sealed class GdiBuffer : IDisposable {
+      [DllImport("user32.dll")]static extern IntPtr GetDC(IntPtr window);
+      [DllImport("user32.dll")]static extern int ReleaseDC(IntPtr window,IntPtr dc);
+      [DllImport("gdi32.dll")]static extern IntPtr CreateCompatibleDC(IntPtr dc);
+      [DllImport("gdi32.dll")]static extern bool DeleteDC(IntPtr dc);
+      [DllImport("gdi32.dll")]static extern bool DeleteObject(IntPtr obj);
+      [DllImport("gdi32.dll")]static extern IntPtr SelectObject(IntPtr dc,IntPtr obj);
+      [DllImport("gdi32.dll")]static extern IntPtr CreateDIBSection(IntPtr dc,ref Info info,uint usage,out IntPtr bits,IntPtr section,uint offset);
+      [DllImport("gdi32.dll",SetLastError=true)]static extern bool BitBlt(IntPtr target,int x,int y,int w,int h,IntPtr source,int sx,int sy,uint operation);
+      [DllImport("gdi32.dll")]static extern bool GdiFlush();
+      [StructLayout(LayoutKind.Sequential)]struct Info {public uint Size;public int Width,Height;public ushort Planes,Bits;public uint Compression,ImageSize;public int X,Y;public uint Used,Important;}
+      IntPtr screen,memory,bitmap,previous;public Bitmap Image;
+      public GdiBuffer(int width,int height){try{
+        if(width<1||height<1||width>32768||height>32768)throw new ArgumentOutOfRangeException();int stride=checked(width*4);
+        screen=GetDC(IntPtr.Zero);if(screen==IntPtr.Zero)throw new System.ComponentModel.Win32Exception();memory=CreateCompatibleDC(screen);if(memory==IntPtr.Zero)throw new System.ComponentModel.Win32Exception();
+        var info=new Info{Size=40,Width=width,Height=-height,Planes=1,Bits=32};IntPtr bits;bitmap=CreateDIBSection(screen,ref info,0,out bits,IntPtr.Zero,0);
+        if(bitmap==IntPtr.Zero||bits==IntPtr.Zero)throw new System.ComponentModel.Win32Exception();previous=SelectObject(memory,bitmap);if(previous==IntPtr.Zero||previous==new IntPtr(-1))throw new System.ComponentModel.Win32Exception();
+        Image=new Bitmap(width,height,stride,PixelFormat.Format32bppRgb,bits);
+      }catch{Dispose();throw;}}
+      public void Capture(Rectangle area){if(!BitBlt(memory,0,0,area.Width,area.Height,screen,area.Left,area.Top,0x00cc0020))throw new System.ComponentModel.Win32Exception();GdiFlush();}
+      public void Dispose(){if(Image!=null){Image.Dispose();Image=null;}if(memory!=IntPtr.Zero&&previous!=IntPtr.Zero&&previous!=new IntPtr(-1))SelectObject(memory,previous);if(bitmap!=IntPtr.Zero)DeleteObject(bitmap);if(memory!=IntPtr.Zero)DeleteDC(memory);if(screen!=IntPtr.Zero)ReleaseDC(IntPtr.Zero,screen);screen=memory=bitmap=previous=IntPtr.Zero;}
+    }
+    // Keep GDI surfaces for the session instead of allocating several MB and
+    // new device contexts for every frame. Dispose on resize, failure and EOF.
+    sealed class CaptureSurface : IDisposable {
+      Bitmap full,scaled;Graphics copy,resize;DesktopCopy desktop;GdiBuffer native;DateTime retry;bool checkedDesktop;public string Mode="gdi";
+      bool Verify(Rectangle area){using(var reference=new Bitmap(area.Width,area.Height,PixelFormat.Format32bppRgb)){
+        using(var g=Graphics.FromImage(reference))g.CopyFromScreen(area.Left,area.Top,0,0,area.Size,CopyPixelOperation.SourceCopy);
+        int bad=0,total=0;for(int y=16;y<area.Height;y+=Math.Max(1,area.Height/16))for(int x=16;x<area.Width;x+=Math.Max(1,area.Width/24)){
+          var a=reference.GetPixel(x,y);var b=full.GetPixel(x,y);if(Math.Abs(a.R-b.R)+Math.Abs(a.G-b.G)+Math.Abs(a.B-b.B)>120)bad++;total++;
+        }return total>0&&bad*5<total*2;
+      }}
+      public Bitmap Capture(Rectangle area,int w,int h,double scale) {
+        bool smaller=scale>1.0||w!=area.Width||h!=area.Height;
+        if(full==null||full.Width!=area.Width||full.Height!=area.Height||
+          (smaller&&(scaled==null||scaled.Width!=w||scaled.Height!=h))||(!smaller&&scaled!=null)) {
+          Dispose();
+          try {
+            try{native=new GdiBuffer(area.Width,area.Height);full=native.Image;}catch{native=null;full=new Bitmap(area.Width,area.Height,PixelFormat.Format32bppRgb);}copy=Graphics.FromImage(full);
+            if(smaller){scaled=new Bitmap(w,h,PixelFormat.Format32bppRgb);resize=Graphics.FromImage(scaled);resize.InterpolationMode=System.Drawing.Drawing2D.InterpolationMode.Bilinear;}
+          } catch { Dispose();throw; }
+        }
+        bool captured=false;
+        if(desktop==null&&DateTime.UtcNow>=retry){try{desktop=new DesktopCopy(area);checkedDesktop=false;}catch{retry=DateTime.UtcNow.AddSeconds(30);}}
+        if(desktop!=null){try{captured=desktop.Capture(full);
+          if(captured&&(!checkedDesktop||!desktop.HasColor)){if(!Verify(area))throw new NotSupportedException("Desktop duplication image differs from the visible desktop");checkedDesktop=true;}
+          Mode="dxgi";if(captured&&desktop.SeparatePointer){DrawCursor(copy,area);copy.Flush();}
+        }catch(Exception e){desktop.Dispose();desktop=null;captured=false;retry=e is NotSupportedException?DateTime.MaxValue:DateTime.UtcNow.AddSeconds(5);}}
+        if(!captured){if(native!=null){native.Capture(area);Mode="gdi-dib";}else{copy.CopyFromScreen(area.Left,area.Top,0,0,area.Size,CopyPixelOperation.SourceCopy);Mode="gdi";}DrawCursor(copy,area);copy.Flush();}
+        if(smaller){resize.DrawImage(full,0,0,w,h);resize.Flush();return scaled;}return full;
+      }
+      public void Dispose(){if(desktop!=null)desktop.Dispose();desktop=null;if(resize!=null)resize.Dispose();if(copy!=null)copy.Dispose();if(scaled!=null)scaled.Dispose();if(native!=null)native.Dispose();else if(full!=null)full.Dispose();native=null;resize=copy=null;scaled=full=null;}
+    }
+
+    static Stream OpenUpload(HttpWebRequest request){
+      var pending=request.BeginGetRequestStream(null,null);
+      using(pending.AsyncWaitHandle){if(!pending.AsyncWaitHandle.WaitOne(15000)){request.Abort();throw new TimeoutException("Video upload connection timed out");}return request.EndGetRequestStream(pending);}
+    }
     static void Session() {
+      streamId++;
       var rq = (HttpWebRequest)WebRequest.Create(Relay + "/a/stream");
-      rq.Method = "POST"; rq.SendChunked = true; rq.AllowWriteStreamBuffering = false; rq.Timeout = 15000; rq.ReadWriteTimeout = 20000; rq.KeepAlive = false;
-      rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ServicePoint.Expect100Continue = false;
-      using (var st = rq.GetRequestStream()) {
-        int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty; double interval = 66;   // ms between frames: 66 = 15 fps on a fast link, grows when the link is slow so frames do not pile up (the lag people saw)
-        try { Sys.Snap(10); } catch { } var lastSys = DateTime.UtcNow;   // primes the CPU counters
+      // This request stays open for the whole viewing session. An overall
+      // 15-second deadline aborts even a healthy, continuously written upload.
+      // Keep the per-write timeout so an actually broken route still recovers.
+      rq.Method = "POST"; rq.SendChunked = true; rq.AllowWriteStreamBuffering = false; rq.Timeout = Timeout.Infinite; rq.ReadWriteTimeout = 20000; rq.KeepAlive = false;
+      rq.Headers["Authorization"] = "Bearer " + Token; rq.ContentType = "application/octet-stream"; rq.ServicePoint.Expect100Continue = false; rq.ServicePoint.UseNagleAlgorithm = false;rq.ServicePoint.ConnectionLimit=16;rq.ConnectionGroupName="helper-live";
+      MfEncoder encoder=null;string videoCodec=null,videoError="";bool videoFailed=false;activeRequest=rq;
+      try { using (var surface=new CaptureSurface()) using (var st = OpenUpload(rq)) {
+        int[] pa = null, ca = null; int curMon = -2, fw = 0, fh = 0; long q = 60; double sc = 1; var lastKey = DateTime.MinValue; Rectangle area = Rectangle.Empty; double interval = 33;
+        RefreshStats(); var lastSys = DateTime.UtcNow;
+        var perfAt=DateTime.UtcNow;double captureTotal=0,workTotal=0,writeTotal=0;int perfFrames=0,perfSent=0;
         while (run) {
           var t0 = DateTime.UtcNow;
           if (mon != curMon) {
+            if(encoder!=null){encoder.Dispose();encoder=null;}videoCodec=null;
             curMon = mon; var scr = System.Windows.Forms.Screen.AllScreens;
             area = curMon >= 0 && curMon < scr.Length ? scr[curMon].Bounds : System.Windows.Forms.SystemInformation.VirtualScreen;
-            sc = Math.Max(1.0, Math.Max(area.Width / 1366.0, area.Height / 900.0)); fw = (int)(area.Width / sc); fh = (int)(area.Height / sc); pa = null;
+            sc = Math.Max(1.0, Math.Max(area.Width / 1366.0, area.Height / 900.0)); fw = ((int)(area.Width / sc)) & ~1; fh = ((int)(area.Height / sc)) & ~1; pa = null;
           }
           Bitmap frame;
           try {
-            var full = new Bitmap(area.Width, area.Height, PixelFormat.Format32bppRgb);
-            using (var g = Graphics.FromImage(full)) { g.CopyFromScreen(area.Left, area.Top, 0, 0, area.Size, CopyPixelOperation.SourceCopy); DrawCursor(g, area); }
-            if (sc > 1.0) { frame = new Bitmap(fw, fh, PixelFormat.Format32bppRgb); using (var g = Graphics.FromImage(frame)) { g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Bilinear; g.DrawImage(full, 0, 0, fw, fh); } full.Dispose(); }
-            else frame = full;
-          } catch (Exception e) { Err = "capture: " + e.Message; Thread.Sleep(500); continue; }   // locked screen, UAC prompt: wait for the desktop to come back
-          using (frame) {
+            frame=surface.Capture(area,fw,fh,sc);
+          } catch (Exception e) { surface.Dispose();Err = "capture: " + e.Message; Thread.Sleep(500); continue; }   // locked screen, UAC prompt: wait for the desktop to come back
+          captureTotal+=(DateTime.UtcNow-t0).TotalMilliseconds;
+          {
             if (ca == null || ca.Length != fw * fh) ca = new int[fw * fh];
             var bd = frame.LockBits(new Rectangle(0, 0, fw, fh), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
             try { Marshal.Copy(bd.Scan0, ca, 0, fw * fh); } finally { frame.UnlockBits(bd); }
-            bool full_ = key || pa == null || pa.Length != ca.Length || (DateTime.UtcNow - lastKey).TotalSeconds > 10;
+            if(Video&&!videoFailed&&fw%2==0&&fh%2==0){
+              try{
+                if(key&&encoder!=null){if(encoder.ForceKeyFrame())key=false;else{encoder.Dispose();encoder=null;videoCodec=null;}}
+                if(encoder==null){encoder=new MfEncoder(fw,fh,30,1800000);key=false;}
+                var encoding=DateTime.UtcNow;
+                foreach(var unit in encoder.EncodeRgb(ca)){
+                  var codec=H264Codec(unit);if(codec!=null&&videoCodec!=codec){videoCodec=codec;
+                    var metadata=Encoding.UTF8.GetBytes(string.Format(System.Globalization.CultureInfo.InvariantCulture,"{{\"codec\":\"{0}\",\"w\":{1},\"h\":{2},\"ox\":{3},\"oy\":{4},\"sc\":{5},\"mon\":{6},\"mons\":{7}}}",codec,fw,fh,area.Left,area.Top,sc,curMon,Mons()));
+                    using(var config=new MemoryStream()){Put16(config,metadata.Length);config.Write(metadata,0,metadata.Length);Send(st,'C',config.ToArray());}
+                  }
+                  if(videoCodec==null)throw new InvalidOperationException("H264 sequence parameters missing");
+                  var payload=new byte[unit.Length+1];payload[0]=(byte)(H264Key(unit)?1:0);Buffer.BlockCopy(unit,0,payload,1,unit.Length);Send(st,'V',payload);perfSent++;
+                }
+                writeTotal+=(DateTime.UtcNow-encoding).TotalMilliseconds;workTotal+=(encoding-t0).TotalMilliseconds;perfFrames++;
+                var previous=pa;pa=ca;ca=previous;
+                goto frameReady;
+              }catch(Exception e){videoError=e.GetType().Name+":"+e.HResult.ToString("x8");Err="video: "+videoError;videoFailed=true;if(encoder!=null){encoder.Dispose();encoder=null;}pa=null;key=true;}
+            }else if(encoder!=null){encoder.Dispose();encoder=null;videoCodec=null;pa=null;key=true;}
+            // TCP preserves every tile in order. Frequent large JPEG refreshes
+            // can block all following motion on a narrow uplink; reconnects and
+            // decoder overflow explicitly request a fresh full image instead.
+            bool full_ = key || pa == null || pa.Length != ca.Length || (DateTime.UtcNow - lastKey).TotalSeconds > 60;
             byte[] tiles = null;
             if (!full_) {
               int tw = (fw + 63) / 64, tht = (fh + 63) / 64, nd = 0; var dirty = new bool[tw * tht];
@@ -640,24 +798,36 @@ namespace F__BUILD__ {
                 }
               }
             }
-            var tw0 = DateTime.UtcNow; int sent = 0;
+            var tw0 = DateTime.UtcNow; int sent = 0;workTotal+=(tw0-t0).TotalMilliseconds;
             if (full_) {
               var meta = Encoding.UTF8.GetBytes(string.Format(System.Globalization.CultureInfo.InvariantCulture, "{{\"w\":{0},\"h\":{1},\"ox\":{2},\"oy\":{3},\"sc\":{4},\"mon\":{5},\"mons\":{6}}}", fw, fh, area.Left, area.Top, sc, curMon, Mons()));
-              var j = Jpeg(frame, q);
+              var j = Jpeg(frame, Math.Min(q,50));
               using (var m = new MemoryStream()) { Put16(m, meta.Length); m.Write(meta, 0, meta.Length); m.Write(j, 0, j.Length); var b = m.ToArray(); Send(st, 'K', b); sent = b.Length; }
               key = false; lastKey = DateTime.UtcNow;
             } else if (tiles != null) { Send(st, 'T', tiles); sent = tiles.Length; }
             var wms = (DateTime.UtcNow - tw0).TotalMilliseconds;   // a slow link shows up as a slow write: lower the quality AND slow the frame rate, so the socket never backs up (which is what felt like lag)
+            writeTotal+=wms;perfFrames++;
             if (sent > 0) {
-              if (wms > 200 && q > 25) q -= 10; else if (wms < 60 && q < 62) q += 5;
-              interval = Math.Min(500, Math.Max(66, wms * 1.3));   // send no faster than the link drains: fast -> 15 fps, a 300 ms write -> ~2.5 fps instead of a growing backlog
+              perfSent++;
+              if (wms > 200 && q > 25) q -= 10; else if (wms < 60 && q < 62) q = Math.Min(62,q+5);
+              interval = Math.Min(500, Math.Max(33, wms * 1.15));
             } else interval = Math.Min(interval, 100);   // nothing changed: poll gently
             var tmp = pa; pa = ca; ca = tmp;
           }
-          if ((DateTime.UtcNow - lastSys).TotalMilliseconds >= 2000) { lastSys = DateTime.UtcNow; try { Send(st, 'S', Encoding.UTF8.GetBytes(Sys.Snap(10))); } catch (IOException) { throw; } catch { } }   // the live System panel
-          var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(5, interval - spent));
+          frameReady:
+          if ((DateTime.UtcNow - lastSys).TotalMilliseconds >= 2000) {
+            lastSys = DateTime.UtcNow; RefreshStats(); var snapshot=Interlocked.Exchange(ref stats,null);
+            if(snapshot!=null)Send(st,'S',Encoding.UTF8.GetBytes(snapshot));
+            if(perfFrames>0){var inv=System.Globalization.CultureInfo.InvariantCulture;
+              Send(st,'Q',Encoding.UTF8.GetBytes("{\"stream_id\":"+streamId+",\"stream_errors\":"+streamErrors+",\"stream_error\":\""+streamError+"\","+string.Format(inv,"\"capture_ms\":{0:F2},\"prepare_ms\":{1:F2},\"encode_write_ms\":{2:F2},\"capture_fps\":{3:F2},\"quality\":{4},\"capture_mode\":\"{5}\",\"sent_fps\":{6:F2},\"video\":\"{7}\"",captureTotal/perfFrames,workTotal/perfFrames,writeTotal/perfFrames,perfFrames/(DateTime.UtcNow-perfAt).TotalSeconds,q,surface.Mode,perfSent/(DateTime.UtcNow-perfAt).TotalSeconds,Video?(videoFailed?"fallback:"+videoError:"h264"):"jpeg")+"}"));
+              perfAt=DateTime.UtcNow;captureTotal=workTotal=writeTotal=0;perfFrames=perfSent=0;
+            }
+          } // Process enumeration and publisher reads never block capture.
+          // An over-budget capture already paced the loop. An unconditional
+          // 5 ms sleep can become another 15.6 ms Windows timer tick per frame.
+          var spent = (DateTime.UtcNow - t0).TotalMilliseconds; Thread.Sleep((int)Math.Max(0, interval - spent));
         }
-      }
+      }} finally {if(encoder!=null)encoder.Dispose();if(object.ReferenceEquals(activeRequest,rq))activeRequest=null;}
       try { rq.GetResponse().Close(); } catch { }
     }
   }
@@ -740,7 +910,7 @@ namespace F__BUILD__ {
     }
   }
   // The link to the relay. Every request to the relay goes through a tiny local CONNECT proxy that can leave through a chosen network adapter
-  // (IP_UNICAST_IF), so a VPN, a DPI-bypass tool (zapret / WinDivert) or a broken default route cannot take the helper down. A watchdog asks the relay
+  // (IP_UNICAST_IF), allowing an independent adapter path when the default route fails. Global WinDivert/WFP filters can still intercept it. A watchdog asks the relay
   // for /health every few seconds; when that fails, every route is tried in parallel and the first healthy one wins (physical adapters first, the
   // default route next, a system proxy next, VPN adapters last). It only ever moves to a route that has just worked.
   // ponytail: IPv4 only, https relays only; plain-http relays (tests, LAN) keep the normal connection
@@ -749,8 +919,8 @@ namespace F__BUILD__ {
     static readonly Regex VpnRx = new Regex("TAP-|TUN|WireGuard|Wintun|VPN|Meta Tunnel|Tailscale|ZeroTier|Hamachi|Cisco|Fortinet|NordLynx|Clash|sing-box|Amnezia|Outline|WARP|Proton|Mullvad|OpenVPN|Radmin|PANGP|GlobalProtect|Npcap", RegexOptions.IgnoreCase);
     static readonly Regex VirtRx = new Regex("Hyper-V|VirtualBox|VMware|vEthernet|WSL|Virtual Adapter|Bluetooth|Teredo|ISATAP|6to4|Pseudo", RegexOptions.IgnoreCase);
     public class Ad { public int If; public string Name = "", Desc = "", Kind = "", Mac = "", Ips = "", Gw = "", Dns = ""; public bool Up, Vpn, Virt, Eth, Dhcp; public long Speed; public int Ms = -2; }
-    class Cand { public string Key, Name; public int If; public bool Vpn, Sys; }
-    class Hop { public string Key; public int If; public int Port; public TcpListener L; public readonly List<Socket> Conns = new List<Socket>(); }
+    class Cand { public string Key, Name; public int If, Endpoint; public bool Vpn, Sys; }
+    class Hop { public string Key; public int If; public int Port, Endpoint; public TcpListener L; public readonly List<Socket> Conns = new List<Socket>(); }
 
     static readonly Dictionary<string, Hop> hops = new Dictionary<string, Hop>();
     static readonly object lk = new object();
@@ -758,7 +928,8 @@ namespace F__BUILD__ {
     static readonly List<string> hist = new List<string>();
     static readonly AutoResetEvent wake = new AutoResetEvent(false);
     static readonly IWebProxy sp = WebRequest.GetSystemWebProxy();
-    static Uri relay; static string host, lastIp, blockFile; static int port; static volatile bool on, forced;
+    static Uri relay; static string host, lastIp, blockFile; static int port; static volatile bool on, forced, running;
+    static DateTime ipUntil = DateTime.MinValue;
     const int AltPort = 9444; static volatile bool alt;   // the relay is also served on 9444 next to the VPN front: when the provider filters 8444 the same TLS goes to 9444, chosen by the hop (the caller still says 8444)
     static volatile Hop cur; static Cand curC; static DateTime lastOk = DateTime.MinValue, since = DateTime.UtcNow; static int switches;
     public static readonly IWebProxy Proxy = new RP();
@@ -776,24 +947,35 @@ namespace F__BUILD__ {
     public static string[] Drain() { var l = new List<string>(); string s; while (ev.TryDequeue(out s)) l.Add(s); return l.ToArray(); }
     public static void Ok() { lastOk = DateTime.UtcNow; }
     public static void Failed() { forced = true; wake.Set(); }
+    static void AddressChanged(object sender, EventArgs args) { ipUntil = DateTime.MinValue; forced = true; wake.Set(); }
+    public static void Stop() {
+      running = false; on = false; Streaming = false; wake.Set();
+      NetworkChange.NetworkAddressChanged -= AddressChanged;
+      lock (lk) {
+        foreach (var h in hops.Values) { try { h.L.Stop(); } catch { } CloseAll(h); }
+        hops.Clear(); cur = null; curC = null;
+      }
+    }
 
     public static string Key() { var c = curC; return c != null ? c.Key : ""; }
     public static void Init(string url, string savedKey, string block) {
       try {
         relay = new Uri(url); host = relay.Host; port = relay.Port; blockFile = block;   // block: a test hook, a file naming the routes (def, sys, if14 ...) that must fail while it exists
         if (relay.Scheme != "https" || Environment.GetEnvironmentVariable("HELPER_ROUTE") == "0") return;
+        running = true;
         var ord = Order(); if (ord.Count == 0) return;
         var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time
         try {   // but never trust it blindly: every route is asked at once (up to 3 s), the saved one wins when it answers, otherwise the first that does. Starting on a dead route cost several "Connecting" rounds
           var res = ProbeAll(ord, 3000); Cand pick = null;
-          if (!Array.Exists(res, x => x > 0)) { alt = true; res = ProbeAll(ord, 3000); if (Array.Exists(res, x => x > 0)) Emit("route", "relay port " + port + " does not answer on any route, using port " + AltPort); else alt = false; }
+          if (!Array.Exists(res, x => x > 0)) { var other = AtPort(ord, AltPort); var second = ProbeAll(other, 3000); if (Array.Exists(second, x => x > 0)) { ord = other; res = second; Emit("route", "relay port " + port + " does not answer on any route, using port " + AltPort); } }
           for (int i = 0; i < ord.Count; i++) if (res[i] > 0 && ord[i].Key == first.Key) pick = ord[i];
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
           if (pick != null) { if (pick.Key != first.Key) Emit("route", "start: " + first.Name + " does not reach the relay, using " + pick.Name); first = pick; }
         } catch { }
         on = true; Switch(first, "start", false); forced = true;
+        NetworkChange.NetworkAddressChanged += AddressChanged;
         new Thread(Watch) { IsBackground = true, Priority = ThreadPriority.AboveNormal }.Start();
-      } catch (Exception e) { on = false; Emit("route", "route layer off: " + e.Message); }
+      } catch (Exception e) { Stop(); Emit("route", "route layer off: " + e.Message); }
     }
 
     static List<Ad> Ads() {
@@ -822,9 +1004,18 @@ namespace F__BUILD__ {
     }
 
     static string RelayIp() {
-      if (lastIp != null) return lastIp;
-      try { foreach (var a in Dns.GetHostAddresses(host)) if (a.AddressFamily == AddressFamily.InterNetwork) { lastIp = a.ToString(); break; } } catch { }
+      if (lastIp != null && DateTime.UtcNow < ipUntil) return lastIp;
+      try {
+        var ar = Dns.BeginGetHostAddresses(host, null, null);
+        using (ar.AsyncWaitHandle) if (ar.AsyncWaitHandle.WaitOne(800)) {
+          foreach (var a in Dns.EndGetHostAddresses(ar)) if (a.AddressFamily == AddressFamily.InterNetwork && !FakeIp(a)) { lastIp = a.ToString(); ipUntil = DateTime.UtcNow.AddSeconds(60); break; }
+        }
+      } catch { }
       return lastIp;
+    }
+    static bool FakeIp(IPAddress a) { var b = a.GetAddressBytes(); return b.Length == 4 && b[0] == 198 && (b[1] == 18 || b[1] == 19); }
+    static List<Cand> AtPort(List<Cand> input, int endpoint) {
+      var output = new List<Cand>(); foreach (var c in input) output.Add(new Cand { Key = c.Key, Name = c.Name, If = c.If, Vpn = c.Vpn, Sys = c.Sys, Endpoint = endpoint }); return output;
     }
 
     // physical adapters (Ethernet before Wi-Fi), the default route, the system proxy, then VPN adapters; when the default route already leaves through a physical adapter it goes first
@@ -832,11 +1023,10 @@ namespace F__BUILD__ {
       var ads = Ads(); var phys = new List<Ad>(); var vpns = new List<Ad>();
       foreach (var a in ads) { if (!a.Up || a.If <= 0) continue; if (a.Vpn) vpns.Add(a); else if (!a.Virt && a.Gw.Length > 0) phys.Add(a); }
       phys.Sort((x, y) => x.Eth != y.Eth ? (x.Eth ? -1 : 1) : y.Speed.CompareTo(x.Speed));
-      bool defVpn = false; try { var ip = RelayIp(); int bi; if (ip != null && GetBestInterface(BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0), out bi) == 0) foreach (var a in ads) if (a.If == bi && a.Vpn) defVpn = true; } catch { }
       var def = new Cand { Key = "def", Name = "default route", If = 0 };
-      var l = new List<Cand>(); if (!defVpn) l.Add(def);
+      var l = new List<Cand>();
       foreach (var a in phys) l.Add(new Cand { Key = "if" + a.If, Name = a.Name + " (" + a.Kind + ")", If = a.If });
-      if (defVpn) l.Add(def);
+      l.Add(def);
       try { var u = new Uri("https://" + host + ":" + port + "/"); if (!sp.IsBypassed(u)) l.Add(new Cand { Key = "sys", Name = "system proxy", Sys = true }); } catch { }
       foreach (var a in vpns) l.Add(new Cand { Key = "if" + a.If, Name = a.Name + " (VPN)", If = a.If, Vpn = true });
       return l;
@@ -844,8 +1034,10 @@ namespace F__BUILD__ {
 
     static Hop HopFor(Cand c) {
       lock (lk) {
-        Hop h; if (hops.TryGetValue(c.Key, out h)) return h;
-        var l = new TcpListener(IPAddress.Loopback, 0); l.Start(); h = new Hop { Key = c.Key, If = c.If, L = l, Port = ((IPEndPoint)l.LocalEndpoint).Port }; hops[c.Key] = h;
+        if (!running) throw new IOException("route transport stopped");
+        int endpoint = c.Endpoint > 0 ? c.Endpoint : port; string key = c.Key + ":" + endpoint;
+        Hop h; if (hops.TryGetValue(key, out h)) return h;
+        var l = new TcpListener(IPAddress.Loopback, 0); l.Start(); h = new Hop { Key = c.Key, If = c.If, Endpoint = endpoint, L = l, Port = ((IPEndPoint)l.LocalEndpoint).Port }; hops[key] = h;
         var hh = h; new Thread(() => { while (true) { Socket s; try { s = hh.L.AcceptSocket(); } catch { return; } ThreadPool.QueueUserWorkItem(_ => Handle(hh, s)); } }) { IsBackground = true }.Start();
         return h;
       }
@@ -857,21 +1049,45 @@ namespace F__BUILD__ {
     static Socket Dial(Hop h, string th, int tp) {
       try { if (blockFile != null && File.Exists(blockFile) && File.ReadAllText(blockFile).Contains(h.Key)) throw new Exception("blocked by the test hook"); } catch (IOException) { }
       var ips = new List<IPAddress>();
-      if (lastIp != null) ips.Add(IPAddress.Parse(lastIp));
-      try { foreach (var a in Dns.GetHostAddresses(th)) if (a.AddressFamily == AddressFamily.InterNetwork && !ips.Contains(a)) ips.Add(a); } catch { }
+      string cached = RelayIp(); if (cached != null) ips.Add(IPAddress.Parse(cached));
+      N__BUILD__.Network.Path bound = null;
+      if (h.If > 0) {
+        bound = N__BUILD__.Network.Paths(h.If, false)[0];
+        if (!bound.vpn && (cached == null || DateTime.UtcNow >= ipUntil)) {
+          var servers = new List<string>(bound.dns); servers.Add("1.1.1.1"); servers.Add("8.8.8.8");
+          foreach (var dns in servers) {
+            var answer = N__BUILD__.Network.Resolve(bound, th, dns, 500);
+            foreach (var address in answer.addresses) {
+              var ip = IPAddress.Parse(address); if (FakeIp(ip)) continue;
+              if (!ips.Contains(ip)) ips.Insert(0, ip);
+              lastIp = address; ipUntil = DateTime.UtcNow.AddSeconds(60);
+            }
+            if (answer.addresses.Length > 0 && DateTime.UtcNow < ipUntil) break;
+          }
+        }
+      }
+      // A bounded lookup: network-change storms and dead VPN DNS cannot pin bridge threads forever.
+      if (ips.Count == 0 || h.If == 0) try {
+        var ar = Dns.BeginGetHostAddresses(th, null, null);
+        // The default path may intentionally use a TUN fake-IP resolver. Its
+        // synthetic address belongs to that routing context and is usable there;
+        // never send it through an explicitly selected physical adapter.
+        using (ar.AsyncWaitHandle) if (ar.AsyncWaitHandle.WaitOne(800)) foreach (var a in Dns.EndGetHostAddresses(ar)) if (a.AddressFamily == AddressFamily.InterNetwork && (h.If == 0 || !FakeIp(a)) && !ips.Contains(a)) ips.Add(a);
+      } catch { }
       Exception last = new Exception("no address for " + th);
       foreach (var ip in ips) {
         Socket s = null;
         try {
           s = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp); s.NoDelay = true;
           if (h.If > 0) s.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31, IPAddress.HostToNetworkOrder(h.If));   // IP_UNICAST_IF: leave through this adapter whatever the routing table says
+          if (bound != null) s.Bind(new IPEndPoint(IPAddress.Parse(bound.source), 0));
           try { var ka = new byte[12]; BitConverter.GetBytes(1u).CopyTo(ka, 0); BitConverter.GetBytes(15000u).CopyTo(ka, 4); BitConverter.GetBytes(5000u).CopyTo(ka, 8); s.IOControl(IOControlCode.KeepAliveValues, ka, null); } catch { }
           var ar = s.BeginConnect(ip, tp, null, null);
           if (!ar.AsyncWaitHandle.WaitOne(4000)) { s.Close(); last = new Exception("connect timeout " + ip); continue; }
           s.EndConnect(ar); return s;
         } catch (Exception e) { last = e; try { if (s != null) s.Close(); } catch { } }
       }
-      throw last;
+      ipUntil = DateTime.MinValue; throw last;
     }
 
     static void Pump(Socket a, Socket b) {
@@ -883,13 +1099,13 @@ namespace F__BUILD__ {
     static void Handle(Hop h, Socket c) {
       Socket u = null;
       try {
-        c.ReceiveTimeout = 5000; var buf = new byte[8192]; int n = 0;
+        c.NoDelay = true; c.ReceiveTimeout = 5000; var buf = new byte[8192]; int n = 0;
         while (n < buf.Length) { int r = c.Receive(buf, n, buf.Length - n, SocketFlags.None); if (r <= 0) return; n += r; if (HasEnd(buf, n)) break; }
         var line = Encoding.ASCII.GetString(buf, 0, Math.Min(n, 400)).Split('\n')[0].Trim(); var p = line.Split(' ');
         if (p.Length < 2 || p[0] != "CONNECT") { Say(c, "HTTP/1.1 405 Method Not Allowed\r\n\r\n"); return; }
         int ci = p[1].LastIndexOf(':'); string th = p[1].Substring(0, ci); int tp = int.Parse(p[1].Substring(ci + 1));
         if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || (tp != port && tp != AltPort)) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }   // not an open proxy: the relay and nothing else
-        u = Dial(h, th, tp == port && alt ? AltPort : tp); try { lastIp = ((IPEndPoint)u.RemoteEndPoint).Address.ToString(); } catch { }
+        u = Dial(h, th, h.Endpoint); try { var address = ((IPEndPoint)u.RemoteEndPoint).Address; if (!FakeIp(address)) lastIp = address.ToString(); } catch { }
         Say(c, "HTTP/1.1 200 Connection established\r\n\r\n"); c.ReceiveTimeout = 0;
         lock (h.Conns) { h.Conns.Add(c); h.Conns.Add(u); }
         var uu = u; new Thread(() => Pump(uu, c)) { IsBackground = true }.Start(); Pump(c, u);
@@ -903,12 +1119,20 @@ namespace F__BUILD__ {
     static void CloseAll(Hop h) { lock (h.Conns) { foreach (var s in h.Conns.ToArray()) { try { s.Close(); } catch { } } h.Conns.Clear(); } }   // the old route may be a black hole: break what is stuck on it now
 
     static int Probe(Cand c, int ms) {
-      if (alt && c.Sys) return -1;
+      if (c.Endpoint == AltPort && c.Sys) return -1;
       try {
         var rq = (HttpWebRequest)WebRequest.Create("https://" + host + ":" + port + "/health");
-        rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
+        rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.AllowAutoRedirect = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        using (var r = (HttpWebResponse)rq.GetResponse()) return (int)r.StatusCode == 200 ? (int)Math.Max(1, sw.ElapsedMilliseconds) : -1;
+        using (var r = (HttpWebResponse)rq.GetResponse()) {
+          if ((int)r.StatusCode != 200) throw new IOException("relay health status mismatch");
+          using (var reader = new StreamReader(r.GetResponseStream())) {
+            var payload = new char[3]; int n = reader.ReadBlock(payload, 0, payload.Length);
+            if (n != 2 || payload[0] != 'o' || payload[1] != 'k') throw new IOException("relay health payload mismatch");
+          }
+          lock (why) why.Remove(c.Key);
+          return (int)Math.Max(1, sw.ElapsedMilliseconds);
+        }
       } catch (Exception e) { lock (why) why[c.Key] = Reason(e); return -1; }
     }
     static readonly Dictionary<string, string> why = new Dictionary<string, string>();   // why the last probe of a route failed: "no route" alone tells nobody what to fix
@@ -932,7 +1156,7 @@ namespace F__BUILD__ {
 
     static void Switch(Cand c, string why, bool tell) {
       Hop old; Cand oc;
-      lock (lk) { old = cur; oc = curC; curC = c; cur = c.Sys ? null : HopFor(c); since = DateTime.UtcNow; switches++; }
+      lock (lk) { if (!running) return; old = cur; oc = curC; curC = c; cur = c.Sys ? null : HopFor(c); alt = c.Endpoint == AltPort; since = DateTime.UtcNow; switches++; }
       if (old != null && old != cur) CloseAll(old);
       lastOk = DateTime.UtcNow;
       if (tell) Emit("route", why + ": " + (oc != null ? oc.Name : "?") + " -> " + c.Name);
@@ -940,7 +1164,7 @@ namespace F__BUILD__ {
 
     // The live picture is an upload: the route that merely answers /health may be the slowest one (a VPN, a congested Wi-Fi). While someone watches, every 2 minutes the upload speed of
     // the best three routes is measured (silently: the numbers are only in the network report, a line appears when the stream moves) and the stream moves to one that is clearly faster (1.6x and 3 Mbit/s more). ponytail: the current route is measured while the stream itself uses it, so it reads low: the margin covers that
-    public static volatile bool Streaming; public static string Token = ""; static DateTime lastOpt = DateTime.MinValue; public static string LastSpeeds = "";
+    public static volatile bool Streaming; public static string Token = ""; public static string LastSpeeds = "";
     static double Speed(Cand c, int bytes) {   // upload Mbit/s through this route, -1 when it fails
       try {
         var grp = Guid.NewGuid().ToString();
@@ -972,9 +1196,11 @@ namespace F__BUILD__ {
 
     static void Watch() {
       DateTime better = DateTime.UtcNow; DateTime failTold = DateTime.MinValue;
-      while (true) {
+      while (running) {
         wake.WaitOne(4000);
-        if (Streaming && (DateTime.UtcNow - lastOpt).TotalSeconds > 120) { lastOpt = DateTime.UtcNow; try { Optimize(true); } catch { } }
+        if (!running) return;
+        // Do not run speed tests here: uploads can block recovery for tens of seconds
+        // and add load precisely while the user's connection is struggling.
         bool f = forced; forced = false;
         if (!f && (DateTime.UtcNow - lastOk).TotalSeconds < 4) continue;
         var c = curC;
@@ -984,13 +1210,12 @@ namespace F__BUILD__ {
           continue;
         }
         try {
-          var ord = Order(); var res = ProbeAll(ord, 4000); Cand pick = null;
+          var ord = AtPort(Order(), alt ? AltPort : port); var res = ProbeAll(ord, 4000); Cand pick = null;
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
           if (pick == null) {   // nothing on this port: the provider may filter the port, not the connection. Try the other one (the link is down anyway, so flipping disturbs nothing)
-            alt = !alt; var r2 = ProbeAll(ord, 4000);
-            for (int i = 0; i < ord.Count && pick == null; i++) if (r2[i] > 0) pick = ord[i];
-            if (pick != null) { Switch(pick, "relay port " + (alt ? port : AltPort) + " is filtered, now port " + (alt ? AltPort : port), true); continue; }
-            alt = !alt;
+            var other = AtPort(ord, alt ? port : AltPort); var r2 = ProbeAll(other, 4000);
+            for (int i = 0; i < other.Count && pick == null; i++) if (r2[i] > 0) pick = other[i];
+            if (pick != null) { Switch(pick, "alternate relay endpoint passed TLS health check", true); continue; }
           }
           if (pick != null) Switch(pick, "relay unreachable", true);
           else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) { string w; lock (why) why.TryGetValue(ord[i].Key, out w); sb.Append(ord[i].Name).Append(" FAIL").Append(w != null ? " (" + w + ")" : "").Append("; "); } Emit("route", "no route reaches the relay: " + sb + Port443()); }
@@ -1000,7 +1225,7 @@ namespace F__BUILD__ {
 
     static void TryBetter() {   // back to a more preferred route once it works again
       try {
-        var ord = Order(); var c = curC; int at = ord.Count; for (int i = 0; i < ord.Count; i++) if (c != null && ord[i].Key == c.Key) at = i;
+        var ord = AtPort(Order(), alt ? AltPort : port); var c = curC; int at = ord.Count; for (int i = 0; i < ord.Count; i++) if (c != null && ord[i].Key == c.Key) at = i;
         if (at == 0 || at >= ord.Count) return;
         var better = ord.GetRange(0, at); var res = ProbeAll(better, 3500);
         for (int i = 0; i < better.Count; i++) if (res[i] > 0) { Switch(better[i], "preferred route works again", true); return; }
@@ -1015,17 +1240,19 @@ namespace F__BUILD__ {
       try { var ip = RelayIp(); int bi; if (ip != null && GetBestInterface(BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0), out bi) == 0) best = bi; } catch { }
       if (probe && relay != null && relay.Scheme == "https") {
         var cs = new List<Cand>(); var who = new List<Ad>();
-        foreach (var a in ads) if (a.Up && a.If > 0 && (a.Gw.Length > 0 || a.Vpn)) { cs.Add(new Cand { Key = "if" + a.If, Name = a.Name, If = a.If }); who.Add(a); }
+        foreach (var a in ads) if (a.Up && a.If > 0 && (a.Gw.Length > 0 || a.Vpn)) { cs.Add(new Cand { Key = "if" + a.If, Name = a.Name, If = a.If, Endpoint = alt ? AltPort : port }); who.Add(a); }
         var res = ProbeAll(cs, 4000); for (int i = 0; i < who.Count; i++) who[i].Ms = res[i];
       }
       var sb = new StringBuilder();
       sb.Append("agent link: ").Append(Status()).Append('\n');
+      sb.Append("IPv4 only; binding does not bypass WinDivert/WFP/zapret. Link rate is NOT internet speed.\n");
       foreach (var a in ads) {
-        sb.Append(a.Name).Append(" [").Append(a.Up ? "Up" : "Down").Append("] ").Append(a.Kind);
+        sb.Append(a.Name).Append(" [").Append(a.Up ? "Up" : "Down").Append("] if=").Append(a.If).Append(' ').Append(a.Kind);
         if (a.Up && a.Speed > 0 && a.Speed < 100000000000L) sb.Append(' ').Append(a.Speed >= 1000000000 ? (a.Speed / 1000000000.0).ToString("0.#") + " Gbit/s" : (a.Speed / 1000000) + " Mbit/s");
         if (a.Ips.Length > 0) sb.Append("; ip ").Append(a.Ips); if (a.Gw.Length > 0) sb.Append("; gw ").Append(a.Gw); if (a.Dns.Length > 0) sb.Append("; dns ").Append(a.Dns);
         if (a.Up) sb.Append(a.Dhcp ? "; dhcp" : "; static"); sb.Append("; mac ").Append(a.Mac);
-        if (a.If == best) sb.Append("; DEFAULT ROUTE to the internet");
+        if (a.If == best) sb.Append("; DEFAULT ROUTE to relay IP (destination-specific)");
+        if (a.Dns.Contains("198.18.") || a.Dns.Contains("198.19.")) sb.Append("; WARNING fake-IP DNS: not a clean physical baseline");
         if (curC != null && !curC.Sys && curC.If == a.If && on) sb.Append("; AGENT USES THIS");
         if (a.Ms > 0) sb.Append("; relay ok ").Append(a.Ms).Append(" ms"); else if (a.Ms == -1) sb.Append("; relay FAIL");
         sb.Append('\n');
@@ -1042,6 +1269,8 @@ Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
 namespace K__BUILD__ {
   public static class Keys {   // one reader for the keyboard: Esc opens a menu (pause / continue / end), the other keys answer the questions
+    static volatile bool reading;
+    static Thread reader;
     public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>();
     public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk, Unattended;      // Esc = the user confirmed the end; Unattended = mode 3, Esc pauses instead of opening the end menu
     public static string Relay, Token, MenuRun, MenuPaused, ConfirmEnd, StPaused, StRestore, Continuing;
@@ -1074,6 +1303,8 @@ namespace K__BUILD__ {
     static void Menu() {
       Say(""); Say(C("1;30;43", "  " + (Paused ? MenuPaused : MenuRun) + "  "));
       while (true) {
+        if (!reading) return;
+        if (!Console.KeyAvailable) { Thread.Sleep(20); continue; }
         var k = Console.ReadKey(true).Key;
         if (k == ConsoleKey.P && !Paused) { SetPaused(true); return; }
         if (k == ConsoleKey.R && Paused) { SetPaused(false); return; }
@@ -1082,9 +1313,13 @@ namespace K__BUILD__ {
       }
     }
     public static void Start() {
-      var t = new Thread(() => { try { while (true) { var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) { if (Unattended) SetPaused(!Paused); else Menu(); } else Q.Enqueue(k.Key); } } catch { } });
-      t.IsBackground = true; t.Start();
+      if (reader != null && reader.IsAlive) return;
+      reading = true; Esc = false; Final = false; Paused = false;
+      ConsoleKey discarded; while (Q.TryDequeue(out discarded)) { }
+      reader = new Thread(() => { try { while (reading) { if (!Console.KeyAvailable) { Thread.Sleep(20); continue; } var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) { if (Unattended) SetPaused(!Paused); else Menu(); } else Q.Enqueue(k.Key); } } catch { } });
+      reader.IsBackground = true; reader.Start();
     }
+    public static void Stop() { reading = false; if (reader != null && reader != Thread.CurrentThread) reader.Join(1000); }
   }
   public static class Chime {   // soft bells made on the fly (no files shipped)
     public static byte[] Make(double[] f, double[] start, double[] dur, double amp) {
@@ -1104,18 +1339,16 @@ namespace K__BUILD__ {
 "@
 
 function Api($path, $data, $token, $timeout = 40) {
-    $h = @{}
-    if ($token) { $h.Authorization = "Bearer $token" }
+    $b=$null;$encoding=$null
     if ($null -ne $data) {
         $b = [Text.Encoding]::UTF8.GetBytes(($data | ConvertTo-Json -Depth 6 -Compress))
         if ($b.Length -gt 2048) {   # weak links: big outputs shrink a lot
             $ms = New-Object IO.MemoryStream; $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
-            $gz.Write($b, 0, $b.Length); $gz.Close(); $b = $ms.ToArray(); $h['Content-Encoding'] = 'gzip'
+            $gz.Write($b, 0, $b.Length); $gz.Close(); $b = $ms.ToArray();$encoding='gzip';$ms.Dispose()
         }
-        Invoke-WebRequest -Uri "$RELAY$path" -Method Post -Headers $h -Body $b -ContentType 'application/json; charset=utf-8' -TimeoutSec $timeout -UseBasicParsing
-    } else {
-        Invoke-WebRequest -Uri "$RELAY$path" -Headers $h -TimeoutSec $timeout -UseBasicParsing
     }
+    try { [F__BUILD__.RelayApi]::Request("$RELAY$path",$b,$encoding,$token,$timeout) }
+    catch { if($_.Exception.InnerException -is [Net.WebException]){throw $_.Exception.InnerException};throw }
 }
 function Clip($s) { if ($s.Length -gt $MaxOut) { $s.Substring(0, $MaxOut) + "`n...[truncated]" } else { $s } }
 
@@ -1433,7 +1666,7 @@ namespace A__BUILD__ {
         Guarded(delegate { vp.SetValue(value); }, "");
         if (pw) return "set (password, not shown)";
         string now = ""; try { now = vp.Current.Value; } catch { }
-        return now == value ? "set" : "set, but it now holds \"" + Cap(now, 80) + "\" (the control may reformat the value, or ignore it: check with ui_tree)";
+        return now == value ? "set" : "set, but the control returned a different value (" + now.Length + " chars; it may reformat or ignore input: check with ui_tree)";
       }
       if (el.TryGetCurrentPattern(RangeValuePattern.Pattern, out p)) {
         double d; if (!double.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out d)) throw new Exception("this control wants a number");
@@ -1656,6 +1889,8 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
     $out = @()
     if ($null -ne $a.glow) { $script:GlowOn = [bool]$a.glow; Overlay-Send ('glow ' + [int]$script:GlowOn); $out += $(if ($script:GlowOn) { 'glow on' } else { 'glow off' }) }
     if ($null -ne $a.sound) { $script:SoundOn = [bool]$a.sound; $out += $(if ($script:SoundOn) { 'sound on' } else { 'sound off' }); if ($script:SoundOn) { Play-Sound 'ok' } }
+    if($null -ne $a.banner){$script:BannerOn=[bool]$a.banner;Overlay-Send ('banner '+[int]$script:BannerOn);$out+='banner set'}
+    if($null -ne $a.timer){$script:TimerOn=[bool]$a.timer;Overlay-Send ('timer '+[int]$script:TimerOn);$out+='timer set'}
     if ($a.color -and "$($a.color)" -match '^#?([0-9a-fA-F]{6})$') {
         $hx = $Matches[1]; $rgb = @([Convert]::ToInt32($hx.Substring(0, 2), 16), [Convert]::ToInt32($hx.Substring(2, 2), 16), [Convert]::ToInt32($hx.Substring(4, 2), 16))
         $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
@@ -1674,6 +1909,7 @@ function Do-TaskDone($a) {
 function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
     $m = Norm-Mode $a.mode; if (-not $m) { throw "unknown mode '$($a.mode)'" }
     $script:Mode = $m; [K__BUILD__.Keys]::Unattended = ($m -eq 'unattended')
+    if($m -eq 'confirm'){Stop-RealtimeInput}else{Start-RealtimeInput}
     if ($script:Persist) { Save-Session $script:Code $script:Token $m; if (-not $env:HELPER_NO_AUTOSTART) { Install-Autostart } }
     Write-AgentLog "mode changed to $m (by the administrator)"
     Write-Host ('  ' + (T 'Администратор сменил режим на ' 'The administrator switched the mode to ') + $m) -ForegroundColor Yellow
@@ -1804,11 +2040,17 @@ function Do-PushFile($a) {   # operator -> this PC: a relay link from the viewer
     $rq = [Net.WebRequest]::Create([string]$a.url); $rq.Timeout = 60000; $rq.ReadWriteTimeout = 120000
     $resp = $rq.GetResponse(); $n = 0
     try {
-        $in = $resp.GetResponseStream(); $out = [IO.File]::Create($dest + '.part')
+        $part=Join-Path $dir ('.helper-transfer-'+[guid]::NewGuid().ToString('N')+'.part')
+        $in = $resp.GetResponseStream(); $out = New-Object IO.FileStream($part,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try { $buf = New-Object byte[] 1048576; while (($k = $in.Read($buf, 0, $buf.Length)) -gt 0) { $out.Write($buf, 0, $k); $n += $k; Pump-Light } } finally { $out.Dispose(); $in.Dispose() }
-    } finally { $resp.Close() }
-    Move-Item -LiteralPath ($dest + '.part') -Destination $dest -Force
-    @{ text = "saved $dest ($([F__BUILD__.Fs]::Human($n)))" }
+    } catch {if($part -and (Test-Path -LiteralPath $part)){Remove-Item -LiteralPath $part -Force};throw} finally { $resp.Close() }
+    try{
+        if($a.unique){
+            $original=$dest;$stem=[IO.Path]::GetFileNameWithoutExtension($dest);$ext=[IO.Path]::GetExtension($dest);$suffix=0
+            while($true){try{[IO.File]::Move($part,$dest);break}catch [IO.IOException]{if(-not [IO.File]::Exists($dest)){throw};$suffix++;if($suffix -gt 1000){throw 'Too many duplicate file names'};$dest=Join-Path $dir ($stem+' ('+$suffix+')'+$ext)}}
+        }else{Move-Item -LiteralPath $part -Destination $dest -Force}
+    }finally{if(Test-Path -LiteralPath $part){Remove-Item -LiteralPath $part -Force}}
+    @{ text = "saved $dest ($([F__BUILD__.Fs]::Human($n)))";path=$dest;bytes=$n }
 }
 function Zip-Dir($src, $dest) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1820,10 +2062,14 @@ function Zip-Dir($src, $dest) {
 function Do-Stream($a) {
     [F__BUILD__.Live]::Relay = $RELAY; [F__BUILD__.Live]::Token = $script:Token
     if ($a.on -eq $false) { [F__BUILD__.Live]::Stop(); return @{ text = 'stopped' } }
+    $wantVideo=([string]$a.codec -eq 'h264');if([F__BUILD__.Live]::Video -ne $wantVideo){[F__BUILD__.Live]::Video=$wantVideo;[F__BUILD__.Live]::Key()}
     [F__BUILD__.Live]::Start($(if ($null -ne $a.mon) { [int]$a.mon } else { -1 }))
     if ($a.key) { [F__BUILD__.Live]::Key() }
     @{ text = 'streaming' + $(if ([F__BUILD__.Live]::Err) { ' (last error: ' + [F__BUILD__.Live]::Err + ')' } else { '' }) }
 }
+
+__NETWORK_PS__
+__RECOVERY_PS__
 
 # ---- the state of the machine in one call
 function Do-System($a) {
@@ -1838,7 +2084,7 @@ function Do-System($a) {
             switch ($s) {
                 'overview' {
                     Sec 'overview'; $st = Static-Sys; $up = Uptime-TS
-                    Line "$($st.os), $env:COMPUTERNAME\$env:USERNAME, admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator'))"
+                    Line "$($st.os), $env:COMPUTERNAME\$env:USERNAME, admin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
                     Line ("up {0}d {1}h {2}m; cpu {3} ({4} cores) busy {5}%; {6}" -f $up.Days, $up.Hours, $up.Minutes, $st.cpu, $st.cores, [F__BUILD__.Sys]::CpuLoad(150), [F__BUILD__.Sys]::Mem())
                 }
                 'disks' {
@@ -2135,6 +2381,7 @@ function Do-SysData($a) {   # JSON for the live viewer's System tabs
             'process' { ConvertTo-Json -Compress -Depth 5 -InputObject (Process-Detail ([int]$a.pid)) }
             'adapters' { [F__BUILD__.Route]::Report($false) | ConvertTo-Json -Compress }
             'reach' { [F__BUILD__.Route]::Report($true) | ConvertTo-Json -Compress }
+            'netcheck' { (Do-NetCheck @{ mode = 'quick'; detail = $true }).text | ConvertTo-Json -Compress }
             default { throw "unknown kind '$kind' (procs, perf, services, startup, disks, policy, health, activation, process, adapters, reach)" }
         }
         @{ text = [string]$j }
@@ -2647,10 +2894,10 @@ function Static-Sys {
     $script:StaticSys = @{ os = "$name build $build"; cpu = ($cpu -replace '\s+', ' ').Trim(); cores = [Environment]::ProcessorCount }
     $script:StaticSys
 }
-function Uptime-TS { [TimeSpan]::FromMilliseconds([Environment]::TickCount64) }
+function Uptime-TS { [TimeSpan]::FromMilliseconds([double][F__BUILD__.Sys]::GetTickCount64()) }
 function Do-SysInfo($a) {
     $st = Static-Sys
-    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator')
+    $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     @{ text = (@{
         os = $st.os; host = $env:COMPUTERNAME; user = $env:USERNAME; admin = $admin
         powershell = $PSVersionTable.PSVersion.ToString(); cpu = $st.cpu; cores = $st.cores
@@ -2697,7 +2944,7 @@ function Ensure-Uv($cmd) {
     Write-Host '[helper] downloading portable uv ...'
     $zip = Join-Path $dir 'uv.zip'
     $pp = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'
-    try { Invoke-WebRequest "https://github.com/astral-sh/uv/releases/latest/download/uv-$arch-pc-windows-msvc.zip" -OutFile $zip -UseBasicParsing } finally { $ProgressPreference = $pp }
+    try { Invoke-WebRequest "https://github.com/astral-sh/uv/releases/latest/download/uv-$arch-pc-windows-msvc.zip" -OutFile $zip -UseBasicParsing -TimeoutSec 45 } finally { $ProgressPreference = $pp }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dir); Remove-Item $zip
     $script:ExtraPath = @($dir) + $script:ExtraPath
@@ -2856,7 +3103,7 @@ Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSe
 $label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $pausedLabel = $env:HM_PAUSED; $ppid = [int]$env:HM_PPID
 $script:dpos = $null; $script:blendT = -1.0; $holdLabel = $env:HM_HOLD; $doneLabel = $env:HM_DONE; $awayLabel = $env:HM_AWAY; $script:note = ''; $script:pin = $null
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
-$script:state = 'ok'; $script:glowOn = $false
+$script:state = 'ok'; $script:glowOn = $false;$script:bannerOn=$true;$script:timerOn=$true
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
 $BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255; $GREEN = C 61 220 132; $script:okC = $BLUE
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }
@@ -2922,7 +3169,7 @@ function Apply-State {
         }
         $m.img.Source = $m.cache[$key]; $m.img.Opacity = $(if ($script:glowOn -and -not (Warn)) { 1 } else { 0 })   # no glow unless switched on, and none at all while waiting / paused / offline (the orange edge was the nuisance)
         $m.pill.BorderBrush = Brush $c; $m.dot.Fill = Brush $c
-        $m.tb.Text = Label-Text; $m.tc.Text = Clock-Text; $m.tc.Visibility = $(if ($m.tc.Text) { 'Visible' } else { 'Collapsed' })
+        $m.tb.Text = Label-Text;$m.pill.Visibility=$(if($script:bannerOn){'Visible'}else{'Collapsed'}); $m.tc.Text = Clock-Text; $m.tc.Visibility = $(if ($script:timerOn -and $m.tc.Text) { 'Visible' } else { 'Collapsed' })
         if (Warn) {   # the orange dot pulses while the link is down or nobody has connected yet
             $an = New-Object Windows.Media.Animation.DoubleAnimation 1.0, 0.25, ([TimeSpan]::FromMilliseconds(550))
             $an.AutoReverse = $true; $an.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
@@ -3076,6 +3323,8 @@ function On-Line($line) {
     if ($f[0] -eq 'state' -and $f.Count -gt 1) { if ($script:state -ne $f[1]) { if ($f[1] -eq 'ok' -and $script:state -in 'done', 'wait') { $script:clockT.Restart() }; if ($f[1] -eq 'done') { $script:doneSec = [int]$script:clockT.Elapsed.TotalSeconds } else { $script:doneSec = $null }; $script:state = $f[1]; Apply-State }; return }
     if ($f[0] -eq 'color' -and $f.Count -ge 4) { $script:okC = C ([int]$f[1]) ([int]$f[2]) ([int]$f[3]); Apply-State; foreach ($m in $mons) { if ($script:busy) { $m.shadow.Color = (Cur) } }; return }
     if ($f[0] -eq 'glow' -and $f.Count -gt 1) { $script:glowOn = ($f[1] -eq '1'); Apply-State; return }
+    if($f[0] -eq 'banner' -and $f.Count -gt 1){$script:bannerOn=($f[1] -eq '1');Apply-State;return}
+    if($f[0] -eq 'timer' -and $f.Count -gt 1){$script:timerOn=($f[1] -eq '1');Apply-State;return}
     if ($f[0] -eq 'note64') { $script:note = $(if ($f.Count -gt 1) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($f[1])) } else { '' }); Apply-State; return }   # base64: stdin is read in the console code page (cp866), so Russian text came out as hieroglyphs
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
@@ -3201,6 +3450,7 @@ function Start-Overlay {
 }
 
 function Cleanup-Children {
+    try { [K__BUILD__.Keys]::Stop() } catch { }
     foreach ($c in $Children.Values) { Stop-Tree $c.p }
     if ($script:OverlayProc) { try { $script:OverlayIn.Close(); if (-not $script:OverlayProc.WaitForExit(3000)) { $script:OverlayProc.Kill() } } catch { try { $script:OverlayProc.Kill() } catch { } } }
     try { [void][H.U__BUILD__]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
@@ -3218,7 +3468,7 @@ $script:Token = $null; $script:Mode = 'auto'; $script:Code = $null; $script:Last
 # when a question is waiting, ONE key answers it (Y yes, A always for that kind of action until the session ends, N no), small steps are asked together,
 # and after the answer the window focus and the pointer are put back where the AI left them (otherwise a click that was allowed is followed by typing into the wrong window).
 $AskGroup = @{ ui_click = 'input'; ui_set = 'input'; click = 'input'; move = 'input'; drag = 'input'; scroll = 'input'; type_text = 'input'; press_key = 'input'; actions = 'input'; run = 'commands'; start_process = 'commands'; fsop = 'files'; util = 'commands'
-    write_file = 'files'; edit_file = 'files'; push_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp' }
+    write_file = 'files'; edit_file = 'files'; push_file = 'files'; fetch_file = 'files'; mcp_start = 'mcp'; mcp_call = 'mcp'; net_recover = 'commands'; net_check = 'commands' }
 $script:Allowed = @{}; $script:EndRequested = $false; $script:AiAt = $null; $script:AiPos = $null; $script:AiFg = [IntPtr]::Zero; $script:VT = $false; $script:Snd = @{}
 $Quiet = @{ ui_tree = @('читаю элементы окна', 'reading the window controls'); watch = @('смотрю, что происходит на экране', 'watching the screen'); trace = @('читаю текст на экране', 'reading text on the screen'); agent_log = @('читаю журнал', 'reading the log'); screenshot = @('смотрю на экран', 'looking at the screen'); sysinfo = @('смотрю сведения о системе', 'reading system info'); list_dir = @('смотрю папку', 'listing a folder')
     read_file = @('читаю файл', 'reading a file'); mcp_tools = @('смотрю MCP', 'listing MCP tools'); mcp_stop = @('останавливаю MCP', 'stopping MCP')
@@ -3232,7 +3482,7 @@ function Step-Text($st) {
         'click' { if ($st.double) { T "двойной клик ($x, $y)" "double-click ($x, $y)" } elseif ($st.button -eq 'right') { T "правый клик ($x, $y)" "right-click ($x, $y)" } elseif ($st.button -eq 'middle') { T "средний клик ($x, $y)" "middle-click ($x, $y)" } else { T "нажать ($x, $y)" "click ($x, $y)" } }
         'drag' { T "перетащить ($x, $y) -> ($($st.x2), $($st.y2))" "drag ($x, $y) -> ($($st.x2), $($st.y2))" }
         'scroll' { $am = if ($st.amount) { $st.amount } else { 3 }; T "прокрутить ($am)" "scroll ($am)" }
-        'type' { T ('ввести "' + (Cut $st.text 60) + '"') ('type "' + (Cut $st.text 60) + '"') }
+        'type' { T ('ввести текст: ' + ([string]$st.text).Length + ' симв.') ('type text: ' + ([string]$st.text).Length + ' chars') }
         'key' { T "нажать клавиши $($st.keys)" "press $($st.keys)" }
         'wait' { $ms = if ($st.ms) { $st.ms } else { 500 }; T "подождать $ms мс" "wait $ms ms" }
         default { [string]$st.do }
@@ -3248,7 +3498,9 @@ function Steps-Of($name, $a) {   # the steps of a tool call; a move right before
     $out
 }
 function Describe-Action($name, $a) {   # -> array of short sentences
-    if ($name -eq 'ui_click' -or $name -eq 'ui_set') { $who = if ($a.name) { [string]$a.name } else { "#$($a.id)" }; return @($(if ($name -eq 'ui_click') { (T 'нажать: ' 'press: ') + (Cut $who 60) } else { (T 'ввести в поле ' 'fill in ') + (Cut $who 40) + ': ' + (Cut ([string]$a.value) 40) })) }
+    if ($name -eq 'net_recover') { return @((T 'сценарий сети с откатом: ' 'guarded network scenario: ') + [string]$a.op + ', ' + @($a.steps).Count + (T ' шагов' ' steps')) }
+    if ($name -eq 'net_check') { return @((T 'проверяю сеть, режим: ' 'network check, mode: ') + $(if ($a.mode) { $a.mode } else { 'quick' }) + ', if=' + [int]$a.interface_index) }
+    if ($name -eq 'ui_click' -or $name -eq 'ui_set') { $who = if ($a.name) { [string]$a.name } else { "#$($a.id)" }; return @($(if ($name -eq 'ui_click') { (T 'нажать: ' 'press: ') + (Cut $who 60) } else { (T 'ввести в поле ' 'fill in ') + (Cut $who 40) + ': ' + ([string]$a.value).Length + (T ' симв.' ' chars') })) }
     if ($AskGroup[$name] -eq 'input') { return @(Steps-Of $name $a | ForEach-Object { Step-Text $_ }) }
     $pre = switch ($name) { 'run' { T 'команда: ' 'command: ' } 'start_process' { T 'запустить: ' 'start: ' } 'write_file' { T 'записать файл: ' 'write file: ' } 'fetch_file' { T 'скопировать файл: ' 'copy file: ' } 'edit_file' { T 'изменить файл: ' 'edit file: ' } 'push_file' { T 'получить файл: ' 'receive file: ' } 'fsop' { (T 'файлы: ' 'files: ') + $a.op + ' ' } 'util' { (T 'утилита: ' 'utility: ') + $a.op + ' ' } 'mcp_start' { T 'запустить MCP: ' 'start MCP: ' } 'mcp_call' { T 'вызвать MCP: ' 'call MCP: ' } default { "$name " } }
     $tail = if ($a.command) { $a.command } elseif ($a.path) { $a.path } elseif ($a.name) { $a.name } elseif ($a.url) { $a.url } elseif ($name -eq 'util') { '' } else { ($a | ConvertTo-Json -Compress) }
@@ -3288,7 +3540,7 @@ function Write-AgentLog($m) {
         Add-Content -Path $LogFile -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss ') + (([string]$m) -replace "`n", "`n    ")) -Encoding UTF8
     } catch { }
 }
-function Get-BootTime { try { [int][DateTimeOffset]::new((Get-CimInstance Win32_OperatingSystem).LastBootUpTime).ToUnixTimeSeconds() } catch { 0 } }
+function Get-BootTime { try { [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [Math]::Floor([F__BUILD__.Sys]::GetTickCount64() / 1000.0)) } catch { 0 } }
 function Get-DeviceId {   # a permanent per-install identity (like an AnyDesk/RustDesk ID): the relay then hands back the same code every time, not a new random one
     $f = Join-Path $StateDir 'device.json'
     try { $d = Get-Content $f -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json; if ($d.id) { return $d.id } } catch { }
@@ -3302,16 +3554,26 @@ function Norm-Mode($m) {   # confirm: ask before every action. auto: no question
 function Save-Session($code, $token, $mode) {   # the token is encrypted for this Windows user (DPAPI): the file is useless on another account or PC
     try {
         [void](New-Item $StateDir -ItemType Directory -Force)
-        $enc = ConvertFrom-SecureString (ConvertTo-SecureString $token -AsPlainText -Force)
+        # Use DPAPI directly: auto-loading Microsoft.PowerShell.Security may fail
+        # when launched from another PowerShell runtime. Keep the legacy hex format.
+        Add-Type -AssemblyName System.Security
+        $bytes = [Text.Encoding]::Unicode.GetBytes($token)
+        try { $enc = [BitConverter]::ToString([Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)).Replace('-', '').ToLowerInvariant() }
+        finally { [Array]::Clear($bytes, 0, $bytes.Length) }
         @{ relay = $RELAY; code = $code; token = $enc; mode = $mode; boot = (Get-BootTime); saved = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json | Set-Content $SessionFile -Encoding UTF8
         if ($env:HELPER_TOKEN_FILE) { Set-Content $env:HELPER_TOKEN_FILE $token -Encoding UTF8 -NoNewline }   # tests only: the plaintext token, so the harness need not re-decrypt DPAPI
-    } catch { Write-AgentLog "cannot save the session: $_" }
+    } catch { Write-AgentLog "cannot save the session: $_"; Write-Host (T 'Не удалось сохранить сеанс: автоматическое восстановление после закрытия не гарантируется.' 'Could not save session: recovery after closing is not guaranteed.') -ForegroundColor Yellow }
 }
 function Load-Session {
     try {
         $d = Get-Content $SessionFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($d.relay -ne $RELAY -or -not $d.code -or -not $d.token) { return $null }
-        $tok = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $d.token)))
+        Add-Type -AssemblyName System.Security
+        if ($d.token -notmatch '^[0-9a-fA-F]+$' -or $d.token.Length % 2 -ne 0) { return $null }
+        $encrypted = New-Object byte[] ($d.token.Length / 2)
+        for ($i = 0; $i -lt $encrypted.Length; $i++) { $encrypted[$i] = [Convert]::ToByte($d.token.Substring($i * 2, 2), 16) }
+        $bytes = [Security.Cryptography.ProtectedData]::Unprotect($encrypted, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+        try { $tok = [Text.Encoding]::Unicode.GetString($bytes) } finally { [Array]::Clear($bytes, 0, $bytes.Length) }
         @{ code = $d.code; token = $tok; mode = $d.mode; boot = [int]$d.boot }
     } catch { $null }
 }
@@ -3320,7 +3582,15 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
     try {
         [void](New-Item $StateDir -ItemType Directory -Force)
         $f = Join-Path $StateDir 'agent.ps1'
-        [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))   # the one-liner runs from memory: keep a copy
+        $copy = [string](Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content
+        $parseErrors = $null
+        [void][Management.Automation.Language.Parser]::ParseInput($copy, [ref]$null, [ref]$parseErrors)
+        if ($parseErrors.Count) { throw 'Downloaded autostart copy has PowerShell syntax errors; retaining the previous copy' }
+        $pending = $f + '.' + [guid]::NewGuid().ToString('N') + '.pending'
+        try {
+            [IO.File]::WriteAllText($pending, $copy, (New-Object Text.UTF8Encoding $true))
+            if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
+        } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
         $cmd = '-NoProfile -ExecutionPolicy Bypass -File "' + $f + '"'
         $tcmd = '/c if exist "' + $SessionFile + '" powershell.exe ' + $cmd   # the task only starts the helper while a kept session exists (a task made as administrator cannot be removed by a normal helper)
         if (Test-Admin) {   # started as administrator: from now on it also starts as administrator at logon (a task with the highest rights; the Run entry would start it twice, so it goes)
@@ -3345,7 +3615,7 @@ function Forget-Session {
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
-$NetToolsRx = '^(winws|zapret|goodbyedpi|clash|mihomo|verge|v2ray|xray|sing-box|nekoray|nekobox|v2rayn|hiddify|openvpn|wireguard|wg|tailscale|zerotier|hamachi|nordvpn|expressvpn|protonvpn|warp-svc|cloudflared|amnezia|outline|shadowsocks|windscribe|surfshark|forticlient|vpnui|pangps|fiddler|charles|mitmproxy|wireshark|dumpcap|privoxy|proxifier|netmod|psiphon|lantern)'
+$NetToolsRx = '^(winws|winwear|zapret|goodbyedpi|happ|incy|koala|clash|mihomo|verge|v2ray|xray|sing-box|nekoray|nekobox|v2rayn|hiddify|openvpn|wireguard|wg|tailscale|zerotier|hamachi|nordvpn|expressvpn|protonvpn|warp-svc|cloudflared|amnezia|outline|shadowsocks|windscribe|surfshark|forticlient|vpnui|pangps|fiddler|charles|mitmproxy|wireshark|dumpcap|privoxy|proxifier|netmod|psiphon|lantern)'
 function Diagnose-Net {   # what exactly is wrong right now: adapters, route, gateway, internet, DNS, the relay itself
     $u = [Uri]$RELAY; $d = [ordered]@{}
     try { $ad = @(Get-NetAdapter -ErrorAction Stop | Select-Object Name, Status, InterfaceDescription, LinkSpeed); $d.adapters = ($ad | ForEach-Object { "$($_.Name) [$($_.Status)] $($_.InterfaceDescription) $($_.LinkSpeed)" }) -join '; ' } catch { $ad = @(); $d.adapters = "unavailable: $_" }
@@ -3354,25 +3624,22 @@ function Diagnose-Net {   # what exactly is wrong right now: adapters, route, ga
     try { $d.gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric | Select-Object -First 1).NextHop } catch { $d.gateway = $null }
     if ($d.gateway -and $d.gateway -ne '0.0.0.0') { $d.ping_gateway = Test-Ping $d.gateway } else { $d.ping_gateway = $null }
     $d.ping_internet = Test-Ping '1.1.1.1'
-    try { [void][Net.Dns]::GetHostAddresses($u.Host); $d.dns_ok = $true } catch { $d.dns_ok = $false; $d.dns_error = "$($_.Exception.InnerException.Message)" }
+    try {
+        $dns = [Net.Dns]::BeginGetHostAddresses($u.Host, $null, $null)
+        try { if (-not $dns.AsyncWaitHandle.WaitOne(1000)) { throw 'DNS timeout' }; [void][Net.Dns]::EndGetHostAddresses($dns); $d.dns_ok = $true }
+        finally { $dns.AsyncWaitHandle.Close() }
+    } catch { $d.dns_ok = $false; $d.dns_error = 'DNS lookup failed or timed out' }
     try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect($u.Host, $u.Port, $null, $null); $d.relay_tcp = ($iar.AsyncWaitHandle.WaitOne(3000) -and $c.Connected); $c.Close() } catch { $d.relay_tcp = $false; $d.relay_error = "$($_.Exception.Message)" }
     try { $d.route = [F__BUILD__.Route]::Status(); $d.tools = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $NetToolsRx } | ForEach-Object { $_.ProcessName } | Sort-Object -Unique) -join ',' } catch { }
-    $d.class = if (-not $d.links_up.Count) { 'no_link' } elseif ($d.gateway -and $d.ping_gateway -eq $false) { 'lan_down' } elseif (-not $d.ping_internet) { 'isp_down' } elseif (-not $d.dns_ok) { 'dns' } elseif (-not $d.relay_tcp) { if ($d.vpn.Count) { 'relay_unreachable_vpn' } else { 'relay_unreachable' } } else { 'http_or_tls' }
+    # ICMP can be filtered on a healthy connection: it is evidence, never a reset trigger.
+    $d.class = if (-not $d.links_up.Count) { 'no_link_observed' } elseif (-not $d.dns_ok) { 'dns_lookup_failed' } elseif (-not $d.relay_tcp) { 'relay_tcp_failed_cause_unknown' } else { 'relay_tcp_ok_check_http_tls' }
     $d
 }
-function Heal-Net($d) {   # one attempt per outage, by cause; a VPN is never touched
-    $acts = @(); $cls = [string]$d.class
-    if ($cls -eq 'dns') { ipconfig /flushdns | Out-Null; $acts += 'ipconfig /flushdns' }
-    elseif ($cls -in 'no_link', 'lan_down', 'isp_down') {
-        ipconfig /flushdns | Out-Null; $acts += 'ipconfig /flushdns'
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if ($isAdmin) {
-            try { foreach ($a in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -ne 'Disabled' -and $_.InterfaceDescription -notmatch 'Bluetooth' })) { Restart-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop; $acts += "Restart-NetAdapter '$($a.Name)'" } } catch { $acts += "adapter restart failed: $($_.Exception.Message)" }
-        } else { $acts += 'restarting an adapter needs administrator rights: not done' }
-    }
-    elseif ($cls -like '*_vpn') { $acts += "a VPN adapter is up ($(@($d.vpn) -join ',')): not touched; the relay is unreachable through it" }
-    else { $acts += "nothing to repair automatically for: $cls" }
-    $acts
+function Heal-Net($d) {
+    # Recovery belongs to our own transport. Never reset the user's physical
+    # link or shared DNS cache because a ping or relay probe failed.
+    [F__BUILD__.Route]::Failed()
+    "Helper route retry requested; system networking unchanged; observation=$($d.class)"
 }
 $script:Out = @{ t0 = $null; diag = $null; acts = @(); healed = $false }
 function Outage-Tick {   # after every failed poll: diagnose after ~4 s, repair once after ~10 s
@@ -3515,8 +3782,123 @@ function Do-Actions($a) {   # a short list of small GUI steps, confirmed once
     }
     @{ text = "ok, $($done.Count) step(s) done" }
 }
+function Do-ViewerPointer($a) {
+    $op=[string]$a.op
+    if ($op -notin 'down','move','up','keep','cancel','release','kdown','kup','kkeep','kcancel' -or [string]$a.owner -notmatch '^[a-f0-9]{64}$' -or [string]$a.gesture -notmatch '^[a-f0-9]{32}$') { throw 'Invalid viewer pointer command' }
+    if ($script:Mode -eq 'confirm' -and $op -notin 'release','cancel','kcancel') { throw 'Live input needs auto mode; confirm mode uses completed actions' }
+    if ($op -eq 'release' -and (-not $script:PointerProc -or $script:PointerProc.HasExited)) { return @{text='released'} }
+    if (-not $script:PointerProc -or $script:PointerProc.HasExited) {
+        $source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__POINTER_CS_B64__'))
+        if (-not $script:PointerExe) {
+            # Elevated input must not execute a preplanted EXE from user cache.
+            $base=if(Test-Admin){Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'HelperMCP-Pointer'}else{Join-Path $StateDir 'pointer'}
+            [void](New-Item -ItemType Directory -Path $base -Force)
+            if(Test-Admin){Recovery-SecureDirectory $base}
+            if((Get-Item -LiteralPath $base -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Pointer directory cannot be a reparse point'}
+            $dir=Join-Path $base ([guid]::NewGuid().ToString('N'));[void](New-Item -ItemType Directory -Path $dir)
+            if(Test-Admin){Recovery-SecureDirectory $dir}
+            $exe=Join-Path $dir 'pointer.exe';$file=Join-Path $dir 'pointer.cs'
+            [IO.File]::WriteAllText($file,$source,(New-Object Text.UTF8Encoding $false))
+            # Framework compiler works from both Windows PowerShell and PS7;
+            # Add-Type ConsoleApplication is unavailable in newer PowerShell.
+            $compiler=Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+            if(-not (Test-Path -LiteralPath $compiler)){$compiler=Join-Path $env:SystemRoot 'Microsoft.NET\Framework\v4.0.30319\csc.exe'}
+            if(-not (Test-Path -LiteralPath $compiler)){throw 'Framework C# compiler unavailable; use completed drag'}
+            $cp=New-Object Diagnostics.ProcessStartInfo $compiler
+            $cp.Arguments='/nologo /target:exe /optimize+ /out:'+(Quote-Arg $exe)+' '+(Quote-Arg $file)
+            $cp.UseShellExecute=$false;$cp.CreateNoWindow=$true;$cp.RedirectStandardOutput=$true;$cp.RedirectStandardError=$true
+            $c=[Diagnostics.Process]::Start($cp)
+            try{
+                $stdout=$c.StandardOutput.ReadToEndAsync();$stderr=$c.StandardError.ReadToEndAsync()
+                if(-not $c.WaitForExit(15000)){$c.Kill();throw 'Pointer compiler timeout'}
+                if($c.ExitCode -ne 0){throw 'Pointer worker compilation failed; use completed drag'}
+            }finally{$c.Dispose()}
+            $script:PointerExe=$exe
+        }
+        $exe=$script:PointerExe
+        $psi=New-Object Diagnostics.ProcessStartInfo $exe
+        $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true; $psi.RedirectStandardInput=$true; $psi.RedirectStandardOutput=$true
+        $script:PointerProc=[Diagnostics.Process]::Start($psi)
+    }
+    $seq=[long]$a.seq; $x=[int]$a.x; $y=[int]$a.y
+    if ($seq -lt 0 -or $seq -gt 9007199254740991 -or [Math]::Abs([long]$x) -ge 100000 -or [Math]::Abs([long]$y) -ge 100000) { throw 'Invalid pointer sequence/position' }
+    $button=if($a.button -in 'right','middle'){[string]$a.button}else{'left'}
+    $p=$script:PointerProc
+    $p.StandardInput.WriteLine("$($a.owner) $($a.gesture) $seq $op $x $y $button v1"); $p.StandardInput.Flush()
+    $read=$p.StandardOutput.ReadLineAsync()
+    if (-not $read.Wait(1500)) { $p.StandardInput.Close(); throw 'Pointer worker timeout; its local lease will release the button' }
+    $line=$read.Result
+    if (-not $line -or -not $line.StartsWith('OK ')) { throw $(if($line){$line}else{'Pointer worker exited'}) }
+    @{text=$line.Substring(3)}
+}
+function Stop-RealtimeInput {
+    if($script:FastInputProc){try{$script:FastInputProc.StandardInput.Close()}catch{};try{[void]$script:FastInputProc.WaitForExit(2000)}catch{};$script:FastInputProc.Dispose();$script:FastInputProc=$null}
+}
+function Start-RealtimeInput {
+    if($script:Mode -eq 'confirm' -or -not $script:Token){return}
+    $uri=[Uri]$RELAY;$proxy=[F__BUILD__.Route]::Proxy;$proxyUri=''
+    if(-not $proxy.IsBypassed($uri)){$proxyUri=$proxy.GetProxy($uri).AbsoluteUri}
+    if($script:FastInputProc -and -not $script:FastInputProc.HasExited -and $script:FastInputToken -eq $script:Token -and $script:FastInputProxy -eq $proxyUri){return}
+    Stop-RealtimeInput
+    try{
+        if(-not $script:PointerExe){
+            $null=Do-ViewerPointer @{op='kcancel';owner=('0'*64);gesture=('0'*32);seq=0;x=0;y=0;button='left'}
+            $script:PointerProc.StandardInput.Close();[void]$script:PointerProc.WaitForExit(2000);$script:PointerProc.Dispose();$script:PointerProc=$null
+        }
+        $psi=New-Object Diagnostics.ProcessStartInfo $script:PointerExe
+        $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardInput=$true
+        $psi.EnvironmentVariables['HELPER_INPUT_RELAY']=$RELAY;$psi.EnvironmentVariables['HELPER_INPUT_TOKEN']=$script:Token
+        if($proxyUri){$psi.EnvironmentVariables['HELPER_INPUT_PROXY']=$proxyUri}
+        $script:FastInputProc=[Diagnostics.Process]::Start($psi);$script:FastInputToken=$script:Token;$script:FastInputProxy=$proxyUri
+    }catch{Write-AgentLog ('live input unavailable: '+$_.Exception.GetType().Name)}
+}
+function Do-ViewerInput($name, $a) {
+    # The human sees the video already. Do not restore the AI's old focus, glide
+    # before every hover, or wait for screenshot comparison after every key.
+    if ($name -in 'move','click','scroll') {
+        $t = Target $a
+        if (-not [H.U__BUILD__]::SetCursorPos($t[0], $t[1])) { throw 'Windows rejected pointer input (desktop locked or inaccessible)' }
+    }
+    switch ($name) {
+        'move' { }
+        'click' {
+            $down, $up = Btn $a.button
+            try { [H.U__BUILD__]::mouse_event($down, 0, 0, 0, [UIntPtr]::Zero) }
+            finally { [H.U__BUILD__]::mouse_event($up, 0, 0, 0, [UIntPtr]::Zero) }
+        }
+        'scroll' {
+            $n = [Math]::Max(-20, [Math]::Min(20, [int]$a.amount))
+            if ($n) {
+                $delta = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int](-120 * $n)), 0)
+                [H.U__BUILD__]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
+            }
+        }
+        'type_text' { [V__BUILD__.Kb]::Type(([string]$a.text -replace "`r`n", "`n")) }
+        'press_key' {
+            $parts = @(([string]$a.keys).Split('+'))
+            if (([string]$a.keys).EndsWith('++')) { $parts = @(([string]$a.keys).Substring(0, ([string]$a.keys).Length - 2).Split('+') + '+') }
+            $codes = @(foreach ($k in $parts) { if ($k -eq '+') { 0xBB } else { Key-Code $k.Trim() } })
+            $pressed = New-Object 'Collections.Generic.List[int]'
+            try {
+                foreach ($c in $codes) {
+                    [void]$pressed.Add($c)
+                    [H.U__BUILD__]::keybd_event([byte]$c, 0, $(if ($VkExt -contains $c) { 1 } else { 0 }), [UIntPtr]::Zero)
+                }
+            } finally {
+                for ($i=$pressed.Count-1; $i -ge 0; $i--) {
+                    $c=$pressed[$i]
+                    [H.U__BUILD__]::keybd_event([byte]$c, 0, $(if ($VkExt -contains $c) { 3 } else { 2 }), [UIntPtr]::Zero)
+                }
+            }
+        }
+        default { throw 'Unsupported direct viewer input' }
+    }
+    @{ text = 'ok' }
+}
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
+    $manualInput = $a.viewer_input -and $name -in 'move','click','drag','scroll','type_text','press_key','viewer_pointer'
+    if ($manualInput) { $script:AiAt = $null }   # handback must not restore a window from before the human's edits
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
     $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode'
     if (-not $viewFrame -and -not $meta) {
@@ -3528,20 +3910,24 @@ function Process-Command($cmd) {
             if ($wasDone -and $script:Persist) { Install-Autostart }   # work resumed after task_done: re-arm the safety net
         }
     }
-    if (-not $viewFrame -and -not $meta) { Say-Step $name $a }
+    if (-not $viewFrame -and -not $meta -and $name -ne 'viewer_pointer') { Say-Step $name $a }
     $res = @{ id = $cmd.id }
-    $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame; if (-not $quietCall) { Overlay-Send 'busy' }
+    $pointerRelease = $name -eq 'viewer_pointer' -and $a.op -in 'release','cancel','kcancel'
+    $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame -or $name -eq 'viewer_pointer'; if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
-        if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
-        if ($script:Mode -eq 'confirm' -and $AskTools -contains $name -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
-        Resume-State $name $a
+        if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta -and -not $pointerRelease) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
+        $needsConsent = $AskTools -contains $name -or ($name -eq 'net_check' -and $a.mode -eq 'profile')
+        if ($script:Mode -eq 'confirm' -and $needsConsent -and -not ($name -eq 'net_recover' -and $a.op -in 'list', 'templates', 'status', 'rollback') -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
+        if (-not $manualInput) { Resume-State $name $a }
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
-            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; ui_tree = 'Do-UiTree'; ui_click = 'Do-UiClick'; ui_set = 'Do-UiSet'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+            actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; ui_tree = 'Do-UiTree'; ui_click = 'Do-UiClick'; ui_set = 'Do-UiSet'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; net_check = 'Do-NetCheck'; net_recover = 'Do-NetRecover'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
+        if ($name -eq 'viewer_pointer') { $fn='Do-ViewerPointer' }
         if (-not $fn) { throw "Unknown tool $name" }
-        $res.ok = $true; $res.data = & $fn $a
-        Mark-State $name
+        $res.ok = $true
+        $res.data = if ($manualInput -and $name -notin 'drag','viewer_pointer') { Do-ViewerInput $name $a } else { & $fn $a }
+        if (-not $manualInput) { Mark-State $name }
     } catch { $ex = $_.Exception; while ($ex -is [Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }; $res.ok = $false; $res.error = $ex.Message }   # a C# helper's own message, not "Exception calling ..."
     if (-not $quietCall) { Overlay-Send 'idle' }
     if (-not $quietCall) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
@@ -3576,7 +3962,8 @@ function Net-State($st) {
 }
 
 function Register-Agent($mode, $resume, $resumeToken, $note) {
-    $body = @{ os = (Get-CimInstance Win32_OperatingSystem).Caption; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId) }
+    $os = try { (Static-Sys).os } catch { [Environment]::OSVersion.VersionString }
+    $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1;viewer_realtime=1 }
     if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
@@ -3597,21 +3984,32 @@ function Start-Helper {
     else { $script:Persist = $true }
     $note = ''
     if ($saved) { Write-Host ('  ' + (T 'Продолжаю прошлый сеанс ' 'Resuming the previous session ') + $saved.code) -ForegroundColor Yellow; $note = if ([Math]::Abs($saved.boot - (Get-BootTime)) -gt 90) { 'after a reboot' } else { 'restarted' }; Write-AgentLog "resuming session $($saved.code) ($note)" }
-    $wait = 1.0
+    $wait = 1.0; $lastStartupFailure = ''
     while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
         try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
-        catch { Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…')); Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7 }
+        catch {
+            # Record error categories, never response bodies, session tokens or
+            # request data. An endless "connecting" alone hides startup faults.
+            $failure=$_.Exception.GetType().Name
+            $errorId=([string]$_.FullyQualifiedErrorId -split ',')[0]
+            if($errorId -match '^[A-Za-z][A-Za-z0-9_.-]{0,80}$'){$failure+='; '+$errorId}
+            try{if($_.Exception.Response){$failure+='; HTTP '+[int]$_.Exception.Response.StatusCode}}catch{}
+            try{if($_.Exception.Status){$failure+='; '+[string]$_.Exception.Status}}catch{}
+            if($failure -ne $lastStartupFailure){Write-AgentLog ('registration failed: '+$failure);Write-Host ('  '+$failure) -ForegroundColor Yellow;$lastStartupFailure=$failure}
+            Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…'))
+            Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7
+        }
     }
     $token = $r.token; $script:Token = $token; $code = $script:Code = $r.code
-    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } elseif (-not $env:HELPER_NO_AUTOSTART) { try { $af = Join-Path $StateDir 'agent.ps1'; if (-not (Test-Path $af) -or ((Get-Date) - (Get-Item $af).LastWriteTime).TotalHours -gt 24) { Install-Autostart } } catch { } } }
+    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } elseif (-not $env:HELPER_NO_AUTOSTART) { try { $af = Join-Path $StateDir 'agent.ps1'; if (-not (Test-Path $af) -or -not [IO.File]::ReadAllText($af).Contains('namespace F__BUILD__ {') -or ((Get-Date) - (Get-Item $af).LastWriteTime).TotalHours -gt 24) { Install-Autostart } } catch { Write-AgentLog ('autostart refresh: '+$_.Exception.GetType().Name) } } }
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
-    if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound }   # what the admin panel says a new link starts with (both off by default)
+    if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound;if($null -ne $r.look.banner){$script:BannerOn=[bool]$r.look.banner};if($null -ne $r.look.timer){$script:TimerOn=[bool]$r.look.timer} }
     Play-Sound 'ok'
     Start-Overlay
-    Overlay-Send 'state wait'; if ($script:GlowOn) { Overlay-Send 'glow 1' }
+    Overlay-Send 'state wait'; if ($script:GlowOn) { Overlay-Send 'glow 1' };Overlay-Send ('banner '+[int]$script:BannerOn);Overlay-Send ('timer '+[int]$script:TimerOn)
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
     $k::MenuRun = (T 'Меню:  [P] пауза    [X] выход (сразу)    [Esc] закрыть меню' 'Menu:  [P] pause    [X] exit (now)    [Esc] close the menu'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] выход (сразу)    [Esc] закрыть меню' 'Paused.  [R] continue    [X] exit (now)    [Esc] close the menu')
     $k::ConfirmEnd = (T 'Сеанс завершён. Код больше не работает.' 'Session ended. The code no longer works.')
@@ -3621,6 +4019,7 @@ function Start-Helper {
     $fails = 0; $delay = 1.0
     try {
         while ($true) {
+            if($script:Mode -ne 'confirm'){Start-RealtimeInput}
             if ([K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
             else {
@@ -3659,9 +4058,12 @@ function Start-Helper {
             if ($script:EndRequested -or [K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
         }
     } finally {
+        Stop-RealtimeInput
+        if ($script:PointerProc) { try { $script:PointerProc.StandardInput.Close() } catch { }; $script:PointerProc.Dispose() }
         Cleanup-Children
         $final = [K__BUILD__.Keys]::Final -or $script:FinalEnd -or -not $script:Persist   # a closed window or a reboot keeps a saved session; only the user's confirmed end (or the operator's) ends it
         try { [void](Api '/a/bye' @{ final = $final } $script:Token 5) } catch { }
+        try { [F__BUILD__.Route]::Stop() } catch { }
         Write-AgentLog $(if ($final) { 'stopped (session ended)' } else { 'stopped (session kept)' })
         if ($final) { Forget-Session }
         try { if ((Get-Clipboard -Raw).Trim() -eq $code) { Set-Clipboard -Value ' ' } } catch { }   # the session code does not stay in the clipboard

@@ -56,7 +56,7 @@ function render(st) {
     L.push(M('  ' + pad(t('код', 'code'), 11) + pad(t('статус', 'status'), 11) + pad(t('устройство', 'device'), 26) + pad(t('режим', 'mode'), 7) + pad(t('вып.', 'run'), 5) + pad(t('оч.', 'q'), 5) + t('активность', 'last seen')));
     for (const x of st.sessions) {
       const state = !x.online ? R(pad(t('офлайн', 'offline'), 11)) : x.running ? O(pad(t('работает', 'working'), 11)) : G(pad(t('ждёт', 'idle'), 11));
-      L.push('  ' + G(pad(x.code, 11)) + state + pad(`${x.host || '?'} (${(x.os || '').split(/[ -]/)[0]})`, 26) + pad(x.mode, 7) + pad(x.running, 5) + pad(x.queued, 5) + D(`${x.last_seen_s}${t('с назад', 's ago')}`));
+      L.push('  ' + G(pad(x.code, 11)) + state + pad(`${x.host || '?'} (${(x.os || '').split(/[ -]/)[0]})`, 26) + pad(x.mode, 7) + pad(x.running, 5) + pad(x.queued, 5) + D(x.last_seen_s == null ? t('неизвестно','unknown') : `${x.last_seen_s}${t('с назад', 's ago')}`));
     }
   }
   return L.join('\n');

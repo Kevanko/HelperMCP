@@ -76,7 +76,7 @@ They open it, run the line for their system and send you the code. Tell your AI:
 - **Nothing is installed.** The PC agent runs from memory and is gone when the window closes.
 - **Everything is visible.** A glowing screen edge, a label with the current step, the AI's own smooth pointer.
 - **They stay in charge.** By default every action asks `Y / A(lways) / N`. **Esc** pauses or ends the session.
-- **It survives real life.** Lost internet, VPN switch, reboot: the session comes back with the same code.
+- **Kept sessions reconnect.** After internet loss, VPN changes or reboot, the agent retries with the saved code when a working route is available.
 
 ## The live view: System and Files
 
@@ -99,16 +99,32 @@ The AI opens a **live view** for you right away: a view-only link to share and a
 
 `https://your-server/admin` lists every connected session (device, state, mode, last seen, IP, what the AI did last), opens any of them in the live viewer with the control link, ends a session, changes the glow colour and the task text, and shows the action report. The install script prints the link, the login and a generated password **once** (the password is stored only as a scrypt hash); `helpermcp admin` shows the link and login again, `helpermcp admin reset` makes a new password.
 
+**All devices** changes Glow or Sound for existing devices and future sessions. Each device row has its own Glow and Sound switches; a local change affects only that device. Offline devices receive their saved setting when they reconnect. **Disconnect** closes that viewer's stream, cancels its queued input and gives control back immediately; another open viewer stays connected. Reconnect opens a fresh viewer connection.
+
+Saved sessions stay offline after a relay restart until the PC contacts it again; their last-contact time is retained. Legacy records without a measured contact display unknown until the next connection. Closing a kept Helper window preserves the code for a later restart. Direct viewer clicks, pointer movement, wheel, text and shortcuts skip AI focus restoration and screenshot-comparison delays; AI tool calls retain their normal visual checks.
+
+Updated Windows agents in auto/unattended mode support live held dragging. A separate local pointer worker owns a three-second lease: it releases the button without relay access when keepalives stop, and also releases when its parent exits. Disconnect, handback, focus loss and pointer cancellation request release immediately. Stale sequences cannot restart a cancelled gesture. Old agents, confirm mode, or a failed/slow live-pointer path retain completed dragging. Button transitions are audited; intermediate pointer samples and keepalives do not fill the action log.
+
 It is hardened: cookie sessions (HttpOnly, SameSite=Strict, Secure over HTTPS, 30 min idle / 8 h absolute), a CSRF header on every change plus an Origin check, five wrong passwords lock the address for 15 minutes (the same work is done for a wrong login as for a wrong password), a strict CSP that allows scripts only from the server itself, no operator key anywhere in the page, every admin action in the action log. Put the server behind a domain with HTTPS (`helpermcp domain <name>`) before using it over the internet; `ADMIN_DISABLE=1` switches the panel off.
 
 ## A link that holds
 
-The session survives VPNs, DPI-bypass tools (zapret and the like) and reboots, and it never waits for a keypress once the friend said *Yes* to keeping it.
+The Windows agent retries kept sessions after VPN changes, internet loss and reboots. It can change its own transport without changing the friend's VPN, routes or DNS. If every path to the relay is blocked, remote access still needs a reachable endpoint.
 
 - **Reboot:** the helper starts again with Windows in a visible window and takes the same code back at once; the saved session decides the mode, so nothing is asked.
-- **Route layer (Windows):** the helper talks to the relay through a tiny local bridge that can leave through any chosen network adapter. A watchdog checks the relay every few seconds; when it stops answering, every adapter is tried at once and the helper moves to the first one that works (physical adapters first, then the default route, a system proxy, VPN adapters last). It only ever moves to a path that has just worked, remembers the last good one across restarts, and logs every switch. A stuck connection on the dead path is cut instantly.
+- **Route layer (Windows):** a local bridge binds its own IPv4 sockets to an adapter. The watchdog checks TLS `/health`, prefers physical adapters, and tests the default route, system proxy and VPN adapters as fallbacks. The alternate relay port 9444 is probed without changing the active endpoint; it must be configured on the server. DNS is refreshed after network changes, with adapter-bound DNS fallback for physical paths. Speed tests do not block the recovery watchdog. WinDivert/WFP filters can still intercept bound sockets.
 - **Look at the network:** `system {sections:["reach"]}` lists every adapter (type, speed, IP, gateway, DNS, MAC), which one is the default route, which one the helper uses, whether each reaches the relay, the VPN / DPI-bypass / proxy programs and filter drivers installed, proxies and the hosts file; `connections` shows who talks to whom.
-- **Not touched:** VPN adapters are never restarted; an adapter restart needs administrator rights and is only tried for a dead physical link.
+- **Not touched:** outage recovery does not restart adapters, flush shared DNS, change routes, stop zapret or switch VPN/TUN.
+
+## Network diagnosis
+
+The updated Windows agent exposes `net_check`. Start with `{mode:"quick"}` to compare the current default/TUN route with adapter-bound paths. It reports DNS, repeated TCP/TLS/HTTP timings, HTTP status and payload bytes, CPU, memory and adapter counters. Use `interface_index` from `system {sections:["network"]}` for one exact adapter; a missing/down adapter fails without silently using the default route.
+
+Modes: `sites`, `dns`, `speed` (bounded download goodput), `load` (idle/load latency comparison), `inventory` (paged local JSON/YAML/URI subscription exports without credentials), `vpn` (endpoint reachability), `profile` (authenticated HTTP through one local Mihomo YAML/JSON profile using an already installed core, private proxy and bounded child process; no TUN/system proxy changes or application UDP claim) and `rkn` ([RKN Block Checker](https://github.com/MayersScott/rkn-block-checker), pinned to 0.6.0, with isolated adapter-bound sockets and DNS). Reports are compact by default; `detail:true` includes each sample. The live viewer's Network tab has diagnosis, route inspection, recovery jobs/status, a non-mutating guard self-test and rollback. The Windows launcher retries an alternate HTTPS endpoint and keeps startup errors visible.
+
+`vpn` tests endpoint reachability; `profile` verifies HTTP through one authenticated protocol connection. Neither proves application UDP/QUIC, Discord voice or game access. Binding to Ethernet does not bypass zapret/WinDivert. See [the network recipe](recipes/network.md) for commands, evidence limits and recovery rules.
+
+For authorized network changes, `net_recover` runs local background scenarios with a SYSTEM rollback task. It captures undo before each mutation, verifies the task before touching the network, and restores settings even when Helper loses its connection. Templates cover temporary adapter disconnect/cycle, WARP and zapret service A/B, DNS, one stale manual route, and IPv4 MTU. `restore`, `wait` and bound HTTP `probe` steps can run offline; status and probe results remain on the PC. An elevated Helper is required. Recovery cannot guarantee a working physical line or fix an OS/driver hang. See [the recovery recipe](recipes/network-recovery.md).
 
 ## The action log
 
@@ -141,11 +157,20 @@ To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=http
 
 ## Develop
 
+Run Windows integration tests in a dedicated VM: they create windows and send
+mouse/keyboard input. Do not run them on a desktop someone is using.
+
 ```bash
 cd relay && npm ci && npm test      # relay + real agent + MCP client, end to end
 ```
 
 CI runs on Windows and Ubuntu, Node 18 and 22.
+
+On Windows, `npm run test:network` covers native networking and offline recovery.
+For real profile protocol tests, set `HELPER_TEST_MIHOMO` to an already installed
+Mihomo executable, then run `npm run test:profile` and `node test/network-e2e.mjs`
+from `relay`. Tests use their own local VLESS fixture, do not download a core,
+and verify authentication, HTTP errors, TLS rejection and process/config cleanup.
 
 ## Security
 

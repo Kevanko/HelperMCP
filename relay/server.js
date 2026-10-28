@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { WebSocketServer } from 'ws';
 import QRCode from 'qrcode';
 import zlib from 'node:zlib';
 import os from 'node:os';
@@ -25,6 +26,9 @@ const AGENT_DIR = process.env.AGENT_DIR || path.join(here, '..', 'agent');
 const SESSION_IDLE_MS = Number(process.env.IDLE_MS || 300_000);
 const KEEP_MS = Number(process.env.KEEP_MS || 7 * 24 * 3600_000);   // a session the user chose to keep (survives reboots and outages) waits this long for its PC
 const ONLINE_MS = 30_000;   // an agent that has not polled for this long is shown as offline (it polls every <= 15 s)
+const isOnline = (s) => !s.awaitingReconnect && Date.now() - s.lastSeen <= ONLINE_MS;
+const contactAge = (s) => s.lastSeenKnown === false ? null : Math.max(0, Math.round((Date.now() - s.lastSeen) / 1000));
+const contactText = (s) => contactAge(s) === null ? 'unknown until the agent reconnects' : `${contactAge(s)} s ago`;
 const POLL_MS = 15_000;   // agents time out a poll after ~22 s, so a silently dead connection (VPN switch, firewall) is noticed quickly
 const MAX_SESSIONS = 200;
 const MAX_PER_IP = 10;
@@ -50,14 +54,14 @@ const unseal = (buf) => {
 let saveTimer = null;
 // what a new link starts with (changed in the admin panel): the edge glow and the sounds are OFF unless someone turns them on; a session can override it
 const settings = { glow: false, sound: false };
-const effLook = (s) => ({ glow: s.glow ?? settings.glow, sound: s.sound ?? settings.sound });
+const effLook = (s) => ({ glow: s.glow ?? settings.glow, sound: s.sound ?? settings.sound, banner:s.banner??true, timer:s.timer??true });
 function save() {
   if (!STATE_FILE || saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
     try {
       const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, glow: s.glow, sound: s.sound, events: (s.events || []).slice(-30) })),
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, glow: s.glow, sound: s.sound, banner:s.banner, timer:s.timer, events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
         devices: [...devices].map(([dh, code]) => ({ dh, code })),
         settings,
@@ -73,7 +77,7 @@ function save() {
 const MISS_FILE = process.env.MISS_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'misses.jsonl') : path.join(os.tmpdir(), 'helpermcp-misses.jsonl'));
 function recordMiss(s, code, kind, info) {
   try {
-    const redact = (a) => String(a || '').replace(/("text"\s*:\s*")((?:[^"\\]|\\.)*)(")/g, (_m, p, v, q) => `${p}<${v.length} chars>${q}`);
+    const redact = (a) => String(a || '').replace(HIDE, (_m, p, v, q) => `${p}<${v.length} chars>${q}`).replace(SECRET, '$1<hidden>');
     const e = { t: new Date().toISOString(), session: code, kind, device: `${s.info?.host || ''} / ${s.info?.os || ''}`, ...info,
       trail: s.log.slice(-8).map((l) => ({ ago_s: Math.round((Date.now() - l.t) / 1000), tool: l.tool, args: redact(l.args) })) };
     fs.appendFileSync(MISS_FILE, JSON.stringify(e) + '\n', { mode: 0o600 });
@@ -89,6 +93,14 @@ const ACT_MAX = Number(process.env.ACT_MAX_BYTES || 20_000_000);
 const HIDE = /("(?:text|content|value|old|new|stdin|body)"\s*:\s*")((?:[^"\\]|\\.)*)(")/g;
 const SECRET = /((?:pass(?:word|wd)?|token|secret|api[_-]?key|authorization|bearer)["'\s:=]+)([^\s"',;]{4,})/gi;
 const SHOW_OUT = new Set(['run', 'util', 'start_process', 'edit_file', 'push_file', 'fetch_file', 'write_file', 'system', 'sysinfo']);
+function loggedArgs(tool, args) {
+  if (tool === 'viewer_pointer') return String(args?.op||'').startsWith('k')&&args?.op!=='keep'?{op:args?.op}:{ op: args?.op, x: args?.x, y: args?.y, button: args?.button };
+  if (tool === 'net_recover') return { op: args?.op || 'list', job: args?.job, steps: args?.steps?.length || 0, rollback_after_s: args?.rollback_after_s };
+  if (tool !== 'net_check') return args;
+  // Subscription tokens can be opaque path segments: do not store network inputs.
+  return { mode: args?.mode || 'quick', interface_index: args?.interface_index || 0,
+    targets: (args?.urls?.length || 0) + (args?.endpoints?.length || 0), samples: args?.samples || 3 };
+}
 function actWrite(e) {
   if (!ACT_FILE) return;
   try {
@@ -100,7 +112,7 @@ const sidOf = (s) => (s.sid ??= crypto.randomBytes(3).toString('hex'));
 const devOf = (s) => `${s.info?.host || ''}|${s.info?.os || ''}`;
 function actCall(s, tool, args, ok, t0, res) {
   try {
-    const a = JSON.stringify(args || {}, (k, v) => (k === 'session' ? undefined : typeof v === 'string' && v.length > 300 ? v.slice(0, 300) + '…' : v))
+    const a = JSON.stringify(loggedArgs(tool, args || {}), (k, v) => (k === 'session' ? undefined : typeof v === 'string' && v.length > 300 ? v.slice(0, 300) + '…' : v))
       .replace(HIDE, (_m, p1, v, q) => `${p1}<${v.length} chars>${q}`).replace(SECRET, '$1<hidden>').slice(0, 700);
     const text = ok ? String((res && res.text) ?? '') : String(res || '');
     const e = { t: new Date(t0).toISOString(), sid: sidOf(s), dev: devOf(s), tool, a: a === '{}' ? '' : a, ok, ms: Date.now() - t0, n: ok ? text.length || (res && res.jpeg ? res.jpeg.length : 0) : undefined };
@@ -120,14 +132,27 @@ function lookOf(s) {
   return { color: s.lookForce || (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };   // a colour picked by a person wins over the plan's
 }
 // a person changes the glow colour or the task text from the viewer / the admin panel
-async function humanLook(code, color, note, glow, sound) {
+async function humanLook(code, color, note, glow, sound, banner, timer) {
   const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
   if (color !== undefined && color !== '') { if (!/^#[0-9a-f]{6}$/i.test(color)) throw new Error('bad colour (use #RRGGBB)'); s.lookForce = color.toLowerCase(); }
-  if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').slice(0, 90); s.lastNoteAt = 0; }
+  if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').trim().slice(0, 90); s.lastNoteAt = 0; }
   if (typeof glow === 'boolean') s.glow = glow;
-  if (typeof sound === 'boolean') s.sound = sound;
+  if (typeof sound === 'boolean') s.sound = sound;if(typeof banner==='boolean')s.banner=banner;if(typeof timer==='boolean')s.timer=timer;
   evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', glow: effLook(s).glow, sound: effLook(s).sound, by: 'operator' } }); save();
+  if (!isOnline(s)) { s.lookPending = true; return 'saved; applies when the device reconnects'; }
   return pushLook(String(code).toUpperCase(), s);
+}
+function globalLook(update) {
+  for (const key of ['glow', 'sound']) if (typeof update[key] === 'boolean') settings[key] = update[key];
+  for (const [code, s] of sessions) {
+    for (const key of ['glow', 'sound']) if (typeof update[key] === 'boolean') s[key] = update[key];
+    s.lookPending = true;
+    if (isOnline(s)) {
+      s.lookPending = false;
+      pushLook(code, s).catch(() => { s.lookPending = true; });
+    }
+  }
+  save();
 }
 async function pushLook(code, s) {
   const l = lookOf(s);
@@ -154,11 +179,13 @@ function streamCtl(code, s, a) {
   if (s.noStream) return;
   call(code, 'stream', a, 10_000, { human: true }).catch((e) => { if (/Unknown tool|unknown tool/.test(e.message)) s.noStream = true; });   // an old agent: viewers fall back to pictures
 }
-function wantKey(code, s) { if (Date.now() - (s.keyAt || 0) > 1000) { s.keyAt = Date.now(); streamCtl(code, s, { on: true, mon: s.liveMon ?? -1, key: true }); } }
+function liveCodec(s) { return s.live?.size && [...s.live].every(v => v.codec === 'h264') ? 'h264' : 'jpeg'; }
+function wantKey(code, s) { if (Date.now() - (s.keyAt || 0) > 1000) { s.keyAt = Date.now(); streamCtl(code, s, { on: true, mon: s.liveMon ?? -1, codec: liveCodec(s), key: true }); } }
 function liveFrame(code, s, fr) {
   const type = String.fromCharCode(fr[4]);
   const key = type === 'K' || (type === 'V' && (fr[5] & 1));
   if (type === 'C') s.lastC = fr;   // a new viewer needs the decoder settings before the next key frame
+  if (type === 'K') s.lastC = null;
   if (type === 'S') { s.lastS = fr; for (const lv of s.live || []) if (lv.res.writableLength < LIVE_BACKLOG) lv.res.write(fr); return; }
   for (const lv of s.live || []) {
     if (lv.res.writableLength > LIVE_BACKLOG) { lv.waitKey = true; wantKey(code, s); continue; }   // the viewer's link is slower than the picture
@@ -168,10 +195,58 @@ function liveFrame(code, s, fr) {
   }
 }
 function liveEnd(s) { for (const lv of s.live || []) { try { lv.res.end(); } catch { /* gone */ } } s.live?.clear(); try { s.ingest?.destroy(); } catch { /* gone */ } }
+function cancelViewerCommands(s, owner) {
+  for (const q of s.queue.slice()) {
+    const pending = s.pending.get(q.id);
+    if (pending?.viewerOwner !== owner) continue;
+    s.queue = s.queue.filter((item) => item.id !== q.id); s.pending.delete(q.id); clearTimeout(pending.timer);
+    pending.reject(new Error('Viewer disconnected or handed control back; queued input cancelled'));
+  }
+}
+function releaseViewerPointer(code, s, owner) {
+  if(fastInput(s,{owner:sha(owner),gesture:'0'.repeat(32),seq:0,op:'release',x:0,y:0,button:'left'}))return;
+  if(s.info?.viewer_realtime===1)return; // disconnected stream already released its own leases
+  if (s.info?.viewer_pointer !== 1) return;
+  call(code, 'viewer_pointer', { op: 'release', owner: sha(owner), gesture: '0'.repeat(32), seq: 0, x: 0, y: 0, viewer_input: true }, 4000, { human: true, release: true }).catch(() => {});
+}
+function fastInput(s,a){
+  const out=s.fastInput;if(!out||out.destroyed||out.writableEnded)return false;
+  if(out.writableLength>16384){out.destroy();return false;}
+  out.write(Date.now()+'|'+[a.owner,a.gesture,a.seq,a.op,a.x||0,a.y||0,a.button||'left','v1'].join(' ')+'\n');return true;
+}
+function liveInputArgs(s,owner,b){
+  const seq=Number(b.seq);if(!Number.isSafeInteger(seq)||seq<1)throw Error('invalid input sequence');
+  if(b.a==='pointer'){
+    if(s.info?.viewer_pointer!==1||!['down','hover','move','up','keep','cancel'].includes(b.phase)||!/^[a-f0-9]{32}$/.test(String(b.gesture||'')))throw Error('invalid pointer input');
+    const x=Math.round(Number(b.x||0)),y=Math.round(Number(b.y||0));if(![x,y].every(n=>Number.isFinite(n)&&Math.abs(n)<100000))throw Error('invalid pointer position');
+    return {op:b.phase,owner:sha(owner),gesture:b.gesture,seq,x,y,button:['right','middle'].includes(b.button)?b.button:'left'};
+  }
+  if(b.a==='keyboard'){
+    const vk=Number(b.vk||0);if(s.info?.viewer_keyboard!==1||!['down','up','keep','cancel'].includes(b.phase)||!Number.isInteger(vk)||(['down','up'].includes(b.phase)&&(vk<8||vk>254)))throw Error('invalid keyboard input');
+    return {op:{down:'kdown',up:'kup',keep:'kkeep',cancel:'kcancel'}[b.phase],owner:sha(owner),gesture:'0'.repeat(32),seq,x:vk,y:b.extended?1:0,button:'left'};
+  }
+  throw Error('unsupported live input');
+}
+function scheduleViewerHandback(token,v,s,client){
+  const owner=token+'/'+client;
+  setTimeout(()=>{
+    if(s.takeoverOwner!==owner||[...(s.live||[])].some(x=>x.viewer===token&&x.client===client)||[...inputSockets.clients].some(x=>x.helperOwner===owner&&x.readyState===1))return;
+    cancelViewerCommands(s,owner);releaseViewerPointer(v.code,s,owner);s.takeover=0;s.takeoverOwner='';evPush(s,{t:Date.now(),type:'handback',data:{reason:'viewer channels closed'}});
+  },3000).unref();
+}
+function detachViewer(token, v, s, client) {
+  (v.disconnected ??= new Set()).add(client);
+  if (v.disconnected.size > 128) v.disconnected.delete(v.disconnected.values().next().value);
+  for (const lv of s.live || []) if (lv.viewer === token && lv.client === client) { s.live.delete(lv); try { lv.res.end(); } catch {} }
+  cancelViewerCommands(s, token + '/' + client);
+  releaseViewerPointer(v.code, s, token + '/' + client);
+  if (s.takeoverOwner === token + '/' + client) { s.takeover = 0; s.takeoverOwner = ''; evPush(s, { t: Date.now(), type: 'handback', data: { reason: 'viewer disconnected' } }); }
+  if (!s.live?.size) streamCtl(v.code, s, { on: false });
+}
 
 // a file in transit, encrypted at rest with its own key, deleted with the session (or after 24 h)
 async function storeFile(req, rawName, code) {
-  const name = String(rawName || 'file').replace(/[^\w.\-]+/g, '_').slice(0, 100) || 'file';
+  const name = safeUploadName(rawName);
   const id = crypto.randomBytes(12).toString('hex'), fp = path.join(FILES_DIR, id);
   let n = 0;
   const cap = new Transform({ transform(chunk, _e, cb) { n += chunk.length; n > MAX_FILE ? cb(new Error('file too large')) : cb(null, chunk); } });
@@ -181,13 +256,17 @@ async function storeFile(req, rawName, code) {
   files.set(id, { path: fp, name, size: n, exp: Date.now() + FILE_TTL_MS, code, key, iv, tag: enc.getAuthTag() });
   return { url: `${baseUrl(req)}/f/${id}/${encodeURIComponent(name)}`, size: n, name };
 }
+function safeUploadName(raw){
+  let name=String(raw||'file').normalize('NFC').split(/[\\/]/).pop().replace(/[\x00-\x1f\x7f<>:"|?*\u202a-\u202e\u2066-\u2069]/g,'_').replace(/[. ]+$/g,'').slice(0,120);
+  if(!name||/^\.+$/.test(name))name='file';if(/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name))name='_'+name;return name;
+}
 
 function makeViewer(c, base = lastBase) {
   const token = crypto.randomBytes(18).toString('hex'), ctl = crypto.randomBytes(12).toString('hex');
   viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
   return { watch: `${base}/v/${token}`, control: `${base}/v/${token}#c=${ctl}` };
 }
-const newSession = (o) => ({ events: [], persist: false, paused: false, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
+const newSession = (o) => ({ events: [], persist: false, paused: false, lookPending: true, ...o, queue: [], pending: new Map(), waiting: null, waitTimer: null, lastSeen: Date.now(), log: [] });
 const viewers = new Map();  // unguessable token -> { code, exp }: lets the operator watch a screen in a browser without exposing OPERATOR_KEY
 let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used to build viewer links)
 const VIEWER_TTL_MS = 12 * 3600_000;
@@ -221,22 +300,24 @@ const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
-  if (s.paused && tool !== 'bye' && !(opts.human && (tool === 'screenshot' || tool === 'stream' || tool === 'look'))) {   // the live viewer keeps showing the screen while it is paused
+  if (s.paused && tool !== 'bye' && !opts.release && !(opts.human && (tool === 'screenshot' || tool === 'stream' || tool === 'look'))) {   // the live viewer keeps showing the screen while it is paused
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
   if (takenOver(s) && !opts.human && tool !== 'bye') {
     return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
-  if (Date.now() - s.lastSeen > ONLINE_MS && !s.pending.size && tool !== 'bye') {
-    if (s.persist) return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet loss, VPN change, sleep or reboot). This session is KEPT and its agent reconnects by itself with the same code. Use wait_online to wait for it, then session_log to read what happened.`));
-    return Promise.reject(new Error(`The remote PC is offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
+  if (!isOnline(s) && !s.pending.size && tool !== 'bye') {
+    if (s.persist) return Promise.reject(new Error(`The remote PC is offline (last seen ${contactText(s)}: internet loss, VPN change, sleep or reboot). This session is KEPT and its agent reconnects by itself with the same code. Use wait_online to wait for it, then session_log to read what happened.`));
+    return Promise.reject(new Error(`The remote PC is offline (last seen ${contactText(s)}: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'confirm' && tool !== 'bye') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
-  if (!args.view && tool !== 'stream') { // live-viewer frames are not "actions"
-    const a = JSON.stringify(args, (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v));
+  const passivePointer = tool === 'viewer_pointer' && ['move','keep','kkeep'].includes(args.op);
+  if (!args.view && tool !== 'stream' && !passivePointer) { // live frames/hover keepalives are not audit actions
+    const a = JSON.stringify(loggedArgs(tool, args), (k, v) => (typeof v === 'string' && v.length > 80 ? v.slice(0, 80) + '…' : v))
+      .replace(HIDE, (_m, p, v, q) => `${p}<${v.length} chars>${q}`).replace(SECRET, '$1<hidden>');
     argStr = a === '{}' ? '' : a.slice(0, 160);
     s.log.push({ t: Date.now(), tool, args: argStr });
     if (s.log.length > 60) s.log.shift();
@@ -247,11 +328,11 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
       s.pending.delete(id); s.queue = s.queue.filter((q) => q.id !== id);   // a caller that gave up must not have its command run later
       reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
     }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view });
-    s.queue.push({ id, tool, args });
+    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view, viewerOwner: opts.viewerOwner });
+    if (opts.release) s.queue.unshift({ id, tool, args }); else s.queue.push({ id, tool, args });
     flush(s);
   });
-  if (!args.view && tool !== 'stream' && tool !== 'bye') pr.then((d) => actCall(s, tool, args, true, t0, d), (e) => actCall(s, tool, args, false, t0, e.message));
+  if (!args.view && tool !== 'stream' && tool !== 'bye' && !passivePointer) pr.then((d) => actCall(s, tool, args, true, t0, d), (e) => actCall(s, tool, args, false, t0, e.message));
   return pr;
 }
 
@@ -269,7 +350,7 @@ function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
   ended.set(code, Date.now());
-  sessions.delete(code); s.log.length = 0; s.queue.length = 0; liveEnd(s);
+  sessions.delete(code); s.log.length = 0; s.queue.length = 0; liveEnd(s);s.fastInput?.end();
   for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }   // files fetched in this session die with it
   for (const [t, v] of viewers) if (v.code === code) { v.last = null; viewers.delete(t); }                          // so do viewer links and their last frame
   save();
@@ -283,7 +364,7 @@ setInterval(() => {
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   for (const [ip, r] of regRate) if (Date.now() - r.t > 60_000) regRate.delete(ip);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
-  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - s.lastSeen > (s.persist ? (s.keepMs || KEEP_MS) : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
+  for (const [code, s] of sessions) if (!s.pending.size && Date.now() - Math.max(s.lastSeen, s.restoredAt || 0) > (s.persist ? (s.keepMs || KEEP_MS) : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
 
 // ---- adapting to the network: viewer frames step through quality levels, "lite" mode shrinks the AI's screenshots on slow links
@@ -351,7 +432,7 @@ const tools = [
     run: async () => ({
       text: JSON.stringify([...sessions].map(([code, s]) => ({
         code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
-        online: Date.now() - s.lastSeen <= ONLINE_MS, last_seen_s: Math.round((Date.now() - s.lastSeen) / 1000),
+        online: isOnline(s), last_seen_s: contactAge(s),
         connected_s: Math.round((Date.now() - s.created) / 1000), paused: s.paused, kept: s.persist, events: s.events.length,
         last_event: s.events.length ? { type: s.events[s.events.length - 1].type, ago_s: Math.round((Date.now() - s.events[s.events.length - 1].t) / 1000) } : undefined,
       })), null, 2),
@@ -361,7 +442,7 @@ const tools = [
     props: {}, run: async (code) => {
       const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
       const ago = (t) => Math.round((Date.now() - t) / 1000);
-      return { text: JSON.stringify({ online: Date.now() - s.lastSeen <= ONLINE_MS, paused: s.paused, kept_across_reboots: s.persist, last_seen_s: ago(s.lastSeen),
+      return { text: JSON.stringify({ online: isOnline(s), paused: s.paused, kept_across_reboots: s.persist, last_seen_s: contactAge(s),
         events: s.events.slice(-15).map((e) => ({ ...(e.data || {}), ago_s: ago(e.t), type: e.type })),
         recent_actions: s.log.slice(-15).map((l) => ({ ago_s: ago(l.t), tool: l.tool, args: l.args })) }, null, 2) };
     } },
@@ -433,8 +514,8 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session (it was ended)');
       const until = Date.now() + (a.timeout_s || 40) * 1000;
-      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (Date.now() - s.lastSeen <= ONLINE_MS && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
-      return { text: takenOver(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${Math.round((Date.now() - s.lastSeen) / 1000)} s ago); call wait_online again or ask the operator` };
+      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (isOnline(s) && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
+      return { text: takenOver(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${contactText(s)}); call wait_online again or ask the operator` };
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
@@ -476,7 +557,45 @@ const tools = [
     props: { op: { type: 'string', enum: ['mkdir', 'newfile', 'copy', 'move', 'rename', 'delete', 'stat', 'preview'] }, path: str('item'), dest: str('destination file or folder (copy, move)'), name: str('new name (rename)'), overwrite: { type: 'boolean' }, permanent: { type: 'boolean', description: 'delete: skip the Recycle Bin' } }, required: ['op', 'path'] },
   { name: 'find', agent: true, ms: (a) => 60_000, description: 'Find files by name (glob) and/or by content (regex, case-insensitive): answers path (and size) or path:line: text. Skips .git / node_modules, binary files and files over 5 MB when searching content.',
     props: { path: str('Folder to search'), name: str('file name glob, e.g. *.json or config*'), text: str('regex to search inside files'), max: { type: 'integer', minimum: 1, maximum: 1000, description: 'results, default 100' }, depth: { type: 'integer', minimum: 1, maximum: 50 } }, required: ['path'] },
-  { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (EVERY adapter: type, speed, IP, gateway, DNS, MAC, which one is the default route and which one the agent uses), reach (tests each adapter against the relay, lists VPN / DPI-bypass / proxy programs and network filter drivers, proxies, hosts file), connections (TCP connections per process), services (stopped auto-start services / failed units), startup (programs that start with the system), apps (installed programs), events (recent system errors). Default: overview, disks, processes, network.',
+  { name: 'net_recover', agent: true, ms: () => 45_000,
+    description: 'Windows guarded BACKGROUND network scenarios that run offline. Read recipe network-recovery first. templates lists disconnect/adapter-cycle/zapret-ab/warp-cycle/fake-dns/stale-route/mtu-trial. start snapshots exact resources and verifies a SYSTEM rollback task BEFORE changes; detached worker journals undo before mutation. Deadline/startup task restores without Helper/relay and retries on failure. restore, wait, bound HTTP probe steps run locally; status includes results. Custom script steps require local apply_path AND explicit reviewed idempotent undo_path, frozen/hash-checked with timeout; no inferred rollback. Elevated Helper required for start/rollback/commit. Default ALWAYS restores; allow_commit needs relay and application postchecks, never adapter disconnect. One pending job at a time. OS/driver hangs or physical faults can still prevent recovery.',
+    props: {
+      op: { type: 'string', enum: ['list', 'status', 'templates', 'start', 'rollback', 'commit'] }, job: { type: 'string', pattern: '^[a-f0-9]{24}$' },
+      template: { type: 'string', enum: ['guard-selftest','disconnect','adapter-cycle','zapret-ab','warp-cycle','fake-dns','stale-route','mtu-trial'] },
+      interface_index: { type: 'integer', minimum: 0 }, interface_indices: { type: 'array', maxItems: 6, items: { type: 'integer', minimum: 1 } },
+      seconds: { type: 'integer', minimum: 1, maximum: 60 }, mtu: { type: 'integer', minimum: 1280, maximum: 1500 }, service: { type: 'string' },
+      servers: { type: 'array', maxItems: 3, items: { type: 'string' } }, destination: { type: 'string' }, gateway: { type: 'string' }, url: { type: 'string' },
+      rollback_after_s: { type: 'integer', minimum: 45, maximum: 300 }, allow_commit: { type: 'boolean', description: 'Default false: always restores. Never valid with adapter_disable.' },
+      script_rollback_reviewed: { type: 'boolean', description: 'Required only for custom script steps: operator agent has inspected the exact explicit idempotent undo script; scripts cannot be rolled back by inference.' },
+      steps: { type: 'array', minItems: 1, maxItems: 12, items: { type: 'object', additionalProperties: false, properties: {
+        op: { type: 'string', enum: ['wait', 'restore', 'probe', 'script', 'adapter_disable', 'dns_set', 'route_remove', 'service_stop', 'mtu_set'] },
+        apply_path: { type: 'string', description: 'script: local .ps1 apply script, frozen before launch' }, undo_path: { type: 'string', description: 'script: local .ps1 idempotent undo script; mandatory, frozen and journaled before apply' }, timeout_s: { type: 'integer', minimum: 2, maximum: 20 },
+        mtu: { type: 'integer', minimum: 1280, maximum: 1500 }, url: { type: 'string', description: 'probe: http(s) URL without credentials/query/fragment' },
+        interface_index: { type: 'integer', minimum: 1 }, seconds: { type: 'integer', minimum: 1, maximum: 60 },
+        servers: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string' } },
+        destination: { type: 'string' }, gateway: { type: 'string' }, name: { type: 'string', description: 'Exact running WARP/zapret/winws/GoodbyeDPI service, core Windows services excluded.' }
+      }, required: ['op'] } }
+    } },
+  { name: 'net_check', agent: true, ms: (a) => a.mode === 'rkn' ? 220_000 : a.mode === 'profile' ? 150_000 : 90_000,
+    description: 'Windows 10/11 read-only network diagnosis; requires updated Windows agent. Start quick: default/TUN vs up to four adapter-bound IPv4 paths, DNS, repeated TCP/TLS/HTTP with real status/body, timings and CPU/memory. interface_index selects EXACTLY one adapter (system network lists indices); missing/down fails, never silently uses default. sites: URLs; vpn: endpoint TCP/TLS reachability ONLY, not authenticated VPN/UDP functionality. inventory: local JSON/YAML/URI subscription export, credentials omitted. profile: authenticated HTTP through ONE selected Mihomo YAML/JSON profile using an already installed core_path, private loopback proxy and bounded child Job; requires command consent in confirm mode. No application UDP test or client/TUN changes. dns: compare resolvers without changing Windows DNS. speed: capped 1 MiB payload goodput per sample, not line capacity. load: bounded idle/load comparison on one path. rkn: pinned MayersScott/rkn-block-checker 0.6.0 via uv (prepared if missing), child sockets and DNS bound to interface; inspected resolver provenance is returned. NEVER stops zapret, switches VPN/TUN or alters routes. Binding does NOT bypass WinDivert/WFP: do not claim clean Ethernet while filters are active. Read recipe network before repairs; ping alone never proves working application access.',
+    props: {
+      mode: { type: 'string', enum: ['quick', 'sites', 'vpn', 'dns', 'speed', 'rkn', 'inventory', 'load', 'routes', 'profile'] },
+      core_path: { type: 'string', description: 'profile: absolute path of an already installed mihomo/clash-meta .exe; no download, TUN or existing client changes' },
+      profile_index: { type: 'integer', minimum: 0, description: 'profile: zero-based index in the original Mihomo export proxies list, default 0; not the deduplicated inventory position' },
+      profile_timeout_s: { type: 'integer', minimum: 3, maximum: 15, description: 'profile: each HTTP request budget, default 8; samples 1..2 and urls 1..2' },
+      load_url: { type: 'string', description: 'load: bounded download target, <=3 MiB, one path only; compares control URL latency idle vs concurrent download. Does not prove channel saturation or bufferbloat.' },
+      config_path: { type: 'string', description: 'LOCAL export. inventory: JSON/YAML/base64/URI, metadata only. profile: original Mihomo YAML/JSON proxies list; uses selected credentials privately, never returns them or fetches subscription URLs.' },
+      inventory_offset: { type: 'integer', minimum: 0, maximum: 100000, description: 'inventory: endpoint offset, use next_offset from the previous response' },
+      inventory_limit: { type: 'integer', minimum: 1, maximum: 128, description: 'inventory: endpoint page size, default 64; count is the total unique endpoints' },
+      detail: { type: 'boolean', description: 'Return individual samples instead of compact min/median/max summary; default false' },
+      interface_index: { type: 'integer', minimum: 0, description: 'Exact IPv4 adapter index; 0 = default + adapter matrix unless single_path=true. rkn uses one path only, default when 0.' },
+      single_path: { type: 'boolean', description: 'Do not add adapter matrix to default route' },
+      urls: { type: 'array', maxItems: 8, items: { type: 'string' }, description: 'http(s) URLs without credentials, query or fragment; never subscription URLs' },
+      endpoints: { type: 'array', maxItems: 8, items: { type: 'object', properties: { host: { type: 'string' }, port: { type: 'integer', minimum: 1, maximum: 65535 }, tls: { type: 'boolean' }, server_name: { type: 'string' } }, required: ['host', 'port'], additionalProperties: false }, description: 'VPN server hosts/ports WITHOUT UUID/password; optional server_name selects TLS SNI/certificate name independently of host/IP. TLS only if endpoint actually speaks standard TLS. UDP/Hysteria not verified by TCP.' },
+      resolver: { type: 'string', description: 'Alternate IPv4 DNS server, default 1.1.1.1; queried using the same bound adapter' },
+      timeout_ms: { type: 'integer', minimum: 300, maximum: 3000 }, samples: { type: 'integer', minimum: 1, maximum: 5 }
+    } },
+  { name: 'system', agent: true, ms: (a) => 90_000, description: 'The state of the machine in one call, compact. Sections: overview (OS, uptime, CPU, RAM), disks, processes (top by CPU and RAM), network (EVERY adapter: index, type, link speed, IP, gateway, DNS, MAC, default route and helper path), reach (relay per adapter plus VPN/filter/proxy inventory; NOT a full internet test: use net_check), connections (TCP connections per process), services, startup, apps, events. Default: overview, disks, processes, network.',
     props: { sections: { type: 'array', items: { type: 'string', enum: ['overview', 'disks', 'processes', 'network', 'services', 'startup', 'apps', 'drivers', 'events', 'reach', 'connections', 'perf', 'policy', 'activation', 'health', 'process'] } }, pid: { type: 'integer', description: 'for section process: one process in detail (path, command line, parent chain, publisher, signature, hash, services, autostart entries, connections)' }, top: { type: 'integer', minimum: 3, maximum: 60, description: 'processes / events to show, default 15' } } },
   { name: 'util', agent: true, ms: (a) => (/install|download|zip/.test(a.op) ? 1_900_000 : 120_000),
     description: 'Ready-made, tested operations: right on the first try, no quoting. op: apps (search installed programs: name), install / uninstall (winget / apt id or name), kill (name or pid, whole process tree), service (name, value=start|stop|restart|status), env_get (name; empty = all), env_set (name, value; user scope), path_add (path; user PATH, no setx truncation), reg_get / reg_set (path = HKCU\\..., name, value), reg_find (path = root like HKLM\\SOFTWARE, name = text, value = key|value|data, max; Windows), crash (name = program or empty, value = days: why it died, from the event log: faulting module, exception code, full exe path, the events just before, dump files; Windows), recent (name = filter, value = days: what ran and when, from UserAssist / BAM / Prefetch and recent files; Windows), ffind (instant file search on ALL NTFS disks at once from the file table: name = text or glob like *.log, path = limit to a folder or disk like D:\\Games, value = new to list the newest first, max; needs administrator, else use find; Windows), elevate (restart the helper as administrator: the friend accepts one Windows prompt, the session continues; Windows), browser (extensions of Chrome / Edge / Brave / Opera / Yandex / Firefox per profile: on/off, size, what they can read, heaviest first, plus memory of the browser processes by kind; max; Windows), bsod (blue screens: bugcheck code and parameters read from the dump with what the code usually means, the events 15 minutes before; exact driver when cdb is installed; value = days; Windows), health (a quick check from logs and counters, under 10 s: name = boot | disks | heat | drivers, empty = all: boot time and what slowed it, SMART and disk errors, free space, CPU / GPU throttling, GPU driver resets, broken devices, failed updates, WHEA hardware errors; Windows), threats (read-only facts for a suspected infection, nothing is guessed from file names: what the antivirus found and whether it removed it, whether its protection was switched off, its exclusions (a whole drive excluded is flagged), remote / network logins and failed-password bursts, Remote Desktop on, services and scheduled tasks installed lately; value = days, default 14; the security log and exclusions need administrator; Windows), appinfo (what Windows knows by a program name, a part of a window title or a pid: running processes with exe path, full command line, version, publisher; Start menu shortcuts with target and arguments; App Paths; Store apps with their AUMID; the PATH; Windows), launch (start a program by its name, a path, a Start menu shortcut or a Store app, with args: [..] passed exactly; name = program or path; Windows), open (url or path with the default app), clipboard_get / clipboard_set (value), dns_flush, net_test (host, port: DNS + TCP check), ports (name = port number: who listens), download (url -> path, resumes), zip (path -> dest), unzip (path -> dest), shortcut (path = target, dest = .lnk file).',
@@ -604,7 +723,7 @@ Workflow for any task:
 16b. Look with ui_tree, not with pictures: it lists the window's controls as a few lines of text (name, value, state, position), exact and about 20 times cheaper than a screenshot. Then press with ui_click and fill with ui_set (by id or name): no coordinates to guess, no layout or DPI problems, and it works on a phone too. Use screenshot only when ui_tree finds nothing (games, custom-drawn or administrator windows) or when you need to see the picture itself; click {x,y} stays the fallback. Prefer a dedicated MCP server (mcp_start / recipe) or a command for the app over clicking at all when one exists.
 17. Files and system state without shell one-liners: tree (folders in one call), find (by name and content), read_file with offset/lines/tail (only what you need), edit_file (exact replace, never rewrite a whole file to change a line), push_file (send a file to the PC), fetch_file (a file or folder to the operator), util (install, kill, services, PATH / env, registry, clipboard, network test, ports, download, zip, open, shortcut). They are faster, cheaper and right on the first try.
 17b. Speed with the screen: do not loop action -> screenshot -> think. Put several steps in ONE actions call, add shot:true to the action that needs a look at the result (the picture comes back in the same answer, an unchanged screen costs a line), and after something slow starts (a click that loads a page, an installer) call wait_screen (it returns one picture when the screen has changed and settled, or text if nothing moved). Never take screenshots in a loop to wait.
-17a. Slow PC / what eats CPU, RAM or disk / anything malicious: ONE call to system {sections:["processes"]} lists every process with its real CPU %, memory, the exe path and who signed it, and marks with ! anything run from a temp or download folder or unsigned outside the normal install dirs. system {} also gives disks, network and startup; add "drivers" and "services". Kill a bad one with util {op:"kill"} and delete its file. sysinfo and system cost tens of ms now: prefer them to a handful of run commands. Network problems on a PC (cuts, slow, a VPN / zapret / proxy in the way): system {sections:["reach"]} lists every adapter with its type, IP, gateway, DNS, which one is the default route, which one the agent talks through, whether each reaches the relay, plus the VPN / DPI-bypass programs, network filter drivers, proxies and hosts entries; {sections:["connections"]} shows who talks to whom. The agent keeps its own link alive by itself (it moves to another adapter when the current route dies, VPN adapters last) and logs every switch.
+17a. Slow PC / CPU / memory pressure: system {sections:["processes","perf"]} gives measured load. Network problems: FIRST read recipe {name:"network"}, then net_check {mode:"quick"} and system {sections:["network","reach"]}. reach tests only relay access. net_check compares default/TUN and bound adapters; interface_index selects exact Ethernet/TUN without switching VPN. Use routes/dns/sites/load/inventory/rkn. For authenticated HTTP use profile with a local Mihomo export, original profile_index and already installed core_path; it runs a bounded isolated child, never claims application UDP works. Binding does NOT bypass WinDivert/WFP/zapret. TCP alone proves neither authenticated VPN nor an IP/SNI block. For AUTHORIZED risky network changes read recipe {name:"network-recovery"}, use net_recover templates/start with SYSTEM preflight and captured undo BEFORE disconnecting anything. Custom scripts need reviewed explicit idempotent undo. Never issue unguarded network resets or switch VPN/zapret through the only link. Collect status/results after reconnect and validate the actual app before commit. Autonomous transport retries change only Helper's own route, not system networking; no working path means no remote access.
 18. No quoting traps: to start a program with arguments use run {command: "program", args: [...]} (no shell, each argument arrives exactly as given). For a longer script use write_file, then run the file. A failed command may come back with a HINT line: follow it instead of retrying the same thing.`;
 
 function buildMcp(fixed) {
@@ -703,9 +822,28 @@ const clientIp = (req) => { const a = req.socket.remoteAddress || '', x = req.he
 const PKG_VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(here, 'package.json'), 'utf8')).version; } catch { return '?'; } })();
 
 function script(req, res, file) {
+  res.setHeader('cache-control', 'no-store');
   let f;
   try { f = fs.readFileSync(path.join(AGENT_DIR, file), 'utf8'); } catch { return text(res, 404, 'not found'); }
-  f = f.replace(/\r\n/g, '\n');
+  // A BOM belongs in a saved PS1, not in an Invoke-Expression string: PS5.1
+  // otherwise treats the first comment as an attempted command named BOM+#.
+  f = f.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+  if (file === 'agent.ps1') {
+    f = f.replace('__NETWORK_SHARED_CS__', () => fs.readFileSync(path.join(AGENT_DIR, 'network.cs'), 'utf8'));
+    f = f.replace('__VIDEO_SHARED_CS__', () => fs.readFileSync(path.join(AGENT_DIR, 'video.cs'), 'utf8'));
+    const network = fs.readFileSync(path.join(AGENT_DIR, 'network.ps1'), 'utf8').replace(/^\uFEFF/, '')
+      .replace('__RKN_RUNNER_B64__', () => fs.readFileSync(path.join(AGENT_DIR, 'rkn_runner.py')).toString('base64'))
+      .replace('__PROFILE_CS__', () => fs.readFileSync(path.join(AGENT_DIR, 'profiles.cs'), 'utf8'))
+      .replace('__YAML_SHA256__', () => JSON.parse(fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/manifest.json'), 'utf8')).dll_sha256)
+      .replace('__YAML_LICENSE__', () => fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/LICENSE.txt'), 'utf8'));
+    const profileNetwork = network.replace('__NETWORK_PROFILE_PS__', () => fs.readFileSync(path.join(AGENT_DIR, 'network-profile.ps1'), 'utf8'));
+    f = f.replace('__NETWORK_PS__', () => profileNetwork).replace(/\r\n/g, '\n');
+    const recovery = fs.readFileSync(path.join(AGENT_DIR, 'recovery.ps1'), 'utf8').replace(/^\uFEFF/, '')
+      .replace('__RECOVERY_WORKER_B64__', () => fs.readFileSync(path.join(AGENT_DIR, 'recovery-worker.ps1')).toString('base64'))
+      .replace('__RECOVERY_NETWORK_B64__', () => fs.readFileSync(path.join(AGENT_DIR, 'network.cs')).toString('base64'));
+    f = f.replace('__RECOVERY_PS__', () => recovery).replace(/\r\n/g, '\n');
+    f = f.replace('__POINTER_CS_B64__', () => fs.readFileSync(path.join(AGENT_DIR, 'pointer.cs')).toString('base64'));
+  }
   // PowerShell cannot redefine a type in a session that already has it: the types of the Windows agent get a name that changes with the script, so running the one-liner again in the same window after an update just works
   const build = crypto.createHash('sha256').update(f).digest('hex').slice(0, 6);
   text(res, 200, f.replaceAll('__RELAY__', baseUrl(req)).replaceAll('__BUILD__', build));   // LF whatever the checkout's line endings
@@ -734,7 +872,14 @@ function landing(req, res) {
 }
 
 function launcherCmd(b) {
-  const lines = ['@echo off', 'title Remote help', `powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol=3072; irm ${b}/h | iex"`, 'pause'];
+  const urls = [b + '/h'];
+  const alternate = new URL(b);
+  if (alternate.protocol === 'https:' && alternate.port !== '9444') { alternate.port = '9444'; urls.push(alternate.href.replace(/\/$/, '') + '/h'); }
+  const choices = urls.map((u) => `'${u.replaceAll("'", "''")}'`).join(',');
+  const ps = `$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=3072; try { $source=$null; foreach($url in @(${choices})) { try { Write-Host ('Connecting: '+$url); $source=Invoke-RestMethod $url -TimeoutSec 12; break } catch { Write-Host ('Download failed: '+$_.Exception.Message) -ForegroundColor Yellow } }; if(-not $source) { throw 'Helper could not be downloaded from either HTTPS endpoint. Check the address, TLS and network access.' }; Invoke-Expression $source } catch { Write-Host ('Helper startup failed: '+$_.Exception.Message) -ForegroundColor Red; exit 1 }`;
+  // EncodedCommand prevents cmd.exe metacharacters/Unicode in the generated URL
+  // from becoming shell syntax. TLS verification stays enabled on both attempts.
+  const lines = ['@echo off', 'title Remote help', `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(ps, 'utf16le').toString('base64')}`, 'pause'];
   return lines.join('\r\n') + '\r\n';
 }
 
@@ -795,8 +940,8 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 </style>
 <div id=top><span id=dot></span><span id=st>…</span><span id=who>${esc(who)}</span>
 <div id=mons></div>
-<button id=zr title="1:1" style="display:none">1:1</button><button id=ctl hidden></button><button id=disc></button></div>
-<div id=main><div id=scr><div id=frame><i></i><canvas id=cv width=16 height=9></canvas></div><div id=tag></div></div>
+<button id=zr title="Reset zoom" style="display:none">Fit</button><button id=fs title="Full screen">⛶</button><button id=ctl hidden></button><button id=disc></button></div>
+<div id=main><div id=scr><div id=frame><i></i><canvas id=cv tabindex=0 aria-label="Remote screen" width=16 height=9></canvas></div><div id=tag></div></div>
 <aside id=side><h2 id=hNote></h2><div id=note></div><h2 id=hPlan hidden></h2><ol id=plan></ol>
 <section id=sys hidden><h2 id=hSys style="padding-left:0"></h2><div id=sg></div><div class=bar><i id=bc></i></div><div class=bar><i id=bm></i></div><div id=sp></div></section>
 <div id=log></div></aside></div>
@@ -809,21 +954,30 @@ const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: t
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
 let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
 
-function status(t,cls){st.textContent=t;dot.className=cls||''}
-async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());
+const viewerClient=Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join(''),viewerAbort=new AbortController(),nativeFetch=window.fetch.bind(window);
+window.fetch=(input,init={})=>{const u=new URL(typeof input==='string'?input:input.url,location.href);if(u.origin===location.origin&&u.pathname.startsWith(base+'/')){if(gone)return Promise.reject(new DOMException('Viewer disconnected','AbortError'));const headers=new Headers(init.headers||{});headers.set('x-viewer-client',viewerClient);init={...init,headers,signal:init.signal||viewerAbort.signal}}return nativeFetch(input,init)};
+function status(t,cls){st.textContent=gone?(ru?'отключено':'disconnected'):t;dot.className=gone?'':cls||''}
+async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());if(ended)return;
  if(r.status===410){ended=true;return}
  if(r.status===204){status(L.live,'on');await new Promise(x=>setTimeout(x,250));return}
  if(r.ok){const b=await r.blob();const bmp=await createImageBitmap(b);
-  if(my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
+  if(!ended&&my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
    meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};status(L.live+'  '+Math.round(b.size/1024)+' KB','on')}
   bmp.close()}
  else{let m='';try{m=(await r.json()).error||''}catch(_){}status(/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait,'bad');await new Promise(x=>setTimeout(x,1200))}}
  catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
-async function lane(){while(!ended){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}status(L.end,'')}
+async function lane(){while(!ended&&noLive){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}if(ended)status(L.end,'')}
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
-let gone=false,abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve();
+let gone=false,abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve(),renderPending=0,renderEpoch=0,waitFull=false;
+function queuePicture(draw,full){
+ if(waitFull&&!full)return;
+ if(renderPending>=3){renderEpoch++;waitFull=true;if(abort)abort.abort();return}
+ if(full)waitFull=false;
+ const epoch=renderEpoch;renderPending++;
+ chain=chain.then(async()=>{if(!ended&&epoch===renderEpoch)await draw(()=>!ended&&epoch===renderEpoch)}).catch(()=>{}).finally(()=>{renderPending--});
+}
 const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
-setInterval(()=>{if(gotEver&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
+setInterval(()=>{if(!ended&&gotEver&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
 const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
 function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(1)+'G':n>=1048576?Math.round(n/1048576)+'M':Math.round(n/1024)+'K';
@@ -850,24 +1004,29 @@ function monMap(ms,cur){const k=JSON.stringify(ms)+cur;if(k===mapKey)return;mapK
 function pick(v){mon=v<0?'':String(v);if(abort)abort.abort()}
 addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||control)return;if(!/^[0-9]$/.test(e.key))return;
  const n=+e.key,ms=window.__mons||[];if(n===0)pick(-1);else if(n<=ms.length)pick(n-1)});
-function handle(ty,p){const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
+function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
  if(ty==='S'){try{sysPanel(JSON.parse(td.decode(p)))}catch(_){}return}
- if(ty==='K'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n))),img=p.subarray(2+n);
+ if(ty==='K'){try{if(dec)dec.close()}catch(_){}dec=null;const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n))),img=p.subarray(2+n);
   if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
-  chain=chain.then(async()=>{const b=await jpeg(img);size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);b.close();frames++}).catch(()=>{})}
+  queuePicture(async valid=>{const b=await jpeg(img);try{if(valid()){size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);frames++}}finally{b.close()}},true)}
  else if(ty==='T'){const c=dv.getUint16(0),parts=[];let o=2;
   for(let i=0;i<c;i++){const n=dv.getUint32(o+4);parts.push([dv.getUint16(o),dv.getUint16(o+2),p.subarray(o+8,o+8+n)]);o+=8+n}
-  chain=chain.then(async()=>{const bs=await Promise.all(parts.map(q=>jpeg(q[2])));bs.forEach((b,i)=>{g.drawImage(b,parts[i][0],parts[i][1]);b.close()});frames++}).catch(()=>{})}
+  queuePicture(async valid=>{const bs=await Promise.allSettled(parts.map(q=>jpeg(q[2])));const complete=bs.every(x=>x.status==='fulfilled');bs.forEach((x,i)=>{if(x.status==='fulfilled'){if(valid()&&complete)g.drawImage(x.value,parts[i][0],parts[i][1]);x.value.close()}});if(valid()&&complete)frames++;else if(!complete){waitFull=true;if(abort)abort.abort()}},false)}
  else if(ty==='C'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n)));meta={ox:m.ox,oy:m.oy,sc:m.sc};
+  renderEpoch++;waitFull=false;
+  if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
   if(!('VideoDecoder' in window)){noLive=true;if(abort)abort.abort();return}   // no WebCodecs in this browser: pictures instead
   try{if(dec)dec.close()}catch(_){}
-  dec=new VideoDecoder({output:f=>{size(f.displayWidth,f.displayHeight);g.drawImage(f,0,0);f.close();frames++},error:()=>{dec=null}});
-  dec.configure({codec:m.codec,optimizeForLatency:true})}
- else if(ty==='V'&&dec&&dec.state==='configured')dec.decode(new EncodedVideoChunk({type:p[0]&1?'key':'delta',timestamp:Math.round(performance.now()*1000),data:p.subarray(1)}))}
+  const current=new VideoDecoder({output:f=>{try{if(!ended&&dec===current){size(f.displayWidth,f.displayHeight);g.drawImage(f,0,0);frames++}}finally{f.close()}},error:()=>{if(dec===current){dec=null;noVideo=true;if(abort)abort.abort()}}});
+  dec=current;videoWaitKey=true;try{dec.configure({codec:m.codec,optimizeForLatency:true})}catch(_){try{current.close()}catch(_){}dec=null;noVideo=true;if(abort)abort.abort()}}
+ else if(ty==='V'&&dec&&dec.state==='configured'){
+  const key=!!(p[0]&1);if(dec.decodeQueueSize>3){videoWaitKey=true;if(abort)abort.abort();return}if(videoWaitKey&&!key)return;if(key)videoWaitKey=false;
+  try{dec.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:Math.round(performance.now()*1000),data:p.subarray(1)}))}catch(_){noVideo=true;if(abort)abort.abort()}}}
+let noVideo=false,videoWaitKey=true;
 async function live(){   // -> true if pictures came
  abort=new AbortController();let got=false;const my=abort;
  const quiet=setTimeout(()=>{if(!got)my.abort()},7000);   // nothing in 7 s: this agent does not stream
- try{const r=await fetch(base+'/live'+(mon?'?mon='+mon:''),{signal:my.signal});
+ try{const r=await fetch(base+'/live?codec='+(!noVideo&&'VideoDecoder' in window?'h264':'jpeg')+(mon?'&mon='+mon:''),{signal:my.signal});
   if(r.status===410){ended=true;return true}
   if(!r.ok||!r.body)return false;
   const rd=r.body.getReader();let buf=new Uint8Array(0);
@@ -879,20 +1038,21 @@ async function live(){   // -> true if pictures came
  }catch(e){}finally{clearTimeout(quiet)}
  return got}
 (async()=>{while(!ended){
- if(noLive){lane();setTimeout(lane,350);return}   // two frames in flight: the agent never waits for the browser, so the picture keeps moving
+ if(noLive){const lanes=[lane(),lane()];await sleep(5000);noLive=false;await Promise.all(lanes);continue} // retry video after startup, reconnect or an older agent's update
  const ok=await live();if(ended)break;
  if(!ok&&!gotEver)noLive=true;else if(!ok)await sleep(1000)}
  status(L.end,'')})();
 const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function info(){while(!ended){try{
- const r=await fetch(base+'/log');if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
+ const r=await fetch(base+'/log');if(ended)break;if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
  const q=await fetch(base+'/state');if(q.ok){const s=await q.json();
+  window.ViewerInput?.setPointer(!!s.live_pointer);window.ViewerInput?.setKeyboard(!!s.live_keyboard);window.ViewerInput?.setRealtime(!!s.realtime_capable);window.ViewerInput?.setLook(s.look||{});
   $('note').textContent=s.note||'';const c=s.color||'#38ff7a';document.documentElement.style.setProperty('--st',c);
   const p=s.plan;$('hPlan').hidden=!p;$('plan').innerHTML=p?p.stages.map((x,i)=>'<li style="--c:'+esc(x.color||c)+'" class="'+(i===p.current?'cur':(p.done||[]).includes(i)||i<p.current?'done':'')+'">'+esc(x.title)+'</li>').join(''):'';
   if(!s.online)status(L.off,'bad');else if(s.paused)status(L.paused,'bad')}}catch(e){}
  await new Promise(x=>setTimeout(x,1500))}}
 info();
-async function send(path,body){try{await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)})}catch(e){}}
+async function send(path,body){if(gone)return;try{const r=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json','x-ctl':CTL},body:JSON.stringify(body)});if(!r.ok){const j=await r.json().catch(()=>({}));throw new Error(j.error||'HTTP '+r.status)}}catch(e){if(!gone)status(e.message,'bad')}}
 function real(ev){const r=cv.getBoundingClientRect();return{x:Math.round(meta.ox+(ev.clientX-r.left)*(cv.width/r.width)*meta.sc),y:Math.round(meta.oy+(ev.clientY-r.top)*(cv.height/r.height)*meta.sc)}}
 // zoom into the picture (wheel to zoom toward the cursor, drag to pan when zoomed; the control coordinates stay correct because real() reads the live box)
 let zoom=1,tx=0,ty=0;
@@ -905,23 +1065,10 @@ cv.addEventListener('pointermove',e=>{if(!pan)return;tx=pan.tx+(e.clientX-pan.x)
 addEventListener('pointerup',()=>{pan=null});
 $('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
 // disconnect: stop watching (the stream closes at once; the helper stops filming 15 s after the last viewer leaves); the same button reconnects
-$('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(ended&&gone){location.reload();return}gone=true;ended=true;if(abort)abort.abort();status(ru?'отключено':'disconnected','');$('disc').textContent=ru?'Подключиться':'Reconnect'};
-if(CTL){const b=$('ctl');b.hidden=false;b.textContent=L.take;$('send').textContent=L.send;txt.placeholder=L.ph;
- const set=on=>{control=on;b.className=on?'on':'';b.textContent=on?L.give:L.take;cv.className=on?'ctl':'';kb.style.display=on?'flex':'none';document.documentElement.style.setProperty('--kb',on?(kb.offsetHeight||52)+'px':'0px');$('tag').style.display=on?'block':'none';$('tag').textContent=L.tag;send('/takeover',{on});if(on)txt.focus()};
- b.onclick=()=>set(!control);
- let down=null;
- cv.addEventListener('pointerdown',e=>{if(!control)return;e.preventDefault();try{cv.setPointerCapture(e.pointerId)}catch(_){}down={p:real(e),t:Date.now(),b:e.button}});
- cv.addEventListener('pointerup',e=>{if(!control||!down)return;const u=real(e),d=down;down=null;const moved=Math.hypot(u.x-d.p.x,u.y-d.p.y)/meta.sc;
-  if(moved>8)send('/input',{a:'drag',x:d.p.x,y:d.p.y,x2:u.x,y2:u.y,hold:Date.now()-d.t>500});
-  else send('/input',{a:'click',x:u.x,y:u.y,button:d.b===2?'right':'left'})});
- cv.addEventListener('contextmenu',e=>{if(control)e.preventDefault()});
- let acc=0,wt=0;cv.addEventListener('wheel',e=>{if(!control||e.ctrlKey||e.metaKey)return;e.preventDefault();acc+=Math.sign(e.deltaY)*Math.max(1,Math.round(Math.abs(e.deltaY)/100));clearTimeout(wt);wt=setTimeout(()=>{const p=real(e);send('/input',{a:'scroll',x:p.x,y:p.y,amount:Math.max(-20,Math.min(20,acc))});acc=0},120)},{passive:false});
- $('send').onclick=()=>{if(txt.value){send('/input',{a:'text',text:txt.value});txt.value=''}};
- txt.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.isComposing){e.preventDefault();if(txt.value)send('/input',{a:'text',text:txt.value});setTimeout(()=>send('/input',{a:'key',keys:'enter'}),350);txt.value=''}});
- kb.querySelectorAll('[data-k]').forEach(x=>x.onclick=()=>send('/input',{a:'key',keys:x.dataset.k}));
- setInterval(()=>{if(control)send('/takeover',{on:true})},60000)}   // the hand-over lasts while this page is in control; the relay lets it lapse a few minutes after the page closes
+function disconnectViewer(){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
+$('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(gone){location.reload();return}disconnectViewer()};addEventListener('pagehide',()=>disconnectViewer());
 </script>
-<link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
+<script src=/assets/viewer-control.js></script><link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
 }
 
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer /i, '');
@@ -935,9 +1082,9 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, settings, effLook, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, globalLook, settings, effLook, isOnline, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
-  status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => Date.now() - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size } }),
+  status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
     const f = ACT_FILE; if (!f) return 'The action log is off (no data directory).';
     const misses = []; try { for (const l of fs.readFileSync(MISS_FILE, 'utf8').split(String.fromCharCode(10))) if (l) misses.push(JSON.parse(l)); } catch { /* none */ }
@@ -953,7 +1100,7 @@ async function handler(req, res) {
     if (await adminHandle(req, res, url)) return;
     if (p === '/health') return text(res, 200, 'ok');
     if (p === '/logo.svg' || p === '/favicon.svg' || p === '/favicon.ico') { res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' }); return res.end(fs.readFileSync(path.join(here, 'logo.svg'))); }
-    if (p === '/assets/panels.js' || p === '/assets/panels.css') {   // the viewer's System / Files drawer
+    if (p === '/assets/panels.js' || p === '/assets/panels.css' || p === '/assets/viewer-control.js') {   // viewer controls and System / Files drawer
       const f = path.join(here, p.slice(8));
       try { res.writeHead(200, { 'content-type': p.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8', 'cache-control': 'no-cache', 'x-content-type-options': 'nosniff' }); return res.end(fs.readFileSync(f)); }
       catch { return text(res, 404, 'not found'); }
@@ -991,35 +1138,64 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
     if (fm) {
       const f = files.get(fm[1]);
       if (!f || f.exp < Date.now()) return text(res, 404, 'file expired or invalid');
-      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${f.name}"`, 'cache-control': 'no-store' });
+      const fallback=f.name.replace(/[^\x20-\x7e]/g,'_'),utf8=encodeURIComponent(f.name).replace(/['()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${fallback}"; filename*=UTF-8''${utf8}`, 'cache-control': 'no-store' });
       const dec = crypto.createDecipheriv('aes-256-gcm', f.key, f.iv); dec.setAuthTag(f.tag);
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act|\/look)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/disconnect|\/network|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act|\/look)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
       const s = sessions.get(v.code);
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
+      const client = String(req.headers['x-viewer-client'] || 'legacy');
+      if (!/^(legacy|[a-zA-Z0-9-]{16,64})$/.test(client)) return json(res, 400, { error: 'invalid viewer client' });
+      if (vw[2] === '/disconnect') {
+        if (req.method !== 'POST') return json(res, 405, {});
+        if (client === 'legacy' && (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl))) return json(res, 403, { error: 'viewer client required' });
+        detachViewer(vw[1], v, s, client);
+        return json(res, 200, { disconnected: true });
+      }
+      if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected; reconnect to continue' });
+      if (vw[2] === '/network') {
+        if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'control link required' });
+        const b = JSON.parse((await body(req, 3000)) || '{}');
+        const index = Number(b.interface_index || 0);
+        if (!Number.isInteger(index) || index < 0 || index > 2147483647) return json(res, 400, { error: 'invalid interface index' });
+        let tool, args;
+        if (b.kind === 'routes') { tool = 'net_check'; args = { mode: 'routes' }; }
+        else if (b.kind === 'jobs') { tool = 'net_recover'; args = { op: 'list' }; }
+        else if (b.kind === 'selftest') { tool = 'net_recover'; args = { op: 'start', template: 'guard-selftest', interface_index: index }; }
+        else if (b.kind === 'status' || b.kind === 'rollback') {
+          if (!/^[a-f0-9]{24}$/.test(String(b.job || ''))) return json(res, 400, { error: 'invalid recovery job' });
+          tool = 'net_recover'; args = { op: b.kind, job: b.job };
+        } else return json(res, 400, { error: 'unsupported network action' });
+        if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected' });
+        try { const d = await call(v.code, tool, args, 90_000, { human: true }); return json(res, 200, { text: d?.text || '' }); }
+        catch (e) { return json(res, 503, { error: e.message }); }
+      }
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
       if (vw[2] === '/live') {   // a video-like stream; 501 = this agent cannot stream, the page then polls pictures
         if (s.noStream) return json(res, 501, { error: 'no stream' });
         const ms = url.searchParams.get('mon'), mon = ms ? Number(ms) : -1; s.liveMon = Number.isInteger(mon) && mon >= 0 && mon < 10 ? mon : -1;
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' });
-        const lv = { res, waitKey: true }; (s.live ??= new Set()).add(lv);
-        if (s.lastC) res.write(s.lastC);
+        // Earlier viewers already understand C/V frames but do not advertise a
+        // codec. They fall back to screenshots themselves without WebCodecs.
+        const lv = { res, waitKey: true, viewer: vw[1], client, codec: url.searchParams.get('codec') === 'jpeg' ? 'jpeg' : 'h264' }; (s.live ??= new Set()).add(lv);
+        if (s.lastC && liveCodec(s) === 'h264') res.write(s.lastC);
         if (s.lastS) res.write(s.lastS);
         s.keyAt = 0; wantKey(v.code, s);
         const ping = setInterval(() => res.write(Buffer.from([0, 0, 0, 0, 80])), 15_000);   // keeps proxies from closing a quiet stream
         req.on('close', () => {
-          clearInterval(ping); s.live?.delete(lv);
+          clearInterval(ping); const before=liveCodec(s);s.live?.delete(lv);if(s.live?.size&&liveCodec(s)!==before){s.keyAt=0;wantKey(v.code,s);}scheduleViewerHandback(vw[1],v,s,client);
           setTimeout(() => { if (!s.live?.size && sessions.get(v.code) === s) streamCtl(v.code, s, { on: false }); }, 15_000);   // nobody watches: the agent stops filming
         });
         return;
       }
-      if (vw[2] === '/state') return json(res, 200, { look: { color: s.lookForce || s.lookColor || '', note: s.note || '' }, plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: Date.now() - s.lastSeen <= ONLINE_MS, paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '' });
+      if (vw[2] === '/state') return json(res, 200, { stream: { codec: liveCodec(s), viewers: s.live?.size || 0, video_viewers: [...(s.live || [])].filter(x => x.codec === 'h264').length }, look: { color: s.lookForce || s.lookColor || '', note: s.note || '', ...effLook(s) }, plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: isOnline(s), paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '', live_pointer: s.info?.viewer_pointer === 1 && s.mode !== 'confirm', live_keyboard: s.info?.viewer_keyboard === 1 && s.mode !== 'confirm', realtime_capable:s.info?.viewer_realtime===1,live_realtime:s.info?.viewer_realtime===1&&!!s.fastInput&&!s.paused });
       if (vw[2] === '/kill') {   // end a process from the System panel (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}'), pid = Math.round(Number(b.pid));
@@ -1058,12 +1234,12 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (vw[2] === '/look') {   // glow colour and the task text (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}');
-        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note, b.glow, b.sound) }); } catch (e) { return json(res, 400, { error: e.message }); }
+        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note, b.glow, b.sound,b.banner,b.timer) }); } catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (vw[2] === '/sysdata') {   // the System tabs: JSON from the agent (control link only: command lines and startup entries are not for view-only guests)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const kind = String(url.searchParams.get('kind') || ''), pid = Math.round(Number(url.searchParams.get('pid') || 0));
-        if (!/^(procs|perf|services|startup|disks|policy|health|activation|process|adapters|reach)$/.test(kind)) return json(res, 400, { error: 'bad kind' });
+        if (!/^(procs|perf|services|startup|disks|policy|health|activation|process|adapters|reach|netcheck)$/.test(kind)) return json(res, 400, { error: 'bad kind' });
         try { const d = await call(v.code, 'sysdata', { kind, ...(pid ? { pid } : {}) }, 90_000, { human: true }); res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' }); return res.end(String(d?.text || 'null')); }
         catch (e) { return json(res, 503, { error: e.message }); }
       }
@@ -1072,36 +1248,70 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         try {
           if (vw[2] === '/ls') return json(res, 200, await call(v.code, url.searchParams.get('mode') === 'list' ? 'list_dir' : 'tree', url.searchParams.get('mode') === 'list' ? { path: url.searchParams.get('path') || '~' } : { path: url.searchParams.get('path') || '~', depth: 1, max: 500 }, 30_000, { human: true }));
           if (req.method !== 'POST') return json(res, 405, {});
-          if (vw[2] === '/get') { const b = JSON.parse((await body(req, 5000)) || '{}'); return json(res, 200, await call(v.code, 'fetch_file', { path: String(b.path || '') }, 3_700_000, { human: true })); }
-          const f = await storeFile(req, url.searchParams.get('name'), v.code), dir = String(url.searchParams.get('dir') || '');
+          if (vw[2] === '/get') {
+            const b=JSON.parse((await body(req,5000))||'{}'),d=await call(v.code,'fetch_file',{path:String(b.path||'')},3_700_000,{human:true});
+            const link=new URL(String(d?.text||'').split(/\s/)[0]),match=link.pathname.match(/^\/f\/([a-f0-9]{24})\//),f=match&&files.get(match[1]);
+            if(link.origin!==new URL(baseUrl(req)).origin||link.username||link.password||!f||f.code!==v.code||f.exp<Date.now())throw Error('Remote client returned an untrusted download link');
+            return json(res,200,{text:link.href});
+          }
+          const f = await storeFile(req, url.searchParams.get('name'), v.code), desktopDrop=url.searchParams.get('drop')==='1',dir = desktopDrop?'~/Downloads/Helper Transfers':String(url.searchParams.get('dir') || '');
           const sep = dir.includes('\\') ? '\\' : '/', dest = dir ? dir.replace(/[\\/]+$/, '') + sep + f.name : f.name;
-          const d = await call(v.code, 'push_file', { url: f.url, path: dest }, 3_700_000, { human: true });
+          const d = await call(v.code, 'push_file', { url: f.url, path: dest,...(desktopDrop?{unique:true}:{}) }, 3_700_000, { human: true });
           (s.uploads ??= []).push(`${dest} (${f.size} bytes)`);   // the AI hears about it with its next answer
-          return json(res, 200, { text: d?.text || 'saved', path: dest });
+          return json(res, 200, { text: d?.text || 'saved', path: d?.path||dest });
         } catch (e) { return json(res, 503, { error: e.message }); }
       }
       if (vw[2] === '/input' || vw[2] === '/takeover') {   // control: needs the secret from the control link
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 20_000)) || '{}');
-        if (vw[2] === '/takeover') { s.takeover = b.on ? Date.now() : 0; evPush(s, { t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on }); }
-        v.n = (v.n || 0) + 1; const now = Date.now(); if (now - (v.nt || 0) > 1000) { v.nt = now; v.n = 1; } if (v.n > 25) return json(res, 429, { error: 'too fast' });
-        s.takeover = now;   // any input keeps the hand-over alive
+        if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected' });
+        const owner = vw[1] + '/' + client;
+        if (vw[2] === '/takeover') {
+          if (takenOver(s) && s.takeoverOwner && s.takeoverOwner !== owner) return json(res, 409, { error: 'another operator is in control' });
+          if (!b.on) { cancelViewerCommands(s, owner); releaseViewerPointer(v.code, s, owner); }
+          s.takeover = b.on ? Date.now() : 0; s.takeoverOwner = b.on ? owner : ''; evPush(s, { t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on });
+        }
+        if (takenOver(s) && s.takeoverOwner && s.takeoverOwner !== owner) return json(res, 409, { error: 'another operator is in control' });
+        if (['pointer','keyboard'].includes(b.a) && b.phase !== 'cancel' && (!takenOver(s) || s.takeoverOwner !== owner)) return json(res,409,{error:'take control before sending live input'});
+        v.n = (v.n || 0) + 1; const now = Date.now(); if (now - (v.nt || 0) > 1000) { v.nt = now; v.n = 1; } if (v.n > 120 && !(['pointer','keyboard'].includes(b.a)&&['cancel','up'].includes(b.phase))) return json(res, 429, { error: 'too fast' });
         const num = (x) => Math.round(Number(x)), ok = (...xs) => xs.every((x) => Number.isFinite(x) && Math.abs(x) < 100000);
         let tool, a2;
-        if (b.a === 'click') { const x = num(b.x), y = num(b.y); if (!ok(x, y)) return json(res, 400, {}); tool = 'click'; a2 = { x, y, raw: true, button: b.button === 'right' ? 'right' : 'left' }; }
-        else if (b.a === 'drag') { const x = num(b.x), y = num(b.y), x2 = num(b.x2), y2 = num(b.y2); if (!ok(x, y, x2, y2)) return json(res, 400, {}); tool = 'drag'; a2 = { x, y, x2, y2, raw: true, hold: !!b.hold }; }
+        if (b.a === 'pointer') {
+          if (s.info?.viewer_pointer !== 1 || (s.mode === 'confirm' && b.phase !== 'cancel')) return json(res, 409, {error:'live pointer unavailable; reconnect/update the agent or use completed drag'});
+          const x=num(b.x || 0), y=num(b.y || 0), seq=Number(b.seq);
+          if (!ok(x,y) || !Number.isSafeInteger(seq) || seq<1 || !/^[a-f0-9]{32}$/.test(String(b.gesture || '')) || !['down','hover','move','up','keep','cancel'].includes(b.phase)) return json(res,400,{error:'invalid pointer gesture'});
+          tool='viewer_pointer'; a2={op:b.phase,owner:sha(owner),gesture:b.gesture,seq,x,y,button:['right','middle'].includes(b.button)?b.button:'left'};
+        }
+        else if(b.a==='keyboard'){
+          if(s.info?.viewer_keyboard!==1||(s.mode==='confirm'&&b.phase!=='cancel'))return json(res,409,{error:'live keyboard unavailable'});
+          const seq=Number(b.seq),vk=Number(b.vk||0);
+          if(!Number.isSafeInteger(seq)||seq<1||!['down','up','keep','cancel'].includes(b.phase)||!Number.isInteger(vk)||(['down','up'].includes(b.phase)&&(vk<8||vk>254)))return json(res,400,{error:'invalid keyboard input'});
+          tool='viewer_pointer';a2={op:{down:'kdown',up:'kup',keep:'kkeep',cancel:'kcancel'}[b.phase],owner:sha(owner),gesture:'0'.repeat(32),seq,x:vk,y:b.extended?1:0,button:'left'};
+        }
+        else if (b.a === 'click') { const x = num(b.x), y = num(b.y); if (!ok(x, y)) return json(res, 400, {}); tool = 'click'; a2 = { x, y, raw: true, button: ['right','middle'].includes(b.button) ? b.button : 'left' }; }
+        else if (b.a === 'move') { const x = num(b.x), y = num(b.y); if (!ok(x,y)) return json(res, 400, {}); tool = 'move'; a2 = { x, y, raw: true }; }
+        else if (b.a === 'drag') { const x = num(b.x), y = num(b.y), x2 = num(b.x2), y2 = num(b.y2); if (!ok(x, y, x2, y2)) return json(res, 400, {}); tool = 'drag'; a2 = { x, y, x2, y2, raw: true, hold: !!b.hold, button:['right','middle'].includes(b.button)?b.button:'left' }; }
         else if (b.a === 'scroll') { const x = num(b.x), y = num(b.y), amount = num(b.amount); if (!ok(x, y, amount)) return json(res, 400, {}); tool = 'scroll'; a2 = { x, y, raw: true, amount: Math.max(-20, Math.min(20, amount)) }; }
         else if (b.a === 'text') { tool = 'type_text'; a2 = { text: String(b.text || '').slice(0, 2000) }; }
         else if (b.a === 'key') { tool = 'press_key'; a2 = { keys: String(b.keys || '').slice(0, 40) }; }
         else return json(res, 400, { error: 'unknown input' });
-        try { const d = await call(v.code, tool, a2, 30_000, { human: true }); return json(res, 200, { ok: true, text: d?.text || '' }); }
+        if (['pointer','keyboard'].includes(b.a) && b.phase === 'cancel') cancelViewerCommands(s,owner);
+        else { s.takeover=now; s.takeoverOwner=owner; }
+        if(['pointer','keyboard'].includes(b.a)&&s.info?.viewer_realtime===1){
+          if(s.paused)return json(res,409,{error:'input paused on the device'});
+          if(!fastInput(s,a2))return json(res,409,{error:'live input channel reconnecting'});
+          return json(res,202,{accepted:true});
+        }
+        a2.viewer_input = true; // immediate human input; skip AI focus restoration/probe delays
+        try { const d = await call(v.code, tool, a2, 30_000, { human: true, viewerOwner: owner, release: ['pointer','keyboard'].includes(b.a) && b.phase === 'cancel' }); return json(res, 200, { ok: true, text: d?.text || '' }); }
         catch (e) { return json(res, 503, { error: e.message }); }
       }
       if ((v.inflight || 0) >= 2) { res.writeHead(204); return res.end(); }
       v.inflight = (v.inflight || 0) + 1;
       try {
         const mon = url.searchParams.get('mon'); const extra = /^\d$/.test(mon || '') ? { monitor: Number(mon) } : {};
-        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...extra, ...viewParams(s) }, 20_000, { human: true });
+        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...extra, ...viewParams(s) }, 20_000, { human: true, viewerOwner: vw[1] + '/' + client });
+        if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected' });
         if (d.same) { res.writeHead(204, { 'x-same': '1' }); return res.end(); }   // unchanged screen: nothing to send
         v.hash = d.h; v.last = d.jpeg;
         res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-quality': `${s.vl ?? 3}`, 'x-ox': `${d.ox ?? 0}`, 'x-oy': `${d.oy ?? 0}`, 'x-sc': `${d.sc ?? d.scale ?? 1}` }); return res.end(d.jpeg);
@@ -1117,9 +1327,9 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return json(res, 200, {
         version: PKG_VERSION, uptime_s: Math.round(process.uptime()), public_url: PUBLIC_URL || lastBase || '', tls: !!(process.env.TLS_CERT && process.env.TLS_KEY), port: Number(process.env.PORT || 8444),
         state_encrypted: !!STATE_FILE, apk: fs.existsSync(APK_FILE), cursor_pack: fs.existsSync(CURSOR_DIR),
-        counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => now - x.lastSeen < ONLINE_MS).length, files: files.size, viewers: viewers.size, auth_lockouts: authFails.size },
+        counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size, auth_lockouts: authFails.size },
         limits: { max_sessions: MAX_SESSIONS, per_ip: MAX_PER_IP, idle_s: Math.round(SESSION_IDLE_MS / 1000) },
-        sessions: [...sessions].map(([code, x]) => ({ code, os: x.info?.os || '', host: x.info?.host || '', user: x.info?.user || '', mode: x.mode, online: now - x.lastSeen < ONLINE_MS, last_seen_s: Math.round((now - x.lastSeen) / 1000), running: x.pending.size, queued: x.queue.length, age_s: Math.round((now - x.created) / 1000), paused: x.paused, kept: x.persist })),
+        sessions: [...sessions].map(([code, x]) => ({ code, os: x.info?.os || '', host: x.info?.host || '', user: x.info?.user || '', mode: x.mode, online: isOnline(x), last_seen_s: contactAge(x), running: x.pending.size, queued: x.queue.length, age_s: Math.round((now - x.created) / 1000), paused: x.paused, kept: x.persist })),
       });
     }
     const mcp = p === '/mcp' ? [null] : p.match(/^\/s\/([A-Za-z0-9-]+)\/mcp$/);
@@ -1155,7 +1365,10 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const old = want && sessions.get(want);
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
-        old.lastSeen = Date.now(); old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
+        old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
+        old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
+        old.info.viewer_keyboard = info.viewer_keyboard === 1 ? 1 : 0;
+        old.fastInput?.end();old.info.viewer_realtime=info.viewer_realtime===1?1:0;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true, look: effLook(old) });
@@ -1168,7 +1381,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
         th: sha(token), ip, mode: normMode(info.mode), created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
-        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100) },
+        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0 },
       });
       sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
@@ -1178,8 +1391,24 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
     if (p.startsWith('/a/')) {
       const [code, s] = byToken(req);
       if (!s) return json(res, 401, { error: 'unknown token' });
-      s.lastSeen = Date.now();
+      s.lastSeen = Date.now(); s.lastSeenKnown = true; s.awaitingReconnect = false; s.restoredAt = 0;
+      if (p === '/a/poll') save();
+      if (p === '/a/deps/yamldotnet-18.1.0.dll' && req.method === 'GET') {
+        const bytes = fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/YamlDotNet.dll'));
+        const manifest = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/manifest.json'), 'utf8'));
+        if (crypto.createHash('sha256').update(bytes).digest('hex') !== manifest.dll_sha256) throw Error('YAML dependency integrity failure');
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': bytes.length, 'cache-control': 'private, no-store' });
+        return res.end(bytes);
+      }
+      if(p==='/a/input'&&req.method==='GET'){
+        if(s.mode==='confirm'||s.paused||s.info?.viewer_realtime!==1)return json(res,409,{error:'live input unavailable'});
+        s.fastInput?.end();s.fastInput=res;
+        req.socket.setNoDelay(true);res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','x-accel-buffering':'no','x-input-clock':String(Date.now())});res.flushHeaders();res.write('\n');
+        const ping=setInterval(()=>{if(s.paused||s.mode==='confirm'||!isOnline(s)||res.writableLength>16384)res.end();else res.write('\n');},750);
+        res.on('close',()=>{clearInterval(ping);if(s.fastInput===res)s.fastInput=null;});return;
+      }
       if (p === '/a/poll' && req.method === 'GET') {
+        if (s.lookPending) { s.lookPending = false; pushLook(code, s).catch(() => { s.lookPending = true; }); }
         if (url.searchParams.get('w') === '0' && !s.queue.length) { res.writeHead(204); return res.end(); }   // agent busy with a long call: just peek
         if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 204, {}); } // superseded poll: its timer must go too, or it fires on a finished response and takes the relay down
         s.waiting = res;
@@ -1227,6 +1456,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       }
       if (p === '/a/state' && req.method === 'POST') {   // the user paused / resumed from the console (Esc menu)
         const st = JSON.parse((await body(req, 2000)) || '{}'); s.paused = !!st.paused;
+        if(s.paused)s.fastInput?.end();
         evPush(s, { t: Date.now(), type: s.paused ? 'paused' : 'continued' }); save(); return json(res, 200, {});
       }
       if (p === '/a/event' && req.method === 'POST') {   // what the agent saw: outages, repairs, reboots
@@ -1237,7 +1467,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (p === '/a/bye') {
         const b = JSON.parse((await body(req, 2000)) || '{}');
         if (s.persist && !b.final) {   // the window closed / the PC is going down but the user did not end the session: keep it for the PC to come back
-          console.log(`- ${code} left (kept)`); s.lastSeen = 0; evPush(s, { t: Date.now(), type: 'agent_left' });
+          console.log(`- ${code} left (kept)`); s.awaitingReconnect = true;s.fastInput?.end(); evPush(s, { t: Date.now(), type: 'agent_left' });
           for (const pd of s.pending.values()) { clearTimeout(pd.timer); pd.reject(new Error('The agent went away (reboot or closed window). The session is kept: use wait_online.')); } s.pending.clear(); save();
           return json(res, 200, {});
         }
@@ -1253,7 +1483,14 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
 if (STATE_FILE && fs.existsSync(STATE_FILE)) {
   try {
     const st = JSON.parse(unseal(fs.readFileSync(STATE_FILE)));
-    for (const x of st.sessions || []) sessions.set(x.code, newSession(x));   // agents have SESSION_IDLE_MS to come back
+    for (const x of st.sessions || []) {
+      const s = newSession(x);
+      s.lastSeen = Number(x.lastSeen) || Number(x.created) || Date.now();
+      const resumed = Math.max(0,...(x.events || []).filter(e=>e.type==='resumed').map(e=>Number(e.t)||0));
+      s.lastSeenKnown = x.lastSeenKnown !== false && Number(x.lastSeen)>0 && Number(x.lastSeen)>=resumed;
+      s.awaitingReconnect = true; s.restoredAt = Date.now();
+      sessions.set(x.code, s);   // retained state is not proof of a live connection
+    }
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
     for (const x of st.ended || []) ended.set(x.code, x.t);
@@ -1272,6 +1509,26 @@ if (TLS_CERT && TLS_KEY) {
 } else {
   server = http.createServer(handler);
 }
+const inputSockets=new WebSocketServer({noServer:true,maxPayload:4096,perMessageDeflate:false});
+server.on('upgrade',(req,socket,head)=>{
+  const match=req.url?.match(/^\/v\/([a-f0-9]{36})\/input-ws$/),v=match&&viewers.get(match[1]);
+  if(!v||v.exp<Date.now()||inputSockets.clients.size>=500||req.headers.origin!==new URL(baseUrl(req)).origin){socket.destroy();return;}
+  inputSockets.handleUpgrade(req,socket,head,ws=>{
+    socket.setNoDelay(true);let owner='',client='',authenticated=false,count=0,at=Date.now(),alive=true;
+    const authTimer=setTimeout(()=>ws.close(1008,'authentication required'),3000);
+    const check=()=>{const s=sessions.get(v.code);if(!s||v.exp<Date.now()||v.disconnected?.has(client)||s.paused||s.mode==='confirm'||!isOnline(s)||!s.fastInput||!takenOver(s)||s.takeoverOwner!==owner)throw Error('live control unavailable');return s;};
+    ws.on('pong',()=>{alive=true;});
+    const heartbeat=setInterval(()=>{if(authenticated){try{check();if(!alive){ws.terminate();return;}alive=false;ws.ping();}catch{ws.close(1008,'control released');}}},1000);
+    ws.on('message',data=>{try{
+      const b=JSON.parse(data.toString());
+      if(!authenticated){if(!v.ctl||!safeEq(String(b.auth||''),v.ctl)||!/^[a-f0-9]{32}$/.test(String(b.client||'')))throw Error('control authentication failed');client=b.client;owner=match[1]+'/'+client;check();authenticated=true;ws.helperOwner=owner;clearTimeout(authTimer);ws.send('{"ready":true}');return;}
+      const s=check(),now=Date.now();if(now-at>=1000){at=now;count=0;}if(++count>180)throw Error('input rate exceeded');
+      const args=liveInputArgs(s,owner,b);if(!fastInput(s,args))throw Error('input channel unavailable');s.takeover=now;
+    }catch{ws.close(1008,'live input rejected');}});
+    ws.on('error',()=>{});
+    ws.on('close',()=>{clearTimeout(authTimer);clearInterval(heartbeat);if(authenticated){const s=sessions.get(v.code);if(s){releaseViewerPointer(v.code,s,owner);scheduleViewerHandback(match[1],v,s,client);}}});
+  });
+});
 server.requestTimeout = 0; // long-poll
 process.on('uncaughtException', (e) => console.error('uncaught (kept running):', e && e.stack || e));   // one bad request must not drop every session: agents would sit at "Connecting"
 process.on('unhandledRejection', (e) => console.error('unhandled rejection (kept running):', e && e.stack || e));

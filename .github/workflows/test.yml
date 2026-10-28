@@ -12,5 +12,11 @@ jobs:
         with: { node-version: "${{ matrix.node }}" }
       - run: npm ci
         working-directory: relay
+      - if: runner.os == 'Windows'
+        run: npm run test:network
+        working-directory: relay
+      - if: runner.os == 'Windows'
+        run: npm run test:video
+        working-directory: relay
       - run: npm test
         working-directory: relay

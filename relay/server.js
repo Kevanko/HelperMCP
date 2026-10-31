@@ -326,7 +326,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const pr = new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       s.pending.delete(id); s.queue = s.queue.filter((q) => q.id !== id);   // a caller that gave up must not have its command run later
-      reject(new Error(`Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent (user may not have approved).`));
+      reject(new Error(stuckText(s, timeoutMs, tool)));
     }, timeoutMs);
     s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view, viewerOwner: opts.viewerOwner });
     if (opts.release) s.queue.unshift({ id, tool, args }); else s.queue.push({ id, tool, args });
@@ -336,12 +336,26 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   return pr;
 }
 
+// why a command got no answer: the picture can keep a session "online" while the agent's main loop is stuck inside an earlier command
+function stuckText(s, timeoutMs, tool) {
+  const now = Date.now(), poll = s.lastPoll ? Math.round((now - s.lastPoll) / 1000) : null, took = s.took;
+  const head = `Timed out after ${Math.round(timeoutMs / 1000)}s waiting for the agent`;
+  if (s.mode === 'confirm') return head + ` (ask mode: the user has not answered the question on the PC${took ? ' about ' + took.tool : ''} yet).`;   // the agent waits for a key and does not poll meanwhile
+  if (poll !== null && poll >= 20) {
+    const busy = took ? ` It is still inside ${took.tool} started ${Math.round((now - took.t) / 1000)}s ago.` : '';
+    return head + `: its main loop has not asked for commands for ${poll}s although the PC is reachable (the live picture is a separate thread).${busy}`
+      + (took && /^ui_/.test(took.tool) ? ' The accessibility interface of that window does not answer: do not call ui_tree / ui_click / ui_set on it again, use screenshot and click.' : '')
+      + ' Wait a little and retry once (an updated helper frees itself after 20 s); if it stays stuck, the user restarts the helper and the session continues with the same code.';
+  }
+  return head + ` (${tool} did not finish in time; the agent is still taking commands, so retry or raise timeout_s).`;
+}
 function flush(s) {
   if (s.waiting && s.queue.length) {
     const res = s.waiting;
     s.waiting = null;
     clearTimeout(s.waitTimer);
-    json(res, 200, s.queue.shift());
+    const cmd = s.queue.shift(); if (!s.pending.get(cmd.id)?.view) s.took = { id: cmd.id, tool: cmd.tool, t: Date.now() };   // what the agent is doing now: a time-out can then say "stuck in X" instead of guessing
+    json(res, 200, cmd);
   }
 }
 
@@ -432,7 +446,7 @@ const tools = [
     run: async () => ({
       text: JSON.stringify([...sessions].map(([code, s]) => ({
         code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
-        online: isOnline(s), last_seen_s: contactAge(s),
+        online: isOnline(s), last_seen_s: contactAge(s), ...(s.lastPoll && isOnline(s) && Date.now() - s.lastPoll > 20_000 ? { stuck_s: Math.round((Date.now() - s.lastPoll) / 1000), stuck_in: s.took?.tool || '?' } : {}),
         connected_s: Math.round((Date.now() - s.created) / 1000), paused: s.paused, kept: s.persist, events: s.events.length,
         last_event: s.events.length ? { type: s.events[s.events.length - 1].type, ago_s: Math.round((Date.now() - s.events[s.events.length - 1].t) / 1000) } : undefined,
       })), null, 2),
@@ -1408,6 +1422,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         res.on('close',()=>{clearInterval(ping);if(s.fastInput===res)s.fastInput=null;});return;
       }
       if (p === '/a/poll' && req.method === 'GET') {
+        s.lastPoll = Date.now();   // the main loop asked for work: unlike the picture upload, this proves the agent can take commands
         if (s.lookPending) { s.lookPending = false; pushLook(code, s).catch(() => { s.lookPending = true; }); }
         if (url.searchParams.get('w') === '0' && !s.queue.length) { res.writeHead(204); return res.end(); }   // agent busy with a long call: just peek
         if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 204, {}); } // superseded poll: its timer must go too, or it fires on a finished response and takes the relay down
@@ -1444,7 +1459,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         } else r = JSON.parse(await body(req, 25_000_000));
         const pend = s.pending.get(r.id);
         if (pend) {
-          s.pending.delete(r.id); clearTimeout(pend.timer);
+          s.pending.delete(r.id); clearTimeout(pend.timer); if (s.took?.id === r.id) s.took = null;
           adapt(s, pend, r.data?.jpeg?.length || 0);
           if (r.ok && r.data?.miss) recordMiss(s, code, 'auto', { tool: pend.tool, args: pend.argStr, note: String(r.data.text || '').slice(0, 400) });
           r.ok ? pend.resolve(r.data) : pend.reject(new Error(r.error || 'agent error'));

@@ -1570,7 +1570,7 @@ namespace A__BUILD__ {
     static int Cx(Node n, double sc, int ox) { return (int)((n.X + n.W / 2.0 - ox) / sc); }
     static int Cy(Node n, double sc, int oy) { return (int)((n.Y + n.H / 2.0 - oy) / sc); }
 
-    public static string Tree(string window, string query, int max, bool all, double sc, int ox, int oy) {
+    static string TreeIn(string window, string query, int max, bool all, double sc, int ox, int oy) {
       if (sc <= 0) sc = 1;
       AutomationElement win = PickWindow(window); List<Node> acc = Collect(win);
       string wt = ""; int wp = 0; try { wt = win.Current.Name; wp = win.Current.ProcessId; } catch { }
@@ -1602,7 +1602,7 @@ namespace A__BUILD__ {
       return have == want || (want == "tab" && have == "tabitem") || (want == "menu" && have == "menuitem") || (want == "item" && have.EndsWith("item"));
     }
     // -> [description, centre x, centre y] (real pixels); the control is remembered for Act / Set
-    public static string[] Pick(int id, string name, string type, string window) {
+    static string[] PickIn(int id, string name, string type, string window) {
       AutomationElement el = null;
       if (id > 0) {
         if (id > Cache.Count) throw new Exception("No control #" + id + ": run ui_tree first, ids come from the last ui_tree");
@@ -1643,7 +1643,7 @@ namespace A__BUILD__ {
       return ok;
     }
     // null = the control has no action of its own: the caller clicks its centre
-    public static string Act() {
+    static string ActIn() {
       AutomationElement el = Picked; if (el == null) throw new Exception("nothing picked");
       if (!el.Current.IsEnabled) throw new Exception("the control is disabled");
       object p;
@@ -1656,7 +1656,7 @@ namespace A__BUILD__ {
       return null;
     }
     // null = no direct value access: the caller focuses it and types
-    public static string Set(string value) {
+    static string SetIn(string value) {
       AutomationElement el = Picked; if (el == null) throw new Exception("nothing picked");
       bool pw = false; try { pw = el.Current.IsPassword; } catch { }
       object p;
@@ -1674,8 +1674,24 @@ namespace A__BUILD__ {
       }
       return null;
     }
-    public static void Focus() { if (Picked != null) Picked.SetFocus(); }
-    public static int[] WinRect(string window) { System.Windows.Rect r = PickWindow(window).Current.BoundingRectangle; return new int[] { (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height }; }
+    // Every call into another app's accessibility interface runs on its own thread with a hard limit: one hung app (seen with a
+    // WebView window) used to block the helper's main loop for good, so commands stopped while the picture kept the session "online".
+    // ponytail: the stuck thread is abandoned, not killed (UI Automation calls cannot be cancelled); new calls fail fast while it hangs
+    static volatile Thread stuck;
+    static T Timed<T>(Func<T> f, int ms) {
+      Thread old = stuck; if (old != null && old.IsAlive) throw new Exception("the previous UI Automation call is still hung in that app: use screenshot and click (ui_* works again once the app answers)");
+      T r = default(T); Exception err = null;
+      Thread t = new Thread(delegate() { try { r = f(); } catch (Exception e) { err = e; } }); t.IsBackground = true; t.Start();
+      if (!t.Join(ms)) { stuck = t; throw new Exception("that window did not answer UI Automation in " + (ms / 1000) + " s (the app's accessibility interface is hung or very slow): use screenshot and click; the helper keeps working"); }
+      if (err != null) throw err;
+      return r;
+    }
+    public static string Tree(string window, string query, int max, bool all, double sc, int ox, int oy) { return Timed(delegate { return TreeIn(window, query, max, all, sc, ox, oy); }, 20000); }
+    public static string[] Pick(int id, string name, string type, string window) { return Timed(delegate { return PickIn(id, name, type, window); }, 20000); }
+    public static string Act() { return Timed(delegate { return ActIn(); }, 8000); }
+    public static string Set(string value) { return Timed(delegate { return SetIn(value); }, 8000); }
+    public static void Focus() { Timed(delegate { if (Picked != null) Picked.SetFocus(); return 0; }, 5000); }
+    public static int[] WinRect(string window) { return Timed(delegate { System.Windows.Rect r = PickWindow(window).Current.BoundingRectangle; return new int[] { (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height }; }, 8000); }
   }
 }
 '@

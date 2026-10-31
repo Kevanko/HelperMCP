@@ -1,6 +1,14 @@
 # The relay embeds the worker. It is saved outside the repository, next to the
 # saved session, only when an explicit guarded network job is requested.
 function Recovery-Root { Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'HelperMCP-NetworkRecovery' }
+function Recovery-PrincipalSid($userId) {
+    try {
+        $name = ([string]$userId).Trim()
+        if (-not $name) { return '' }
+        if ($name -match '^S-\d(-\d+)+$') { return (New-Object Security.Principal.SecurityIdentifier $name).Value }
+        return (New-Object Security.Principal.NTAccount $name).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch { return '' }
+}
 function Recovery-SecureDirectory($dir) {
     if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Recovery directory cannot be a reparse point' }
     $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -251,7 +259,7 @@ function Recovery-Operation($a) {
         $null = Set-ScheduledTask -TaskName $state.task_name -Action $taskAction
         $verified = Get-ScheduledTask -TaskName $state.task_name
         if ([string]$verified.Actions.Arguments -ne $arguments) { throw 'Rollback task readback mismatch' }
-        if (-not $verified.Settings.Enabled -or @($verified.Triggers).Count -ne 2 -or [string]$verified.Principal.UserId -notin @('SYSTEM','S-1-5-18')) { throw 'Rollback task principal/triggers/enabled readback mismatch' }
+        if (-not $verified.Settings.Enabled -or @($verified.Triggers).Count -ne 2 -or (Recovery-PrincipalSid $verified.Principal.UserId) -ne 'S-1-5-18') { throw 'Rollback task principal/triggers/enabled readback mismatch' }
         $p = Recovery-Launch $dir 'run'; $p.Dispose()
     } catch {
         $preparationError = $_

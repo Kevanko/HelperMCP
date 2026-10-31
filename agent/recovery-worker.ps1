@@ -55,6 +55,7 @@ function Service($step) {
 }
 function Service-State($step, $running) {
     $null = Service $step
+    Add-Type -AssemblyName System.ServiceProcess
     $controller = New-Object System.ServiceProcess.ServiceController $step.name
     try {
         if ($running) {

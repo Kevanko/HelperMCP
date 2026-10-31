@@ -26,6 +26,13 @@ function New-State($steps, $allow=$false) {
 }
 $step = [pscustomobject]@{ op = 'adapter_disable'; interface_index = 42; interface_guid = 'fixture-guid' }
 try {
+    Assert ((Recovery-PrincipalSid 'S-1-5-18') -eq 'S-1-5-18') 'SYSTEM SID rejected'
+    Assert ((Recovery-PrincipalSid 'S-1-5-32-544') -ne 'S-1-5-18') 'Administrators accepted as SYSTEM'
+    Assert ((Recovery-PrincipalSid 'not-a-real-principal-36c413ba') -ne 'S-1-5-18') 'unknown principal accepted'
+    $localizedSystem = (New-Object Security.Principal.SecurityIdentifier 'S-1-5-18').Translate([Security.Principal.NTAccount]).Value
+    Assert ((Recovery-PrincipalSid $localizedSystem) -eq 'S-1-5-18') 'localized SYSTEM account rejected'
+    Write-Output 'recovery SYSTEM principal SID translation and fail-closed checks PASS'
+
     # A reader holding the old journal must not prevent an atomic replacement.
     # This reproduced during real SYSTEM preflight polling on Windows 11.
     New-State @()

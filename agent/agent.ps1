@@ -1911,7 +1911,6 @@ function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
 function Do-TaskDone($a) {
     $script:Phase = 'done'; Overlay-Send 'state done'
-    if ($script:Persist) { try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }; try { if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue } } catch { }; Write-AgentLog 'task done: autostart removed (a reboot will not bring the console back)' }   # a finished job should not reappear after the PC restarts; a new command re-arms it (below)
     Write-Host ('  ' + [char]0x2714 + ' ' + (T 'Помощник закончил работу' 'The helper finished the work')) -ForegroundColor Green; Show-Status; @{ text = 'ok' }
 }
 function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
@@ -3921,10 +3920,9 @@ function Process-Command($cmd) {
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
-            $first = -not $script:OperatorSeen; $wasDone = $script:Phase -eq 'done'
+            $first = -not $script:OperatorSeen
             $script:OperatorSeen = $true; $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status
             if ($first) { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
-            if ($wasDone -and $script:Persist) { Install-Autostart }   # work resumed after task_done: re-arm the safety net
         }
     }
     if (-not $viewFrame -and -not $meta -and $name -ne 'viewer_pointer') { Say-Step $name $a }

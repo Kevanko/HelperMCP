@@ -113,7 +113,11 @@ namespace HelperPointer {
         using(var response=rq.GetResponse())using(var reader=new StreamReader(response.GetResponseStream()))using(var fresh=new FreshReader(reader,response.Headers["x-input-clock"]))Run(new NativeSink(),fresh,TextWriter.Null,true);
       }catch{}finally{networkRequest=null;}if(!networkStop)Thread.Sleep(500);}
     }
-    public static void Run(IPointerSink sink){Run(sink,Console.In,Console.Out,false);}
+    public static void Run(IPointerSink sink) {
+      // Windows PowerShell can prepend an encoding marker to the redirected pipe.
+      using (var input = new StreamReader(Console.OpenStandardInput(), System.Text.Encoding.UTF8, true))
+        Run(sink, input, Console.Out, false);
+    }
     static void Run(IPointerSink sink,TextReader input,TextWriter output,bool strict) {
       using(var lease=new PointerLease(sink,3000)) using(var keyboard=new KeyboardLease(sink as IKeyboardSink,3000)) {
         string line;

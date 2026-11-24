@@ -2319,11 +2319,6 @@ def hold(a):
     PHASE["p"] = "hold"; overlay_send("state hold"); print(c(ORANGE, "  ⏸ " + ("Помощник на паузе и вернётся" if RU else "The helper is on hold and will be back")), flush=True); return {"text": "ok"}
 def task_done(a):
     PHASE["p"] = "done"; overlay_send("state done")
-    if PERSIST["on"]:   # a finished job should not reappear after the PC restarts; a new command re-arms it (handle(), below)
-        for f in (AUTOSTART, os.path.join(STATE_DIR, "start.sh")):
-            try: os.remove(f)
-            except Exception: pass
-        log("task done: autostart removed (a reboot will not bring the console back)")
     print(c("32", "  ✔ " + ("Помощник закончил работу" if RU else "The helper finished the work")), flush=True); return {"text": "ok"}
 def set_mode(a):
     """admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session"""
@@ -2353,10 +2348,9 @@ def handle(cmd, mode, token):
     if not view and name not in META:
         PHASE["last"] = time.time()
         if not OP["seen"] or PHASE["p"] != "ok":
-            first = not OP["seen"]; was_done = PHASE["p"] == "done"
+            first = not OP["seen"]
             OP["seen"] = True; PHASE["p"] = "ok"; overlay_send("state ok"); show_status()
             if first: print(c("32", "  ● " + t("st_ok")), flush=True)
-            if was_done and PERSIST["on"]: install_autostart()
         ln = line_for(name, args)
         if ln: print(ln, flush=True)
     quiet_ = name in QUIET or name in META or view

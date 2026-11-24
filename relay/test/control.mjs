@@ -70,8 +70,10 @@ try {
   const cookie=/hm_admin=[0-9a-f]+/.exec(login.headers.get('set-cookie'))[0],csrf=(await login.json()).csrf;
   const H={cookie,'x-csrf':csrf};
   const admin=(name,b)=>b===undefined?fetch(base+'/admin/api/'+name,{headers:{cookie}}):post(base+'/admin/api/'+name,b,H);
-  await admin('settings',{glow:true,sound:true});
-  let list=await(await admin('sessions')).json();assert.ok(list.every(s=>s.glow&&s.sound));
+  assert.deepEqual(await(await admin('settings',{})).json(),{glow:false,sound:false,banner:false,timer:false});
+  await admin('settings',{glow:true,sound:true,banner:true,timer:true});
+  let list=await(await admin('sessions')).json();assert.ok(list.every(s=>s.glow&&s.sound&&s.banner&&s.timer));
+  await admin('settings',{banner:false,timer:false});
   await admin('look',{code:first.code,glow:false});
   list=await(await admin('sessions')).json();assert.equal(list.find(s=>s.code===first.code).glow,false);assert.equal(list.find(s=>s.code===second.code).glow,true);
   await admin('settings',{glow:false});list=await(await admin('sessions')).json();assert.ok(list.every(s=>!s.glow&&s.sound));
@@ -182,6 +184,13 @@ try {
   for(let n=0;n<40&&(await(await fetch(rtViewer+'/state')).json()).live_realtime;n++)await sleep(25);
   assert.equal((await(await fetch(rtViewer+'/state')).json()).live_realtime,false,'pause left live input available');
   console.log('Live input WebSocket authentication, owner isolation, ordered direct delivery, handback release and pause PASS');
+  assert.equal((await post(rtViewer+'/end',{})).status,403,'watch link ended the session');
+  assert.equal((await post(rtViewer+'/end',{},RH)).status,200);
+  const stopped=await(await admin('sessions')).json();
+  assert.ok(stopped.some(s=>s.code===first.code),'end closed another device');
+  assert.ok(!stopped.some(s=>s.code===realtime.code),'end retained the session');
+  assert.ok(commands.some(c=>c.code===realtime.code&&c.tool==='bye'),'end did not tell the agent to exit');
+  console.log('Viewer end requires the control link and closes only the selected session PASS');
   if(process.argv.includes('--serve')) {
     const out=process.env.UI_FIXTURE_PATH;
     if(out)fs.writeFileSync(out,JSON.stringify({base,user:creds.user,password:creds.password,control:urls.control,watch:urls.watch,temp}));

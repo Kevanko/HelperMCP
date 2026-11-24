@@ -103,13 +103,34 @@
       el('div', { class: 'note', style: 'color:var(--mut)', text: 'No login yet? On the server run: helpermcp admin' })));
   }
 
-  function defaultsBar() {   // global actions; per-device toggles remain in the device row
-    const gl = el('input', { type: 'checkbox', id: 'df-glow', disabled: true }), sn = el('input', { type: 'checkbox', id: 'df-snd', disabled: true }), msg = el('span', { class: 'mut' });
-    const push = async (key) => { gl.disabled = sn.disabled = true; try { const j = await call('settings', { [key]: key === 'glow' ? gl.checked : sn.checked }); gl.checked = j.glow; sn.checked = j.sound; msg.textContent = 'Applied to all devices'; refreshDevices(); } catch (e) { msg.textContent = e.message; } finally { gl.disabled = sn.disabled = false; } };
-    call('settings', {}).then((j) => { gl.checked = j.glow; sn.checked = j.sound; gl.disabled = sn.disabled = false; }).catch(() => {});
-    gl.addEventListener('change', () => push('glow')); sn.addEventListener('change', () => push('sound'));
-    return el('div', { class: 'defaults' }, el('b', { text: 'All devices' }), el('label', { class: 'chk', for: 'df-glow' }, gl, ' Glow'), el('label', { class: 'chk', for: 'df-snd' }, sn, ' Sound'), msg, el('span', { class: 'mut', text: 'Applies now and to new connections. Use the switches beside a device for a local change.' }));
+  const appearance = { glow: ['☼', 'Подсветка'], sound: ['♫', 'Звук'], banner: ['▤', 'Верхняя плашка'], timer: ['◷', 'Таймер'] };
+  function deviceToggle(key, on, onclick, disabled = false) {
+    const [glyph, label] = appearance[key];
+    return el('button', { type: 'button', class: 'device-toggle' + (on ? ' on' : ''), 'aria-label': label, 'aria-pressed': String(on),
+      title: label + (on ? ' · включено' : ' · выключено'), onclick, disabled }, glyph);
   }
+
+  function defaultsBar() {
+    const controls = el('div', { class: 'device-switches', 'aria-label': 'Настройки для всех устройств' });
+    const msg = el('span', { class: 'mut', role: 'status' });
+    function paint(settings, busy = false) {
+      controls.replaceChildren(...Object.keys(appearance).map((key) => deviceToggle(key, !!settings[key], async () => {
+        paint(settings, true);
+        try {
+          paint(await call('settings', { [key]: !settings[key] }));
+          msg.textContent = 'Настройки применены';
+          refreshDevices();
+        } catch (e) {
+          paint(settings);
+          msg.textContent = e.message;
+        }
+      }, busy)));
+    }
+    paint({}, true);
+    call('settings', {}).then((settings) => paint(settings)).catch((e) => { msg.textContent = e.message; });
+    return el('div', { class: 'defaults' }, el('b', { text: 'Все устройства' }), controls, msg);
+  }
+
   async function panel(me) {
     const status = el('div', { class: 'cards' }), body = el('div');
     const TAB_ICON = { sessions: 'list', report: 'doc', account: 'lock' };
@@ -129,7 +150,12 @@
             el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off' },
               el('td', { class: 'pv' }, previewTile(s)),
               el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null,
-                el('div', { class: 'device-switches', 'aria-label': 'This device only: ' + s.code }, ...['glow', 'sound','banner','timer'].map((key) => el('button', { class: 'device-toggle' + (s[key] ? ' on' : ''), 'aria-pressed': String(!!s[key]), title: 'Toggle ' + key + ' only on ' + s.code, onclick: async (e) => { e.currentTarget.disabled = true; try { await call('look', { code: s.code, [key]: !s[key] }); await draw(); } catch (err) { guard(err); } } }, ({glow:'Подсветка',sound:'Звук',banner:'Плашка',timer:'Таймер'}[key]) + ': ' + (s[key] ? 'вкл' : 'выкл'))))),
+                el('div', { class: 'device-switches', 'aria-label': 'Настройки устройства ' + s.code },
+                  ...Object.keys(appearance).map((key) => deviceToggle(key, !!s[key], async (e) => {
+                    e.currentTarget.disabled = true;
+                    try { await call('look', { code: s.code, [key]: !s[key] }); await draw(); }
+                    catch (err) { guard(err); }
+                  })))),
               el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os }), s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool + (r.args ? ' ' + r.args.slice(0, 40) : '')).join(' · ') }) : null),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
               el('td', null, el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),

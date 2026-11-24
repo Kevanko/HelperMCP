@@ -184,7 +184,7 @@ namespace V__BUILD__ {
   }
 }
 "@
-$script:GlowOn = $false; $script:SoundOn = $false;$script:BannerOn=$true;$script:TimerOn=$true
+$script:GlowOn = $false; $script:SoundOn = $false; $script:BannerOn = $false; $script:TimerOn = $false
 $script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
 $GlowDepth = [int](34 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))   # the edge glow is thin and soft; off unless switched on
 # ---- did an action change anything? A coarse picture around the target and of the whole screen before and after (the overlay's own label and glow are left out)
@@ -3111,7 +3111,7 @@ Add-Type -Namespace O -Name C -MemberDefinition '[DllImport("user32.dll", CharSe
 $label = $env:HM_LABEL; $lostLabel = $env:HM_LOST; $waitLabel = $env:HM_WAIT; $pausedLabel = $env:HM_PAUSED; $ppid = [int]$env:HM_PPID
 $script:dpos = $null; $script:blendT = -1.0; $holdLabel = $env:HM_HOLD; $doneLabel = $env:HM_DONE; $awayLabel = $env:HM_AWAY; $script:note = ''; $script:pin = $null
 $dpi = [Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96
-$script:state = 'ok'; $script:glowOn = $false;$script:bannerOn=$true;$script:timerOn=$true
+$script:state = 'ok'; $script:glowOn = $false; $script:bannerOn = $false; $script:timerOn = $false
 function C($r, $g, $b, $a = 255) { [Windows.Media.Color]::FromArgb($a, $r, $g, $b) }
 $BLUE = C 76 141 255; $ORANGE = C 255 138 30; $VIOLET = C 168 128 255; $GREEN = C 61 220 132; $script:okC = $BLUE
 function Brush($c) { $b = New-Object Windows.Media.SolidColorBrush $c; $b.Freeze(); $b }

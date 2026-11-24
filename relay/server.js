@@ -53,8 +53,9 @@ const unseal = (buf) => {
 };
 let saveTimer = null;
 // what a new link starts with (changed in the admin panel): the edge glow and the sounds are OFF unless someone turns them on; a session can override it
-const settings = { glow: false, sound: false };
-const effLook = (s) => ({ glow: s.glow ?? settings.glow, sound: s.sound ?? settings.sound, banner:s.banner??true, timer:s.timer??true });
+const lookKeys = ['glow', 'sound', 'banner', 'timer'];
+const settings = { glow: false, sound: false, banner: false, timer: false };
+const effLook = (s) => Object.fromEntries(lookKeys.map((key) => [key, s[key] ?? settings[key]]));
 function save() {
   if (!STATE_FILE || saveTimer) return;
   saveTimer = setTimeout(() => {
@@ -143,9 +144,9 @@ async function humanLook(code, color, note, glow, sound, banner, timer) {
   return pushLook(String(code).toUpperCase(), s);
 }
 function globalLook(update) {
-  for (const key of ['glow', 'sound']) if (typeof update[key] === 'boolean') settings[key] = update[key];
+  for (const key of lookKeys) if (typeof update[key] === 'boolean') settings[key] = update[key];
   for (const [code, s] of sessions) {
-    for (const key of ['glow', 'sound']) if (typeof update[key] === 'boolean') s[key] = update[key];
+    for (const key of lookKeys) if (typeof update[key] === 'boolean') s[key] = update[key];
     s.lookPending = true;
     if (isOnline(s)) {
       s.lookPending = false;
@@ -303,6 +304,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   if (s.paused && tool !== 'bye' && !opts.release && !(opts.human && (tool === 'screenshot' || tool === 'stream' || tool === 'look'))) {   // the live viewer keeps showing the screen while it is paused
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
+  if (s.ending && tool !== 'bye') return Promise.reject(new Error('The session is ending.'));
   if (takenOver(s) && !opts.human && tool !== 'bye') {
     return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
@@ -370,6 +372,27 @@ function drop(code, why) {
   save();
   for (const p of s.pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)); }
   if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 410, { error: why }); }
+}
+
+function endSession(code) {
+  const s = sessions.get(code);
+  if (!s) return Promise.resolve();
+  if (s.ending) return s.ending;
+  s.queue.splice(0).forEach(({ id }) => {
+    const pending = s.pending.get(id);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    s.pending.delete(id);
+    pending.reject(new Error('The session is ending.'));
+  });
+  s.fastInput?.end();
+  s.ending = Promise.race([
+    call(code, 'bye', {}, 2500, { human: true }).catch(() => {}),
+    new Promise((resolve) => setTimeout(resolve, 2000)),
+  ]).then(() => {
+    if (sessions.get(code) === s) drop(code, 'The operator ended the session. STOP and do not retry.');
+  });
+  return s.ending;
 }
 
 setInterval(() => {
@@ -673,7 +696,7 @@ const tools = [
       return { text: `Watch (view only, safe to share): ${l.watch}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${l.control}` };
     } },
   { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
-    run: async (code) => { await Promise.race([call(code, 'bye', {}, 4000).catch(() => {}), new Promise((r) => setTimeout(r, 2000))]); drop(code.toUpperCase(), 'Session ended by operator.'); return { text: 'ended' }; } },   // the agent never answers 'bye': waiting for it used to hang the call for a minute (three in ask mode)
+    run: async (code) => { await endSession(code.toUpperCase()); return { text: 'ended' }; } },
 ];
 const byName = new Map(tools.map((t) => [t.name, t]));
 
@@ -910,7 +933,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 #top{height:44px;display:flex;align-items:center;gap:.7rem;padding:0 .9rem;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--panel2),var(--panel))}
 #dot{width:9px;height:9px;border-radius:50%;background:var(--mut);flex:none}#dot.on{background:var(--g);box-shadow:0 0 10px var(--g)}#dot.bad{background:var(--hot);box-shadow:0 0 10px var(--hot)}
 #st{color:var(--g);white-space:nowrap}#who{color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-#ctl{color:#00150a;background:var(--g);border-color:var(--g);font-weight:600}#ctl.on{background:var(--warn);border-color:var(--warn)}
+#ctl{color:#00150a;background:var(--g);border-color:var(--g);font-weight:600}#ctl.on{background:var(--warn);border-color:var(--warn)}.appearance-icon{min-width:36px;min-height:34px;font-size:16px}.appearance-icon[aria-pressed=true]{color:var(--g);border-color:var(--line2)}
 #main{display:grid;grid-template-columns:minmax(0,1fr) 300px;height:calc(100% - 44px - var(--kb))}
 #scr{position:relative;display:flex;align-items:center;justify-content:center;min-width:0;min-height:0;padding:14px}
 #frame{position:relative;max-width:100%;max-height:100%;display:flex}
@@ -1076,7 +1099,7 @@ cv.addEventListener('pointermove',e=>{if(!pan)return;tx=pan.tx+(e.clientX-pan.x)
 addEventListener('pointerup',()=>{pan=null});
 $('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
 // disconnect: stop watching (the stream closes at once; the helper stops filming 15 s after the last viewer leaves); the same button reconnects
-function disconnectViewer(){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
+function disconnectViewer(final=false){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));if(final){status(L.end,'');return}status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
 $('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(gone){location.reload();return}disconnectViewer()};addEventListener('pagehide',()=>disconnectViewer());
 </script>
 <script src=/assets/viewer-control.js></script><link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
@@ -1093,7 +1116,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, globalLook, settings, effLook, isOnline, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, drop, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, globalLook, settings, effLook, isOnline, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, endSession, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1155,7 +1178,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       return pipeline(fs.createReadStream(f.path), dec, res).catch(() => {});
     }
 
-    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/disconnect|\/network|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act|\/look)?$/);   // live viewer for the operator (link from open_viewer)
+    const vw = p.match(/^\/v\/([0-9a-f]{36})(\/frame|\/live|\/log|\/input|\/takeover|\/disconnect|\/end|\/network|\/state|\/ls|\/get|\/upload|\/kill|\/sysdata|\/fsop|\/preview|\/act|\/look)?$/);   // live viewer for the operator (link from open_viewer)
     if (vw) {
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
@@ -1171,6 +1194,11 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         return json(res, 200, { disconnected: true });
       }
       if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected; reconnect to continue' });
+      if (vw[2] === '/end') {
+        if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'control link required' });
+        await endSession(v.code);
+        return json(res, 200, { ended: true });
+      }
       if (vw[2] === '/network') {
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'control link required' });
         const b = JSON.parse((await body(req, 3000)) || '{}');
@@ -1506,7 +1534,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
     for (const x of st.ended || []) ended.set(x.code, x.t);
-    if (st.settings) { settings.glow = !!st.settings.glow; settings.sound = !!st.settings.sound; }
+    if (st.settings) for (const key of lookKeys) if (typeof st.settings[key] === 'boolean') settings[key] = st.settings[key];
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }
 }

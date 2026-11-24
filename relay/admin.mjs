@@ -107,8 +107,11 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b.color, b.note, b.glow, b.sound,b.banner,b.timer) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
     }
     if (api === 'settings') {   // global actions apply to existing devices AND defaults for new ones
-      if (typeof b.glow === 'boolean' || typeof b.sound === 'boolean') { d.globalLook(b); d.audit('admin_settings', { scope: 'all_devices', glow: d.settings.glow, sound: d.settings.sound }); }
-      send(res, 200, { glow: d.settings.glow, sound: d.settings.sound }); return true;
+      if (Object.keys(d.settings).some((key) => typeof b[key] === 'boolean')) {
+        d.globalLook(b);
+        d.audit('admin_settings', { scope: 'all_devices', ...d.settings });
+      }
+      send(res, 200, d.settings); return true;
     }
     if (api === 'mode') {   // confirm / auto / unattended, pushed to the live agent; never reachable by the AI
       const code = String(b.code || '').toUpperCase(), mode = String(b.mode || '');
@@ -122,8 +125,8 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     }
     if (api === 'end') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
-      await Promise.race([d.call(code, 'bye', {}, 4000, { human: true }).catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);   // tell the helper to stop for good first: dropping the session alone left it re-registering
-      d.drop(code, 'The session was ended by the administrator. STOP: do not retry, tell the operator.'); d.audit('admin_end', { code }); send(res, 200, {}); return true;
+      await d.endSession(code);
+      d.audit('admin_end', { code }); send(res, 200, {}); return true;
     }
     if (api === 'password') {
       const adm = readAdmin(d.dir), np = String(b.new || '');

@@ -33,7 +33,8 @@ function Send($p,$seq,$op,$who=$owner){
 function Buttons{if(Test-Path -LiteralPath $log){@(Get-Content -LiteralPath $log | Where-Object{$_ -like 'button:*'})}else{@()}}
 $p=Start-Worker
 try{
-    Assert ((Send $p 1 'down') -eq 'OK held') 'down failed'
+    $reply = Send $p 1 'down'
+    Assert ($reply -eq 'OK held') "First worker command rejected (stdin code page $([Console]::InputEncoding.CodePage)): $reply"
     Assert ((Send $p 1 'down') -eq 'OK duplicate') 'duplicate down not ignored'
     Assert ((@(Buttons) -join ',') -eq 'button:2') 'duplicate down injected again'
     Start-Sleep -Milliseconds 3350

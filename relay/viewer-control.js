@@ -8,6 +8,20 @@
   };
   if (!CTL) return;
   const button = $('ctl'); button.hidden = false; button.textContent = L.take;
+  const endButton = $('disc');
+  endButton.textContent = ru ? 'Завершить' : 'End session';
+  endButton.title = ru ? 'Завершить сеанс Helper на устройстве' : 'End the Helper session on the device';
+  endButton.onclick = async () => {
+    if (!confirm(ru ? 'Завершить сеанс на устройстве?' : 'End the session on the device?')) return;
+    endButton.disabled = true;
+    try {
+      await request('/end', {});
+      disconnectViewer(true);
+    } catch (e) {
+      endButton.disabled = false;
+      status(e.message, 'bad');
+    }
+  };
   $('send').textContent = L.send; txt.placeholder = L.ph;
   // Direct desktop typing is primary; explicit text entry remains for mobile/IME.
   const textToggle=document.createElement('button');textToggle.textContent=ru?'Текст…':'Text…';
@@ -15,17 +29,17 @@
   textToggle.onclick=()=>{const show=txt.style.display==='none';txt.style.display=show?'':'none';$('send').style.display=show?'':'none';(show?txt:cv).focus({preventScroll:true});document.documentElement.style.setProperty('--kb',kb.offsetHeight+'px')};kb.append(textToggle);
   let generation = 0, sending = false, pending = [], down = null, wheel = 0, wheelTimer = null, hoverTimer = null, hover = null, pointerEnabled = false, pointerFailed = false, pointerSeq = 0, keepTimer = null,keyboardEnabled=false,keyboardFailed=false,keyTimer=null;
   const heldKeys=new Map();
-  let lookState={glow:false,sound:false,banner:true,timer:true};const lookButtons=new Map();
+  let lookState={glow:false,sound:false,banner:false,timer:false};const lookButtons=new Map();
   const appearance=document.createElement('div');appearance.style.cssText='display:flex;flex-wrap:wrap;gap:.4rem;padding:.6rem .9rem;border-bottom:1px solid var(--line)';
-  for(const [key,label] of [['glow',ru?'Подсветка':'Glow'],['sound',ru?'Звук':'Sound'],['banner',ru?'Верхняя плашка':'Top banner'],['timer',ru?'Таймер':'Timer']]){
-    const b=document.createElement('button');b.dataset.setting=key;b.onclick=async()=>{b.disabled=true;try{const value=!lookState[key];await request('/look',{[key]:value});lookState[key]=value;paintLook();}catch(e){status(e.message,'bad');}finally{b.disabled=false;}};
+  for(const [key,glyph,label] of [['glow','☼',ru?'Подсветка':'Glow'],['sound','♫',ru?'Звук':'Sound'],['banner','▤',ru?'Верхняя плашка':'Top banner'],['timer','◷',ru?'Таймер':'Timer']]){
+    const b=document.createElement('button');b.dataset.setting=key;b.className='appearance-icon';b.textContent=glyph;b.title=label;b.setAttribute('aria-label',label);b.onclick=async()=>{b.disabled=true;try{const value=!lookState[key];await request('/look',{[key]:value});lookState[key]=value;paintLook();}catch(e){status(e.message,'bad');}finally{b.disabled=false;}};
     lookButtons.set(key,{b,label});appearance.append(b);
   }
   const description=document.createElement('button');description.dataset.setting='note';description.textContent=ru?'Описание':'Description';
   description.onclick=async()=>{const value=prompt(ru?'Текст верхней плашки (до 90 символов)':'Top banner text (up to 90 characters)',lookState.note||'');if(value===null)return;description.disabled=true;try{const note=value.replace(/\s+/g,' ').trim().slice(0,90);await request('/look',{note});lookState.note=note;}catch(e){status(e.message,'bad');}finally{description.disabled=false;}};
   appearance.append(description);
   if($('side').prepend)$('side').prepend(appearance);else $('side').append(appearance);
-  function paintLook(){for(const [key,{b,label}] of lookButtons){const on=!!lookState[key];b.textContent=label+': '+(ru?(on?'вкл':'выкл'):(on?'on':'off'));b.setAttribute('aria-pressed',String(on));}}
+  function paintLook(){for(const [key,{b,label}] of lookButtons){const on=!!lookState[key];b.title=label+': '+(ru?(on?'вкл':'выкл'):(on?'on':'off'));b.setAttribute('aria-pressed',String(on));}}
   paintLook();
   let realtimeEnabled=false,liveSocket=null,socketReady=false;
   const isLive=action=>action.a==='pointer'||action.a==='keyboard';

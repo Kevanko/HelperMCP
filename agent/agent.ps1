@@ -1,4 +1,4 @@
-# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
+﻿# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
 #   [Net.ServicePointManager]::SecurityProtocol=3072; irm RELAY/h | iex
 $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session
 # Windows PowerShell 5.1 started from PowerShell 7 inherits a module path pointing at 7's modules and then fails to load even

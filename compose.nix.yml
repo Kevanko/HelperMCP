@@ -1,0 +1,23 @@
+services:
+  helpermcp:
+    build: .
+    image: helpermcp-nix:${HELPER_IMAGE_TAG:-local}
+    container_name: helpermcp-nix
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs: ["/tmp:size=64m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    ports: ["127.0.0.1:18444:8444"]
+    environment:
+      OPERATOR_KEY: ${OPERATOR_KEY:?required}
+      PUBLIC_URL: ${PUBLIC_URL:?required}
+      STATE_FILE: /data/state.json
+    volumes: ["./data:/data"]
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}

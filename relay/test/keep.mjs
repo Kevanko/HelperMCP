@@ -87,7 +87,18 @@ const log2 = JSON.parse((await call('session_log', { session: code })).text); as
 assert.match((await call('agent_log', { session: code })).text, /session .* (started|resumed)/); console.log('outage report + agent_log ok');
 
 // only a confirmed end removes it (the final bye the Esc menu sends)
+const exited = new Promise((resolve) => agent.once('exit', resolve));
+killAgent(agent);
+await exited;
 await post('/a/bye', { final: true }); await sleep(500);
 assert.equal((await sessions()).length, 0, 'the confirmed end removes the session');
+// The next launch must see the tombstone and clear its stale local state.
+// In particular it must neither retry HTTP 410 nor open a replacement session.
+agent = startAgent(true);
+await waitFor(() => agent.exitCode !== null, 'stale saved session exits on HTTP 410', 25000);
+assert.equal(agent.exitCode, 0, agentOut);
+assert.equal(fs.existsSync(sfile), false, 'ended session retained on disk');
+assert.equal((await sessions()).length, 0, 'restart recreated an ended session');
+console.log('Ended saved session is cleared after HTTP 410 PASS');
 console.log('ALL PASSED');
 stop(); fs.rmSync(STATE, { force: true }); process.exit(0);

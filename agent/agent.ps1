@@ -930,7 +930,6 @@ namespace F__BUILD__ {
     static readonly IWebProxy sp = WebRequest.GetSystemWebProxy();
     static Uri relay; static string host, lastIp, blockFile; static int port; static volatile bool on, forced, running;
     static DateTime ipUntil = DateTime.MinValue;
-    const int AltPort = 9444; static volatile bool alt;   // the relay is also served on 9444 next to the VPN front: when the provider filters 8444 the same TLS goes to 9444, chosen by the hop (the caller still says 8444)
     static volatile Hop cur; static Cand curC; static DateTime lastOk = DateTime.MinValue, since = DateTime.UtcNow; static int switches;
     public static readonly IWebProxy Proxy = new RP();
 
@@ -967,7 +966,6 @@ namespace F__BUILD__ {
         var first = ord[0]; foreach (var c in ord) if (c.Key == savedKey) first = c;   // the route that worked last time
         try {   // but never trust it blindly: every route is asked at once (up to 3 s), the saved one wins when it answers, otherwise the first that does. Starting on a dead route cost several "Connecting" rounds
           var res = ProbeAll(ord, 3000); Cand pick = null;
-          if (!Array.Exists(res, x => x > 0)) { var other = AtPort(ord, AltPort); var second = ProbeAll(other, 3000); if (Array.Exists(second, x => x > 0)) { ord = other; res = second; Emit("route", "relay port " + port + " does not answer on any route, using port " + AltPort); } }
           for (int i = 0; i < ord.Count; i++) if (res[i] > 0 && ord[i].Key == first.Key) pick = ord[i];
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
           if (pick != null) { if (pick.Key != first.Key) Emit("route", "start: " + first.Name + " does not reach the relay, using " + pick.Name); first = pick; }
@@ -1014,9 +1012,6 @@ namespace F__BUILD__ {
       return lastIp;
     }
     static bool FakeIp(IPAddress a) { var b = a.GetAddressBytes(); return b.Length == 4 && b[0] == 198 && (b[1] == 18 || b[1] == 19); }
-    static List<Cand> AtPort(List<Cand> input, int endpoint) {
-      var output = new List<Cand>(); foreach (var c in input) output.Add(new Cand { Key = c.Key, Name = c.Name, If = c.If, Vpn = c.Vpn, Sys = c.Sys, Endpoint = endpoint }); return output;
-    }
 
     // physical adapters (Ethernet before Wi-Fi), the default route, the system proxy, then VPN adapters; when the default route already leaves through a physical adapter it goes first
     static List<Cand> Order() {
@@ -1104,7 +1099,7 @@ namespace F__BUILD__ {
         var line = Encoding.ASCII.GetString(buf, 0, Math.Min(n, 400)).Split('\n')[0].Trim(); var p = line.Split(' ');
         if (p.Length < 2 || p[0] != "CONNECT") { Say(c, "HTTP/1.1 405 Method Not Allowed\r\n\r\n"); return; }
         int ci = p[1].LastIndexOf(':'); string th = p[1].Substring(0, ci); int tp = int.Parse(p[1].Substring(ci + 1));
-        if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || (tp != port && tp != AltPort)) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }   // not an open proxy: the relay and nothing else
+        if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || tp != port) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
         u = Dial(h, th, h.Endpoint); try { var address = ((IPEndPoint)u.RemoteEndPoint).Address; if (!FakeIp(address)) lastIp = address.ToString(); } catch { }
         Say(c, "HTTP/1.1 200 Connection established\r\n\r\n"); c.ReceiveTimeout = 0;
         lock (h.Conns) { h.Conns.Add(c); h.Conns.Add(u); }
@@ -1119,9 +1114,8 @@ namespace F__BUILD__ {
     static void CloseAll(Hop h) { lock (h.Conns) { foreach (var s in h.Conns.ToArray()) { try { s.Close(); } catch { } } h.Conns.Clear(); } }   // the old route may be a black hole: break what is stuck on it now
 
     static int Probe(Cand c, int ms) {
-      if (c.Endpoint == AltPort && c.Sys) return -1;
       try {
-        var rq = (HttpWebRequest)WebRequest.Create("https://" + host + ":" + port + "/health");
+        var rq = (HttpWebRequest)WebRequest.Create(new Uri(relay, "/helper/health"));
         rq.Proxy = c.Sys ? sp : new WebProxy("127.0.0.1", HopFor(c).Port); rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.AllowAutoRedirect = false; rq.ConnectionGroupName = Guid.NewGuid().ToString(); rq.UserAgent = "helpermcp-probe";
         var sw = System.Diagnostics.Stopwatch.StartNew();
         using (var r = (HttpWebResponse)rq.GetResponse()) {
@@ -1156,7 +1150,7 @@ namespace F__BUILD__ {
 
     static void Switch(Cand c, string why, bool tell) {
       Hop old; Cand oc;
-      lock (lk) { if (!running) return; old = cur; oc = curC; curC = c; cur = c.Sys ? null : HopFor(c); alt = c.Endpoint == AltPort; since = DateTime.UtcNow; switches++; }
+      lock (lk) { if (!running) return; old = cur; oc = curC; curC = c; cur = c.Sys ? null : HopFor(c); since = DateTime.UtcNow; switches++; }
       if (old != null && old != cur) CloseAll(old);
       lastOk = DateTime.UtcNow;
       if (tell) Emit("route", why + ": " + (oc != null ? oc.Name : "?") + " -> " + c.Name);
@@ -1210,14 +1204,12 @@ namespace F__BUILD__ {
           continue;
         }
         try {
-          var ord = AtPort(Order(), alt ? AltPort : port); var res = ProbeAll(ord, 4000); Cand pick = null;
+          var ord = Order(); var res = ProbeAll(ord, 4000); Cand pick = null;
           for (int i = 0; i < ord.Count && pick == null; i++) if (res[i] > 0) pick = ord[i];
-          if (pick == null) {   // nothing on this port: the provider may filter the port, not the connection. Try the other one (the link is down anyway, so flipping disturbs nothing)
-            var other = AtPort(ord, alt ? port : AltPort); var r2 = ProbeAll(other, 4000);
-            for (int i = 0; i < other.Count && pick == null; i++) if (r2[i] > 0) pick = other[i];
-            if (pick != null) { Switch(pick, "alternate relay endpoint passed TLS health check", true); continue; }
+          if (pick != null) {
+            if (c == null || pick.Key != c.Key) Switch(pick, "relay unreachable", true);
+            lastOk = DateTime.UtcNow;
           }
-          if (pick != null) Switch(pick, "relay unreachable", true);
           else if ((DateTime.UtcNow - failTold).TotalSeconds > 30) { failTold = DateTime.UtcNow; var sb = new StringBuilder(); for (int i = 0; i < ord.Count; i++) { string w; lock (why) why.TryGetValue(ord[i].Key, out w); sb.Append(ord[i].Name).Append(" FAIL").Append(w != null ? " (" + w + ")" : "").Append("; "); } Emit("route", "no route reaches the relay: " + sb + Port443()); }
         } catch (Exception e) { Emit("route", "route check failed: " + e.Message); }
       }
@@ -1225,14 +1217,14 @@ namespace F__BUILD__ {
 
     static void TryBetter() {   // back to a more preferred route once it works again
       try {
-        var ord = AtPort(Order(), alt ? AltPort : port); var c = curC; int at = ord.Count; for (int i = 0; i < ord.Count; i++) if (c != null && ord[i].Key == c.Key) at = i;
+        var ord = Order(); var c = curC; int at = ord.Count; for (int i = 0; i < ord.Count; i++) if (c != null && ord[i].Key == c.Key) at = i;
         if (at == 0 || at >= ord.Count) return;
         var better = ord.GetRange(0, at); var res = ProbeAll(better, 3500);
         for (int i = 0; i < better.Count; i++) if (res[i] > 0) { Switch(better[i], "preferred route works again", true); return; }
       } catch { }
     }
 
-    public static string Status() { lock (lk) { return on ? "via " + (curC != null ? curC.Name : "?") + (alt ? " (relay port " + AltPort + ")" : "") + " since " + since.ToLocalTime().ToString("HH:mm:ss") + ", " + (switches - 1) + " switch(es)" : "normal connection (route layer off)"; } }
+    public static string Status() { lock (lk) { return on ? "via " + (curC != null ? curC.Name : "?") + " since " + since.ToLocalTime().ToString("HH:mm:ss") + ", " + (switches - 1) + " switch(es)" : "normal connection (route layer off)"; } }
 
     // every adapter, with a relay check through each one that is up and has a gateway
     public static string Report(bool probe) {
@@ -1240,7 +1232,7 @@ namespace F__BUILD__ {
       try { var ip = RelayIp(); int bi; if (ip != null && GetBestInterface(BitConverter.ToUInt32(IPAddress.Parse(ip).GetAddressBytes(), 0), out bi) == 0) best = bi; } catch { }
       if (probe && relay != null && relay.Scheme == "https") {
         var cs = new List<Cand>(); var who = new List<Ad>();
-        foreach (var a in ads) if (a.Up && a.If > 0 && (a.Gw.Length > 0 || a.Vpn)) { cs.Add(new Cand { Key = "if" + a.If, Name = a.Name, If = a.If, Endpoint = alt ? AltPort : port }); who.Add(a); }
+        foreach (var a in ads) if (a.Up && a.If > 0 && (a.Gw.Length > 0 || a.Vpn)) { cs.Add(new Cand { Key = "if" + a.If, Name = a.Name, If = a.If }); who.Add(a); }
         var res = ProbeAll(cs, 4000); for (int i = 0; i < who.Count; i++) who[i].Ms = res[i];
       }
       var sb = new StringBuilder();
@@ -3576,7 +3568,13 @@ function Save-Session($code, $token, $mode) {   # the token is encrypted for thi
         $bytes = [Text.Encoding]::Unicode.GetBytes($token)
         try { $enc = [BitConverter]::ToString([Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)).Replace('-', '').ToLowerInvariant() }
         finally { [Array]::Clear($bytes, 0, $bytes.Length) }
-        @{ relay = $RELAY; code = $code; token = $enc; mode = $mode; boot = (Get-BootTime); saved = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json | Set-Content $SessionFile -Encoding UTF8
+        $pending = $SessionFile + '.' + [guid]::NewGuid().ToString('N') + '.pending'
+        try {
+            $session = @{ relay = $RELAY; code = $code; token = $enc; mode = $mode; boot = (Get-BootTime); saved = [int][DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json
+            [IO.File]::WriteAllText($pending, $session, (New-Object Text.UTF8Encoding $true))
+            if ([IO.File]::Exists($SessionFile)) { [IO.File]::Replace($pending, $SessionFile, [NullString]::Value) }
+            else { [IO.File]::Move($pending, $SessionFile) }
+        } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
         if ($env:HELPER_TOKEN_FILE) { Set-Content $env:HELPER_TOKEN_FILE $token -Encoding UTF8 -NoNewline }   # tests only: the plaintext token, so the harness need not re-decrypt DPAPI
     } catch { Write-AgentLog "cannot save the session: $_"; Write-Host (T 'Не удалось сохранить сеанс: автоматическое восстановление после закрытия не гарантируется.' 'Could not save session: recovery after closing is not guaranteed.') -ForegroundColor Yellow }
 }
@@ -3607,12 +3605,15 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
             [IO.File]::WriteAllText($pending, $copy, (New-Object Text.UTF8Encoding $true))
             if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
         } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
-        $cmd = '-NoProfile -ExecutionPolicy Bypass -File "' + $f + '"'
-        $tcmd = '/c if exist "' + $SessionFile + '" powershell.exe ' + $cmd   # the task only starts the helper while a kept session exists (a task made as administrator cannot be removed by a normal helper)
+        $scriptPath = "'" + $f.Replace("'", "''") + "'"
+        $savedPath = "'" + $SessionFile.Replace("'", "''") + "'"
+        $launch = 'if (Test-Path -LiteralPath ' + $savedPath + ') { & ' + $scriptPath + ' }'
+        $cmd = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch))
+        $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Admin) {   # started as administrator: from now on it also starts as administrator at logon (a task with the highest rights; the Run entry would start it twice, so it goes)
             try {
                 $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-                Register-ScheduledTask -TaskName 'HelperMCP' -Force -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $tcmd) -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) `
+                Register-ScheduledTask -TaskName 'HelperMCP' -Force -Action (New-ScheduledTaskAction -Execute $exe -Argument $cmd) -Trigger (New-ScheduledTaskTrigger -AtLogOn -User $me) `
                     -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest) `
                     -Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)) | Out-Null
                 Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
@@ -4000,10 +4001,16 @@ function Start-Helper {
     else { $script:Persist = $true }
     $note = ''
     if ($saved) { Write-Host ('  ' + (T 'Продолжаю прошлый сеанс ' 'Resuming the previous session ') + $saved.code) -ForegroundColor Yellow; $note = if ([Math]::Abs($saved.boot - (Get-BootTime)) -gt 90) { 'after a reboot' } else { 'restarted' }; Write-AgentLog "resuming session $($saved.code) ($note)" }
-    $wait = 1.0; $lastStartupFailure = ''
+    $wait = 1.0; $startupFailureShown = $false
     while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
         try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
         catch {
+            if ($saved -and [int]$_.Exception.Response.StatusCode -eq 410) {
+                Forget-Session
+                [F__BUILD__.Route]::Stop()
+                Write-Host (T 'Предыдущий сеанс завершён. Запустите Helper снова, чтобы начать новый.' 'The previous session has ended. Start Helper again to open a new session.') -ForegroundColor Yellow
+                return
+            }
             # Record error categories, never response bodies, session tokens or
             # request data. An endless "connecting" alone hides startup faults.
             $failure=$_.Exception.GetType().Name
@@ -4011,8 +4018,11 @@ function Start-Helper {
             if($errorId -match '^[A-Za-z][A-Za-z0-9_.-]{0,80}$'){$failure+='; '+$errorId}
             try{if($_.Exception.Response){$failure+='; HTTP '+[int]$_.Exception.Response.StatusCode}}catch{}
             try{if($_.Exception.Status){$failure+='; '+[string]$_.Exception.Status}}catch{}
-            if($failure -ne $lastStartupFailure){Write-AgentLog ('registration failed: '+$failure);Write-Host ('  '+$failure) -ForegroundColor Yellow;$lastStartupFailure=$failure}
-            Enable-VT; Write-Orange ('  ' + [char]0x25CC + ' ' + (T 'Подключаюсь к серверу…' 'Connecting to the server…'))
+            if (-not $startupFailureShown) {
+                $startupFailureShown = $true
+                Write-AgentLog ('registration retrying: ' + $failure)
+                Write-Orange (T 'Сервер пока не ответил. Helper повторит подключение автоматически.' 'Connection failed. Helper will retry automatically.')
+            }
             Start-Sleep -Milliseconds ([int]([Math]::Min($wait, 10.0) * 1000)); $wait *= 1.7
         }
     }
@@ -4047,7 +4057,7 @@ function Start-Helper {
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); $script:FinalEnd = $true; return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
-                            $r = Register-Agent $mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $mode }; Write-AgentLog 'registered again after the relay lost its state'
+                            $r = Register-Agent $script:Mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $script:Mode }; Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }

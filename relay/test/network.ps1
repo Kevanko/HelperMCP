@@ -31,8 +31,12 @@ public class NetFixture : IDisposable {
         if (mode == "close") return;
         if (mode == "relay") {
           using (var tls = new SslStream(c.GetStream())) {
-            tls.AuthenticateAsServer(Certificate, false, System.Security.Authentication.SslProtocols.Tls12, false); tls.ReadTimeout = 2000; var req = new byte[8192]; tls.Read(req, 0, req.Length);
-            var response = Encoding.ASCII.GetBytes("HTTP/1.1 " + (Healthy ? "200 OK" : "503 Unavailable") + "\r\nContent-Length: 2\r\nConnection: close\r\n\r\n" + (ValidHealth ? "ok" : "NO")); tls.Write(response, 0, response.Length);
+            tls.AuthenticateAsServer(Certificate, false, System.Security.Authentication.SslProtocols.Tls12, false);
+            tls.ReadTimeout = 2000;
+            var requestLine = new System.IO.StreamReader(tls, Encoding.ASCII).ReadLine();
+            var status = requestLine.StartsWith("GET /helper/health ") ? (Healthy ? "200 OK" : "503 Unavailable") : "404 Not Found";
+            var response = Encoding.ASCII.GetBytes("HTTP/1.1 " + status + "\r\nContent-Length: 2\r\nConnection: close\r\n\r\n" + (ValidHealth ? "ok" : "NO"));
+            tls.Write(response, 0, response.Length);
           }
           return;
         }
@@ -141,10 +145,8 @@ try{
  Write-Output 'Native relay API GET/POST and complete response disposal PASS'
 }finally{$apiFixture.Dispose()}
 $primary = New-Object NetFixture 'relay'
-$backup = $null
 try {
-    $backup = New-Object NetFixture 'relay',9444
-    [NetFixture]::TrustFixtures($primary.Certificate, $backup.Certificate)
+    [NetFixture]::TrustFixtures($primary.Certificate, $primary.Certificate)
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     # .NET bypasses proxies for literal loopback URLs. Use an unresolvable test
     # hostname and inject only its cached address, without touching hosts/DNS.
@@ -152,25 +154,20 @@ try {
     [FRouteQa.Route].GetField('lastIp', $flags).SetValue($null, '127.0.0.1')
     [FRouteQa.Route].GetField('ipUntil', $flags).SetValue($null, [DateTime]::MaxValue)
     [FRouteQa.Route]::Init("https://fixture.helper.test:$($primary.Port)", '', $null)
-    Assert ([FRouteQa.Route]::Status() -notmatch 'relay port 9444') 'unexpected startup fallback'
-    $primary.Healthy = $false
-    [FRouteQa.Route]::Streaming = $true
-    [FRouteQa.Route]::Failed()
-    $until = [DateTime]::UtcNow.AddSeconds(25)
-    while ([FRouteQa.Route]::Status() -notmatch 'relay port 9444' -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
-    Assert ([FRouteQa.Route]::Status() -match 'relay port 9444') ('did not recover onto validated alternate TLS endpoint: ' + [FRouteQa.Route]::Status() + '; ' + ([FRouteQa.Route]::Drain() -join ' | '))
     $type = [FRouteQa.Route]; $flags = [Reflection.BindingFlags]'NonPublic,Static'
     $candidateType = $type.GetNestedType('Cand', [Reflection.BindingFlags]'NonPublic')
     $candidate = [Activator]::CreateInstance($candidateType, $true)
     $candidate.Key = 'def'; $candidate.Name = 'test primary'; $candidate.Endpoint = $primary.Port
     $oldProxy = [FRouteQa.Route]::Proxy.GetProxy([Uri]"https://fixture.helper.test:$($primary.Port)").Port
-    $primary.Healthy = $true
     $probe = $type.GetMethod('Probe', $flags).Invoke($null, @($candidate, 2000))
-    Assert ($probe -gt 0) 'primary fixture did not recover'
+    Assert ($probe -gt 0) 'relay health must use the exposed /helper/health path'
+    $primary.Healthy = $false
+    Assert ($type.GetMethod('Probe', $flags).Invoke($null, @($candidate, 2000)) -lt 0) 'failed health was treated as available'
+    $primary.Healthy = $true
     $primary.ValidHealth = $false
     Assert ($type.GetMethod('Probe', $flags).Invoke($null, @($candidate, 2000)) -lt 0) 'unrelated HTTP 200 mistaken for relay health'
     $newProxy = [FRouteQa.Route]::Proxy.GetProxy([Uri]"https://fixture.helper.test:$($primary.Port)").Port
-    Assert ($oldProxy -eq $newProxy -and [FRouteQa.Route]::Status() -match 'relay port 9444') 'a diagnostic probe changed the active relay endpoint'
+    Assert ($oldProxy -eq $newProxy) 'a diagnostic probe changed the active relay route'
     [FRouteQa.Route]::Stop()
     Assert ([FRouteQa.Route]::Status() -eq 'normal connection (route layer off)') 'route did not stop'
     $closed = New-Object Net.Sockets.TcpClient
@@ -186,9 +183,9 @@ try {
     function Restart-NetAdapter { throw 'physical adapter reset attempted' }
     function ipconfig { throw 'shared DNS cache mutation attempted' }
     foreach ($cause in 'dns','no_link','lan_down','isp_down','relay_unreachable_vpn') { Heal-Net @{ class = $cause } | Out-Null }
-    Write-Output 'route TLS fallback, non-mutating probes, stopped listener, recovery without adapter/DNS reset PASS'
+    Write-Output 'public relay health path, non-mutating TLS probes, stopped listener, recovery without adapter/DNS reset PASS'
 } finally {
-    $primary.Dispose(); if ($backup) { $backup.Dispose() }
+    $primary.Dispose()
     [Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 }
 

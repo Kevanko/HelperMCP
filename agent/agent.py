@@ -2423,6 +2423,7 @@ def main():
     elif persist in ("0", "1"): PERSIST["on"] = persist == "1"   # tests / an explicit opt-out only: otherwise the session is always kept
     else: PERSIST["on"] = True
     wait = 1.0
+    reported = False
     note = ""
     if saved:
         print(c("33", "  " + t("resuming") + " " + saved["code"]), flush=True)
@@ -2431,7 +2432,19 @@ def main():
     while True:   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
         try: reg = register(mode, saved["code"], saved["token"], note) if saved else register(mode); break
         except Exception as e:
-            print(c(ORANGE, "  ◌ " + t("st_conn") + f" ({type(e).__name__})"), flush=True); log(f"cannot reach the relay at start: {type(e).__name__}"); time.sleep(min(wait, 10.0)); wait *= 1.7
+            if saved and isinstance(e, urllib.error.HTTPError) and e.code == 410:
+                e.close()
+                forget_session()
+                print("Предыдущий сеанс завершён. Запустите Helper снова." if RU else "The previous session has ended. Start Helper again.", flush=True)
+                return
+            if not reported:
+                print(c(ORANGE, "  ◌ " + t("st_conn")), flush=True)
+                log(f"registration retrying: {type(e).__name__}" + (f"; HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else ""))
+                reported = True
+            if isinstance(e, urllib.error.HTTPError):
+                e.close()
+            time.sleep(min(wait, 10.0))
+            wait *= 1.7
     token = TOKEN = reg["token"]; code = CODE["c"] = reg["code"]; LAST_OK[0] = time.time()
     if PERSIST["on"]:
         save_session(code, token, MODE["m"])

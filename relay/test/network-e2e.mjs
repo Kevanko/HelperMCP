@@ -32,6 +32,7 @@ try {
   const encoded = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(launcher)[1];
   const ps = Buffer.from(encoded, 'base64').toString('utf16le');
   assert.match(ps, /TimeoutSec 12/); assert.match(ps, /startup failed/);
+  assert.ok(ps.includes(base + '/h') && !ps.includes('9444'), 'launcher must use the configured endpoint only');
   const agent = spawn('powershell', ['-NoProfile', '-Command', `irm ${base}/h | iex`], { env: {
     ...process.env, HELPER_MODE: 'full', HELPER_STATE_DIR: path.join(temp, 'agent'), HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1',
   } }); kids.push(agent);

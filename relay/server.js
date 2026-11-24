@@ -886,14 +886,11 @@ function landing(req, res) {
 }
 
 function launcherCmd(b) {
-  const urls = [b + '/h'];
-  const alternate = new URL(b);
-  if (alternate.protocol === 'https:' && alternate.port !== '9444') { alternate.port = '9444'; urls.push(alternate.href.replace(/\/$/, '') + '/h'); }
-  const choices = urls.map((u) => `'${u.replaceAll("'", "''")}'`).join(',');
-  const ps = `$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=3072; try { $source=$null; foreach($url in @(${choices})) { try { Write-Host ('Connecting: '+$url); $source=Invoke-RestMethod $url -TimeoutSec 12; break } catch { Write-Host ('Download failed: '+$_.Exception.Message) -ForegroundColor Yellow } }; if(-not $source) { throw 'Helper could not be downloaded from either HTTPS endpoint. Check the address, TLS and network access.' }; Invoke-Expression $source } catch { Write-Host ('Helper startup failed: '+$_.Exception.Message) -ForegroundColor Red; exit 1 }`;
+  const url = (b + '/h').replaceAll("'", "''");
+  const ps = `$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol=3072; try { $source=Invoke-RestMethod '${url}' -TimeoutSec 12; if(-not $source) { throw 'The Helper download was empty.' }; Invoke-Expression $source } catch { Write-Host ('Helper startup failed: '+$_.Exception.Message) -ForegroundColor Red; exit 1 }`;
   // EncodedCommand prevents cmd.exe metacharacters/Unicode in the generated URL
-  // from becoming shell syntax. TLS verification stays enabled on both attempts.
-  const lines = ['@echo off', 'title Remote help', `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(ps, 'utf16le').toString('base64')}`, 'pause'];
+  // from becoming shell syntax. TLS verification stays enabled.
+  const lines = ['@echo off', 'title Remote help', `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(ps, 'utf16le').toString('base64')}`, 'if errorlevel 1 pause'];
   return lines.join('\r\n') + '\r\n';
 }
 
@@ -1112,7 +1109,7 @@ async function handler(req, res) {
     res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('referrer-policy', 'no-referrer'); res.setHeader('strict-transport-security', 'max-age=31536000');
     res.setHeader('content-security-policy', "default-src 'none'; img-src 'self' data: blob:; style-src 'unsafe-inline' 'self'; script-src 'unsafe-inline' 'self'; connect-src 'self'; frame-ancestors 'none'");
     if (await adminHandle(req, res, url)) return;
-    if (p === '/health') return text(res, 200, 'ok');
+    if (p === '/health' || p === '/helper/health') return text(res, 200, 'ok');
     if (p === '/logo.svg' || p === '/favicon.svg' || p === '/favicon.ico') { res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' }); return res.end(fs.readFileSync(path.join(here, 'logo.svg'))); }
     if (p === '/assets/panels.js' || p === '/assets/panels.css' || p === '/assets/viewer-control.js') {   // viewer controls and System / Files drawer
       const f = path.join(here, p.slice(8));

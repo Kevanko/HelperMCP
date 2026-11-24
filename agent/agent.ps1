@@ -4113,7 +4113,21 @@ function Start-Helper {
         }
     }
     $token = $r.token; $script:Token = $token; $code = $script:Code = $r.code
-    if ($script:Persist) { Save-Session $code $token $mode; if (-not $saved) { Install-Autostart } elseif (-not $env:HELPER_NO_AUTOSTART) { try { $af = Join-Path $StateDir 'agent.ps1'; if (-not (Test-Path $af) -or -not [IO.File]::ReadAllText($af).Contains('namespace F__BUILD__ {') -or ((Get-Date) - (Get-Item $af).LastWriteTime).TotalHours -gt 24) { Install-Autostart } } catch { Write-AgentLog ('autostart refresh: '+$_.Exception.GetType().Name) } } }
+    if ($script:Persist) {
+        Save-Session $code $token $mode
+        if (-not $env:HELPER_NO_AUTOSTART -and $script:Preferences.startup) {
+            try {
+                $af = Join-Path $StateDir 'agent.ps1'
+                $task = Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue
+                $run = (Get-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue).HelperMCP
+                if ($task.State -ne 'Disabled' -and (-not $saved -or (-not $task -and -not $run) -or
+                    -not (Test-Path -LiteralPath $af) -or -not [IO.File]::ReadAllText($af).Contains('namespace F__BUILD__ {') -or
+                    ((Get-Date) - (Get-Item -LiteralPath $af).LastWriteTime).TotalHours -gt 24)) {
+                    Install-Autostart
+                }
+            } catch { Write-AgentLog ('autostart refresh: ' + $_.Exception.GetType().Name) }
+        }
+    }
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied

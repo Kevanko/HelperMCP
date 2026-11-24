@@ -10,6 +10,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createAdmin } from '../admin.mjs';
 import WebSocket from 'ws';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'hm-control-'));
@@ -110,6 +112,19 @@ try {
   assert.deepEqual(sent.args,{op:'start',template:'guard-selftest',interface_index:14},'viewer forwarded unapproved mutation fields');
   assert.equal((await post(viewer+'/network',{kind:'rollback',job},CH)).status,200);
   assert.equal((await post(viewer+'/takeover',{on:true},CH)).status,200);
+  // A viewer owns input on the first desktop while both agents remain observable.
+  const observers = [new Client({ name: 'observer-one', version: '0' }), new Client({ name: 'observer-two', version: '0' })];
+  try {
+    await Promise.all(observers.map((observer) => observer.connect(new StreamableHTTPClientTransport(new URL(base+'/mcp'), {
+      requestInit: { headers: { Authorization: 'Bearer control-fixture-only' } },
+    }))));
+    const [one, two] = await Promise.all(observers.map((observer, i) =>
+      observer.callTool({ name: 'sysinfo', arguments: { session: [first.code, second.code][i] } })));
+    assert.ok(!one.isError && !two.isError, 'parallel read-only calls were blocked by manual input');
+    const mutation = await observers[0].callTool({ name: 'press_key', arguments: { session: first.code, keys: 'enter' } });
+    assert.equal(mutation.isError, true, 'bot input collided with manual control');
+    assert.match(mutation.content[0].text, /TAKEOVER/);
+  } finally { await Promise.all(observers.map((observer) => observer.close())); }
   const upload=await fetch(viewer+'/upload?drop=1&name='+encodeURIComponent('../Тестовый файл.txt'),{method:'POST',headers:CH,body:'private fixture content'});
   assert.equal(upload.status,200);
   const copied=commands.find(c=>c.tool==='push_file');assert.equal(copied.args.path,'~/Downloads/Helper Transfers/Тестовый файл.txt');assert.equal(copied.args.unique,true);

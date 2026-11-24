@@ -157,7 +157,7 @@ try {
     $type = [FRouteQa.Route]; $flags = [Reflection.BindingFlags]'NonPublic,Static'
     $candidateType = $type.GetNestedType('Cand', [Reflection.BindingFlags]'NonPublic')
     $candidate = [Activator]::CreateInstance($candidateType, $true)
-    $candidate.Key = 'def'; $candidate.Name = 'test primary'; $candidate.Endpoint = $primary.Port
+    $candidate.Key = 'def'; $candidate.Name = 'test primary'
     $oldProxy = [FRouteQa.Route]::Proxy.GetProxy([Uri]"https://fixture.helper.test:$($primary.Port)").Port
     $probe = $type.GetMethod('Probe', $flags).Invoke($null, @($candidate, 2000))
     Assert ($probe -gt 0) 'relay health must use the exposed /helper/health path'

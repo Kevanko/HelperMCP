@@ -1,4 +1,4 @@
-﻿# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
+# HelperMCP agent for Windows 10/11 (PowerShell 5.1+). Runs in memory, installs nothing.
 #   [Net.ServicePointManager]::SecurityProtocol=3072; irm RELAY/h | iex
 $prevEAP = $ErrorActionPreference; $ErrorActionPreference = 'Stop'  # restored at the end: iex runs in the user's session
 # Windows PowerShell 5.1 started from PowerShell 7 inherits a module path pointing at 7's modules and then fails to load even
@@ -919,8 +919,8 @@ namespace F__BUILD__ {
     static readonly Regex VpnRx = new Regex("TAP-|TUN|WireGuard|Wintun|VPN|Meta Tunnel|Tailscale|ZeroTier|Hamachi|Cisco|Fortinet|NordLynx|Clash|sing-box|Amnezia|Outline|WARP|Proton|Mullvad|OpenVPN|Radmin|PANGP|GlobalProtect|Npcap", RegexOptions.IgnoreCase);
     static readonly Regex VirtRx = new Regex("Hyper-V|VirtualBox|VMware|vEthernet|WSL|Virtual Adapter|Bluetooth|Teredo|ISATAP|6to4|Pseudo", RegexOptions.IgnoreCase);
     public class Ad { public int If; public string Name = "", Desc = "", Kind = "", Mac = "", Ips = "", Gw = "", Dns = ""; public bool Up, Vpn, Virt, Eth, Dhcp; public long Speed; public int Ms = -2; }
-    class Cand { public string Key, Name; public int If, Endpoint; public bool Vpn, Sys; }
-    class Hop { public string Key; public int If; public int Port, Endpoint; public TcpListener L; public readonly List<Socket> Conns = new List<Socket>(); }
+    class Cand { public string Key, Name; public int If; public bool Vpn, Sys; }
+    class Hop { public string Key; public int If, Port; public TcpListener L; public readonly List<Socket> Conns = new List<Socket>(); }
 
     static readonly Dictionary<string, Hop> hops = new Dictionary<string, Hop>();
     static readonly object lk = new object();
@@ -1030,9 +1030,9 @@ namespace F__BUILD__ {
     static Hop HopFor(Cand c) {
       lock (lk) {
         if (!running) throw new IOException("route transport stopped");
-        int endpoint = c.Endpoint > 0 ? c.Endpoint : port; string key = c.Key + ":" + endpoint;
+        string key = c.Key;
         Hop h; if (hops.TryGetValue(key, out h)) return h;
-        var l = new TcpListener(IPAddress.Loopback, 0); l.Start(); h = new Hop { Key = c.Key, If = c.If, Endpoint = endpoint, L = l, Port = ((IPEndPoint)l.LocalEndpoint).Port }; hops[key] = h;
+        var l = new TcpListener(IPAddress.Loopback, 0); l.Start(); h = new Hop { Key = c.Key, If = c.If, L = l, Port = ((IPEndPoint)l.LocalEndpoint).Port }; hops[key] = h;
         var hh = h; new Thread(() => { while (true) { Socket s; try { s = hh.L.AcceptSocket(); } catch { return; } ThreadPool.QueueUserWorkItem(_ => Handle(hh, s)); } }) { IsBackground = true }.Start();
         return h;
       }
@@ -1100,7 +1100,7 @@ namespace F__BUILD__ {
         if (p.Length < 2 || p[0] != "CONNECT") { Say(c, "HTTP/1.1 405 Method Not Allowed\r\n\r\n"); return; }
         int ci = p[1].LastIndexOf(':'); string th = p[1].Substring(0, ci); int tp = int.Parse(p[1].Substring(ci + 1));
         if (!string.Equals(th, host, StringComparison.OrdinalIgnoreCase) || tp != port) { Say(c, "HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
-        u = Dial(h, th, h.Endpoint); try { var address = ((IPEndPoint)u.RemoteEndPoint).Address; if (!FakeIp(address)) lastIp = address.ToString(); } catch { }
+        u = Dial(h, th, port); try { var address = ((IPEndPoint)u.RemoteEndPoint).Address; if (!FakeIp(address)) lastIp = address.ToString(); } catch { }
         Say(c, "HTTP/1.1 200 Connection established\r\n\r\n"); c.ReceiveTimeout = 0;
         lock (h.Conns) { h.Conns.Add(c); h.Conns.Add(u); }
         var uu = u; new Thread(() => Pump(uu, c)) { IsBackground = true }.Start(); Pump(c, u);
@@ -1260,12 +1260,14 @@ namespace F__BUILD__ {
 Add-Type -TypeDefinition @"
 using System; using System.Collections.Concurrent; using System.Threading; using System.IO; using System.Net;
 namespace K__BUILD__ {
-  public static class Keys {   // one reader for the keyboard: Esc opens a menu (pause / continue / end), the other keys answer the questions
+  public static class Keys {
     static volatile bool reading;
     static Thread reader;
     public static ConcurrentQueue<ConsoleKey> Q = new ConcurrentQueue<ConsoleKey>();
     public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk, Unattended;      // Esc = the user confirmed the end; Unattended = mode 3, Esc pauses instead of opening the end menu
-    public static string Relay, Token, MenuRun, MenuPaused, ConfirmEnd, StPaused, StRestore, Continuing;
+    public static string Relay, Token, ConfirmEnd, StPaused, StRestore, Continuing;
+    public static string[] MenuLabels;
+    public static volatile int MenuAction;
     public static System.IO.StreamWriter Overlay;
     static string C(string code, string s) { return VT ? "\u001b[" + code + "m" + s + "\u001b[0m" : s; }
     static void Say(string s) { try { Console.WriteLine(s); } catch { } }
@@ -1292,23 +1294,34 @@ namespace K__BUILD__ {
       Paused = on; Post("/a/state", on ? "{\"paused\":true}" : "{\"paused\":false}"); Ov(on ? "state paused" : (OpSeen ? "state ok" : "state wait"));
       if (on) { Status(StPaused, false); Say(C("38;5;208", "  || " + StPaused)); } else { Status(StRestore, StRestoreOk); Say(C("32", "  \u25B6 " + Continuing)); }
     }
-    static void Menu() {
-      Say(""); Say(C("1;30;43", "  " + (Paused ? MenuPaused : MenuRun) + "  "));
+    public static int Choose(string[] labels) {
+      int selected = 0;
       while (true) {
-        if (!reading) return;
-        if (!Console.KeyAvailable) { Thread.Sleep(20); continue; }
-        var k = Console.ReadKey(true).Key;
-        if (k == ConsoleKey.P && !Paused) { SetPaused(true); return; }
-        if (k == ConsoleKey.R && Paused) { SetPaused(false); return; }
-        if (k == ConsoleKey.X) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(C("1;30;43", "  " + ConfirmEnd + "  ")); return; }   // X ends the session at once, no second question (the user asked for a clean exit); Esc + X is already two deliberate keys
-        if (k == ConsoleKey.B || k == ConsoleKey.Backspace || k == ConsoleKey.Escape) return;   // close the menu: Esc opens it and Esc (or B) closes it, the natural thing; X is the only key that ends, so a stray Esc never does
+        Console.Write("\r" + C("1;30;43", Row("< " + labels[selected] + " >", null)));
+        ConsoleKey key;
+        while (!Console.KeyAvailable) { if (Thread.CurrentThread == reader && !reading) return -1; Thread.Sleep(30); }
+        key = Console.ReadKey(true).Key;
+        if (key == ConsoleKey.UpArrow || key == ConsoleKey.LeftArrow) selected = (selected + labels.Length - 1) % labels.Length;
+        if (key == ConsoleKey.DownArrow || key == ConsoleKey.RightArrow) selected = (selected + 1) % labels.Length;
+        if (key >= ConsoleKey.D1 && key <= ConsoleKey.D9 && key - ConsoleKey.D1 < labels.Length) {
+          Console.WriteLine(); return key - ConsoleKey.D1;
+        }
+        if (key == ConsoleKey.Enter || key == ConsoleKey.Spacebar) { Console.WriteLine(); return selected; }
+        if (key == ConsoleKey.Escape || key == ConsoleKey.Backspace) { Console.WriteLine(); return -1; }
       }
+    }
+    static void Menu() {
+      Say("");
+      int choice = Choose(MenuLabels);
+      if (choice < 0) return;
+      if (choice == 4) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(ConfirmEnd); }
+      else if (choice != 0) MenuAction = choice;
     }
     public static void Start() {
       if (reader != null && reader.IsAlive) return;
       reading = true; Esc = false; Final = false; Paused = false;
       ConsoleKey discarded; while (Q.TryDequeue(out discarded)) { }
-      reader = new Thread(() => { try { while (reading) { if (!Console.KeyAvailable) { Thread.Sleep(20); continue; } var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) { if (Unattended) SetPaused(!Paused); else Menu(); } else Q.Enqueue(k.Key); } } catch { } });
+      reader = new Thread(() => { try { while (reading) { if (!Console.KeyAvailable) { Thread.Sleep(20); continue; } var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) Menu(); else Q.Enqueue(k.Key); } } catch { } });
       reader.IsBackground = true; reader.Start();
     }
     public static void Stop() { reading = false; if (reader != null && reader != Thread.CurrentThread) reader.Join(1000); }
@@ -3539,6 +3552,14 @@ $script:OperatorSeen = $false; $script:HdrDrawn = $false
 # ---- keeping the session: local state, autostart, a log, network diagnosis and one repair attempt
 $StateDir = if ($env:HELPER_STATE_DIR) { $env:HELPER_STATE_DIR } else { Join-Path $env:APPDATA 'HelperMCP' }
 $SessionFile = Join-Path $StateDir 'session.json'; $LogFile = Join-Path $StateDir 'agent.log'; $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$PreferencesFile = Join-Path $StateDir 'preferences.json'
+$script:Preferences = @{ startup = $true; quiet = $false }
+try {
+    $stored = [IO.File]::ReadAllText($PreferencesFile) | ConvertFrom-Json
+    foreach ($key in 'startup','quiet') {
+        if ($stored.$key -is [bool]) { $script:Preferences[$key] = $stored.$key }
+    }
+} catch { }
 $script:Persist = $false; $script:FinalEnd = $false
 function Write-AgentLog($m) {
     try {
@@ -3592,6 +3613,7 @@ function Load-Session {
 }
 function Install-Autostart {   # after a reboot the helper starts again by itself, in a visible window, and resumes the same session
     if ($env:HELPER_NO_AUTOSTART) { return }
+    if ($script:Preferences -and -not $script:Preferences.startup) { return }
     try {
         [void](New-Item $StateDir -ItemType Directory -Force)
         $f = Join-Path $StateDir 'agent.ps1'
@@ -3606,7 +3628,7 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
         } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
         $scriptPath = "'" + $f.Replace("'", "''") + "'"
         $savedPath = "'" + $SessionFile.Replace("'", "''") + "'"
-        $launch = 'if (Test-Path -LiteralPath ' + $savedPath + ') { & ' + $scriptPath + ' }'
+        $launch = 'if (Test-Path -LiteralPath ' + $savedPath + ') { $env:HELPER_LOGON = ''1''; & ' + $scriptPath + ' }'
         $cmd = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch))
         $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Admin) {   # started as administrator: from now on it also starts as administrator at logon (a task with the highest rights; the Run entry would start it twice, so it goes)
@@ -3629,6 +3651,38 @@ function Forget-Session {
     try { Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }
     try { if (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction Stop } } catch { Write-AgentLog "cannot remove the logon task (needs administrator): $_" }
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
+}
+function Set-ConsoleMenu {
+    $startup = if ($script:Preferences.startup) { T 'Автозапуск включён' 'Autostart on' } else { T 'Автозапуск выключен' 'Autostart off' }
+    $quiet = if ($script:Preferences.quiet) { T 'Тихий режим включён' 'Quiet mode on' } else { T 'Тихий режим выключен' 'Quiet mode off' }
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet, (T 'Завершить сеанс' 'End session'))
+}
+function Read-ConsoleMenu {
+    $choice = [K__BUILD__.Keys]::MenuAction
+    if (-not $choice) { return }
+    [K__BUILD__.Keys]::MenuAction = 0
+    if ($choice -eq 1) {
+        Write-Host ((Do-AgentLog @{ lines = 18 }).text) -ForegroundColor DarkCyan
+        return
+    }
+    $key = if ($choice -eq 2) { 'startup' } else { 'quiet' }
+    $script:Preferences[$key] = -not $script:Preferences[$key]
+    try {
+        [void](New-Item -ItemType Directory -Path $StateDir -Force)
+        $script:Preferences | ConvertTo-Json | Set-Content -LiteralPath $PreferencesFile -Encoding UTF8
+        if ($key -eq 'startup') {
+            if ($script:Preferences.startup) { Install-Autostart }
+            else {
+                Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
+                if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
+            }
+        }
+        Set-ConsoleMenu
+        Write-Host ([K__BUILD__.Keys]::MenuLabels[$choice]) -ForegroundColor Green
+    } catch {
+        Write-AgentLog ('could not save console preferences: ' + $_.Exception.GetType().Name)
+        Write-Orange (T 'Не удалось сохранить настройку.' 'Could not save the setting.')
+    }
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
 $NetToolsRx = '^(winws|winwear|zapret|goodbyedpi|happ|incy|koala|clash|mihomo|verge|v2ray|xray|sing-box|nekoray|nekobox|v2rayn|hiddify|openvpn|wireguard|wg|tailscale|zerotier|hamachi|nordvpn|expressvpn|protonvpn|warp-svc|cloudflared|amnezia|outline|shadowsocks|windscribe|surfshark|forticlient|vpnui|pangps|fiddler|charles|mitmproxy|wireshark|dumpcap|privoxy|proxifier|netmod|psiphon|lantern)'
@@ -3721,7 +3775,7 @@ function Draw-Header($code, $copied) {
         $k::Row('Tell this code to the person who is helping you.', '33'),
         $k::Row(('Mode: ' + $(switch ($script:Mode) { 'unattended' { 'unattended access' } 'auto' { 'auto, no questions' } default { 'ask before every action' } }) + '   |   Server: ' + $relayHost), '2;33'),
         $k::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })),
-        $k::Row($(if ($script:Mode -eq 'unattended') { 'Press Esc at any time to pause. Only the administrator ends this session.' } else { 'Press Esc at any time to pause or end the session.' }), '33'),
+        $k::Row($(if ($script:Mode -eq 'unattended') { 'Esc: menu · arrows to select · Enter to apply' } else { 'Esc: menu · arrows to select · Enter to apply' }), '33'),
         $k::Bottom())
     foreach ($l in $lines) { if ($script:VT) { [Console]::WriteLine($l) } else { Write-Host $l -ForegroundColor Yellow } }
     $script:HdrDrawn = $true
@@ -3925,7 +3979,7 @@ function Process-Command($cmd) {
             if ($first) { Write-Host ('  ' + [char]0x25CF + ' ' + (T 'Помощник подключён' 'Helper connected')) -ForegroundColor Green }
         }
     }
-    if (-not $viewFrame -and -not $meta -and $name -ne 'viewer_pointer') { Say-Step $name $a }
+    if (-not $script:Preferences.quiet -and -not $viewFrame -and -not $meta -and $name -ne 'viewer_pointer') { Say-Step $name $a }
     $res = @{ id = $cmd.id }
     $pointerRelease = $name -eq 'viewer_pointer' -and $a.op -in 'release','cancel','kcancel'
     $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame -or $name -eq 'viewer_pointer'; if (-not $quietCall) { Overlay-Send 'busy' }
@@ -3945,7 +3999,7 @@ function Process-Command($cmd) {
         if (-not $manualInput) { Mark-State $name }
     } catch { $ex = $_.Exception; while ($ex -is [Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }; $res.ok = $false; $res.error = $ex.Message }   # a C# helper's own message, not "Exception calling ..."
     if (-not $quietCall) { Overlay-Send 'idle' }
-    if (-not $quietCall) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
+    if (-not $script:Preferences.quiet -and -not $quietCall) { if ($res.ok) { Write-Host ('     ' + [char]0x221A + ' ' + (T 'готово' 'done')) -ForegroundColor Green } else { Write-Host ('     x ' + (Cut $res.error 120)) -ForegroundColor Red } }
     for ($attempt = 0; $attempt -lt 5; $attempt++) {   # a lost result would leave the operator waiting for a call that already finished
         try { Post-Result $res $script:Token; break }
         catch { $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc -eq 401 -or $sc -eq 410) { break }; Start-Sleep (1 + $attempt) }
@@ -3986,11 +4040,20 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
 
 function Start-Helper {
     $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
+    if ($env:HELPER_LOGON -and (-not $saved -or -not $script:Preferences.startup)) { return }
     $mode = Norm-Mode $env:HELPER_MODE
     if ($saved -and (Norm-Mode $saved.mode)) { $mode = Norm-Mode $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
     elseif (-not $mode) {
-        $ans = Read-Host (T 'Режим: [1] спрашивать про каждое действие (рекомендуется)  [2] авто, без вопросов  [3] постоянный доступ (Esc только ставит на паузу, завершить может только админ)' 'Mode: [1] ask before every action (recommended)  [2] auto, no questions  [3] unattended (Esc only pauses, only the admin ends it)')
-        $mode = switch ($ans.Trim()) { '2' { 'auto' } '3' { 'unattended' } default { 'confirm' } }
+        $prompt = T 'Режим помощи · стрелки, Enter, Esc' 'Access mode · arrows, Enter, Esc'
+        if ([Console]::IsInputRedirected) { $choice = -1; $answer = Read-Host '[1] Confirm  [2] Auto  [3] Unattended'; if ($answer -match '^[1-3]$') { $choice = [int]$answer - 1 } }
+        else {
+            Enable-VT
+            [K__BUILD__.Keys]::VT = $script:VT
+            Write-Host $prompt -ForegroundColor Cyan
+            $choice = [K__BUILD__.Keys]::Choose(@((T '1 · Подтверждать действия' '1 · Confirm actions'), (T '2 · Авто для этого сеанса' '2 · Auto for this session'), (T '3 · Постоянный доступ' '3 · Unattended access')))
+        }
+        if ($choice -lt 0) { return }
+        $mode = @('confirm','auto','unattended')[$choice]
     }
     $script:Mode = $mode; [K__BUILD__.Keys]::Unattended = ($mode -eq 'unattended')
     try { [F__BUILD__.Route]::Init($RELAY, $(try { (Get-Content (Join-Path $StateDir 'route.txt') -ErrorAction Stop | Select-Object -First 1) } catch { '' }), (Join-Path $StateDir 'route.block')); [Net.WebRequest]::DefaultWebProxy = [F__BUILD__.Route]::Proxy } catch { Write-AgentLog "route layer: $_" }   # the link to the relay survives a VPN, zapret or a dead default route
@@ -4029,13 +4092,13 @@ function Start-Helper {
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
     $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
     Enable-VT; Draw-Header $code $copied
+    Set-ConsoleMenu
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound;if($null -ne $r.look.banner){$script:BannerOn=[bool]$r.look.banner};if($null -ne $r.look.timer){$script:TimerOn=[bool]$r.look.timer} }
     Play-Sound 'ok'
     Start-Overlay
     Overlay-Send 'state wait'; if ($script:GlowOn) { Overlay-Send 'glow 1' };Overlay-Send ('banner '+[int]$script:BannerOn);Overlay-Send ('timer '+[int]$script:TimerOn)
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
-    $k::MenuRun = (T 'Меню:  [P] пауза    [X] выход (сразу)    [Esc] закрыть меню' 'Menu:  [P] pause    [X] exit (now)    [Esc] close the menu'); $k::MenuPaused = (T 'Пауза.  [R] продолжить    [X] выход (сразу)    [Esc] закрыть меню' 'Paused.  [R] continue    [X] exit (now)    [Esc] close the menu')
     $k::ConfirmEnd = (T 'Сеанс завершён. Код больше не работает.' 'Session ended. The code no longer works.')
     $k::StPaused = (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'); $k::Continuing = (T 'продолжаем' 'continuing')
     $k::StRestore = ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…')); $k::StRestoreOk = $false
@@ -4043,6 +4106,7 @@ function Start-Helper {
     $fails = 0; $delay = 1.0
     try {
         while ($true) {
+            Read-ConsoleMenu
             if($script:Mode -ne 'confirm'){Start-RealtimeInput}
             if ([K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }

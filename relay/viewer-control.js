@@ -31,7 +31,7 @@
   const heldKeys=new Map();
   let lookState={glow:false,sound:false,banner:false,timer:false};const lookButtons=new Map();
   const appearance=document.createElement('div');appearance.style.cssText='display:flex;flex-wrap:wrap;gap:.4rem;padding:.6rem .9rem;border-bottom:1px solid var(--line)';
-  for(const [key,glyph,label] of [['glow','☼',ru?'Подсветка':'Glow'],['sound','♫',ru?'Звук':'Sound'],['banner','▤',ru?'Верхняя плашка':'Top banner'],['timer','◷',ru?'Таймер':'Timer']]){
+  for(const [key,glyph,label] of [['glow','☼',ru?'Подсветка':'Glow'],['sound','♫',ru?'Звук':'Sound'],['banner','▤',ru?'Верхняя плашка':'Top banner'],['timer','◷',ru?'Таймер':'Timer'],['cursor','➚',ru?'Курсор Helper':'Helper cursor'],['animations','✧',ru?'Анимации курсора':'Cursor animations']]){
     const b=document.createElement('button');b.dataset.setting=key;b.className='appearance-icon';b.textContent=glyph;b.title=label;b.setAttribute('aria-label',label);b.onclick=async()=>{b.disabled=true;try{const value=!lookState[key];await request('/look',{[key]:value});lookState[key]=value;paintLook();}catch(e){status(e.message,'bad');}finally{b.disabled=false;}};
     lookButtons.set(key,{b,label});appearance.append(b);
   }

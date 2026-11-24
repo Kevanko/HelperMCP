@@ -111,7 +111,7 @@ It is hardened: cookie sessions (HttpOnly, SameSite=Strict, Secure over HTTPS, 3
 
 The Windows agent retries kept sessions after VPN changes, internet loss and reboots. It can change its own transport without changing the friend's VPN, routes or DNS. If every path to the relay is blocked, remote access still needs a reachable endpoint.
 
-- **Reboot:** the helper starts again with Windows in a visible window and takes the same code back at once; the saved session decides the mode, so nothing is asked.
+- **Reboot:** with Autostart on, Helper starts at Windows sign-in and resumes the saved code and mode. Esc opens the Windows console menu. Use the arrows to choose recent logs, appearance, autostart, quiet mode or End session.
 - **Route layer (Windows):** a local bridge binds its own IPv4 sockets to an adapter. The watchdog checks TLS `/helper/health` on the configured relay port, prefers physical adapters, and tests the default route, system proxy and VPN adapters. DNS is refreshed after network changes. WinDivert/WFP filters can still intercept bound sockets.
 - **Look at the network:** `system {sections:["reach"]}` lists every adapter (type, speed, IP, gateway, DNS, MAC), which one is the default route, which one the helper uses, whether each reaches the relay, the VPN / DPI-bypass / proxy programs and filter drivers installed, proxies and the hosts file; `connections` shows who talks to whom.
 - **Not touched:** outage recovery does not restart adapters, flush shared DNS, change routes, stop zapret or switch VPN/TUN.
@@ -143,7 +143,7 @@ To publish your own build: `cd android && ./gradlew assembleRelease -Prelay=http
 
 - **Two MCP endpoints.** `/mcp`: one connection, every tool takes a `session` code. `/s/<CODE>/mcp`: per session, the friend's PC looks like your own and their MCP servers show up as native tools.
 - **Your own certificate.** Already have nginx / certbot? Set `TLS_CERT` / `TLS_KEY` in `.env`, or put the relay behind your proxy and set `PUBLIC_URL`. See `.env.example`.
-- **Cursor pack.** Drop `pointer.cur`, `link.cur`, `beam.cur` (and friends) into `data/cursor/` and agents use them during the session.
+- **Windows cursor.** The optional Helper cursor appears during AI pointer activity. It uses the device's configured 32-bit arrow if available, or `data/cursor/pointer.cur` as a relay fallback. Cursor and animations have separate switches in the console, viewer and admin panel.
 - **Recipes.** `recipes/` has step-by-step guides the AI reads (`blender`, `any-app`). Plain Markdown, add your own.
 - **Weak connections.** Screenshots are raw JPEG and shrink on slow links, unchanged screens aren't sent, big output is gzipped.
 - **Latvia deployment.** Use [compose.nix.yml](compose.nix.yml) with the site’s existing TLS virtual host and [nginx locations](relay/deploy/nginx-latvia.conf). Set PUBLIC_URL to the HTTPS origin. The relay listens privately on loopback port 18444, and all public Helper traffic uses TCP 443.

@@ -103,7 +103,7 @@
       el('div', { class: 'note', style: 'color:var(--mut)', text: 'No login yet? On the server run: helpermcp admin' })));
   }
 
-  const appearance = { glow: ['☼', 'Подсветка'], sound: ['♫', 'Звук'], banner: ['▤', 'Верхняя плашка'], timer: ['◷', 'Таймер'] };
+  const appearance = { glow: ['☼', 'Подсветка'], sound: ['♫', 'Звук'], banner: ['▤', 'Верхняя плашка'], timer: ['◷', 'Таймер'], cursor: ['➚', 'Курсор Helper'], animations: ['✧', 'Анимации курсора'] };
   function deviceToggle(key, on, onclick, disabled = false) {
     const [glyph, label] = appearance[key];
     return el('button', { type: 'button', class: 'device-toggle' + (on ? ' on' : ''), 'aria-label': label, 'aria-pressed': String(on),

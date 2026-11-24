@@ -185,6 +185,7 @@ namespace V__BUILD__ {
 }
 "@
 $script:GlowOn = $false; $script:SoundOn = $false; $script:BannerOn = $false; $script:TimerOn = $false
+$script:CursorOn = $false; $script:AnimationsOn = $false
 $script:OkRGB = @(76, 141, 255); $script:Phase = 'ok'; $script:LastOp = [DateTime]::UtcNow; $script:LastQuiet = $null
 $GlowDepth = [int](34 * ([Drawing.Graphics]::FromHwnd([IntPtr]::Zero).DpiX / 96))   # the edge glow is thin and soft; off unless switched on
 # ---- did an action change anything? A coarse picture around the target and of the whole screen before and after (the overlay's own label and glow are left out)
@@ -1314,7 +1315,7 @@ namespace K__BUILD__ {
       Say("");
       int choice = Choose(MenuLabels);
       if (choice < 0) return;
-      if (choice == 4) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(ConfirmEnd); }
+      if (choice == MenuLabels.Length - 1) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(ConfirmEnd); }
       else if (choice != 0) MenuAction = choice;
     }
     public static void Start() {
@@ -1909,16 +1910,30 @@ function Glow-Visible { $script:GlowOn -and $script:Net -ne 'lost' -and -not [K_
 function Do-Look($a) {   # the AI's colour (once per session, the relay keeps it) and a short note in the label
     $out = @()
     if ($null -ne $a.glow) { $script:GlowOn = [bool]$a.glow; Overlay-Send ('glow ' + [int]$script:GlowOn); $out += $(if ($script:GlowOn) { 'glow on' } else { 'glow off' }) }
-    if ($null -ne $a.sound) { $script:SoundOn = [bool]$a.sound; $out += $(if ($script:SoundOn) { 'sound on' } else { 'sound off' }); if ($script:SoundOn) { Play-Sound 'ok' } }
+    if ($null -ne $a.sound) {
+        $changed = $script:SoundOn -ne [bool]$a.sound
+        $script:SoundOn = [bool]$a.sound
+        $out += $(if ($script:SoundOn) { 'sound on' } else { 'sound off' })
+        if ($changed -and $script:SoundOn) { Play-Sound 'ok' }
+    }
     if($null -ne $a.banner){$script:BannerOn=[bool]$a.banner;Overlay-Send ('banner '+[int]$script:BannerOn);$out+='banner set'}
     if($null -ne $a.timer){$script:TimerOn=[bool]$a.timer;Overlay-Send ('timer '+[int]$script:TimerOn);$out+='timer set'}
+    if ($null -ne $a.cursor) { $script:CursorOn = [bool]$a.cursor; Overlay-Send ('cursor ' + [int]$script:CursorOn); $out += 'cursor set' }
+    if ($null -ne $a.animations) { $script:AnimationsOn = [bool]$a.animations; Overlay-Send ('animations ' + [int]$script:AnimationsOn); $out += 'animations set' }
     if ($a.color -and "$($a.color)" -match '^#?([0-9a-fA-F]{6})$') {
         $hx = $Matches[1]; $rgb = @([Convert]::ToInt32($hx.Substring(0, 2), 16), [Convert]::ToInt32($hx.Substring(2, 2), 16), [Convert]::ToInt32($hx.Substring(4, 2), 16))
         $mx = ($rgb | Measure-Object -Maximum).Maximum; if ($mx -lt 200) { $k = 200.0 / [Math]::Max(1, $mx); $rgb = @($rgb | ForEach-Object { [int][Math]::Min(255, $_ * $k) }) }   # always bright enough to be seen
         $script:OkRGB = $rgb; Overlay-Send "color $($rgb[0]) $($rgb[1]) $($rgb[2])"; $out += 'colour set'
     }
-    if ($a.note) { $nt = (Cut ("$($a.note)" -replace '\s+', ' ') 90); $script:Note = $nt; Overlay-Send ("note64 " + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nt))); Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan; $out += 'note shown'
-        if ($script:Phase -in 'done', 'hold') { $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status; $out += 'new task started' } }   # a new note after task_done is a new task: the label shows it and the clock starts again, it used to stay on "finished"
+    if ($null -ne $a.note) {
+        $nt = Cut ("$($a.note)" -replace '\s+', ' ') 90
+        $script:Note = $nt
+        Overlay-Send ('note64 ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nt)))
+        if ($nt -and -not $script:Preferences.quiet) { Write-Host ('  ' + [char]0x270E + ' ' + $nt) -ForegroundColor Cyan }
+        if ($nt -and $script:Phase -in 'done', 'hold') { $script:Phase = 'ok'; Overlay-Send 'state ok'; Show-Status }
+        $out += 'note updated'
+    }
+    Set-ConsoleMenu
     @{ text = $(if ($out) { $out -join ', ' } else { 'nothing to change' }) }
 }
 function Do-Hold($a) { $script:Phase = 'hold'; Overlay-Send 'state hold'; Write-Orange ('  || ' + (T 'Помощник на паузе и вернётся' 'The helper is on hold and will be back')); Show-Status; @{ text = 'ok' } }
@@ -3238,24 +3253,6 @@ function Place($e, $cx, $cy, $r) { $e.Width = 2 * $r; $e.Height = 2 * $r; [Windo
 
 # The REAL pointer is replaced for the whole session: the operator's cursor pack (CURSOR_DIR on the relay) or a soft rounded arrow. Restored when the overlay ends
 # (the agent restores it too, and Windows restores it at the next sign-in whatever happens).
-function Make-SoftCur($file) {
-    $S = 44; $bmp = New-Object Drawing.Bitmap $S, $S, ([Drawing.Imaging.PixelFormat]::Format32bppArgb); $g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'
-    $pts = foreach ($q in @(@(0, 0), @(0, 23), @(5.2, 18.2), @(8.8, 26.5), @(12.3, 25), @(8.7, 16.8), @(15.6, 16.8))) { New-Object Drawing.PointF ((5 + 1.2 * $q[0]) * 1.1), ((4 + 1.2 * $q[1]) * 1.1) }
-    $path = New-Object Drawing.Drawing2D.GraphicsPath; $path.AddPolygon([Drawing.PointF[]]$pts)
-    $g.TranslateTransform(1.1, 2.2)
-    foreach ($sh in @(@(6.6, 15), @(4.4, 23), @(2.6, 36))) { $pen = New-Object Drawing.Pen ([Drawing.Color]::FromArgb($sh[1], 5, 13, 38)), $sh[0]; $pen.LineJoin = 'Round'; $g.DrawPath($pen, $path) }
-    $g.ResetTransform()
-    $pw = New-Object Drawing.Pen ([Drawing.Color]::White), 2.8; $pw.LineJoin = 'Round'; $g.DrawPath($pw, $path)
-    $br = New-Object Drawing.Drawing2D.LinearGradientBrush -ArgumentList @((New-Object Drawing.PointF 0, 4), (New-Object Drawing.PointF 0, 38), [Drawing.Color]::White, [Drawing.Color]::FromArgb(209, 227, 255)); $g.FillPath($br, $path)
-    $po = New-Object Drawing.Pen ([Drawing.Color]::FromArgb(166, 76, 141, 255)), 1.1; $po.LineJoin = 'Round'; $g.DrawPath($po, $path); $g.Dispose()
-    $bd = $bmp.LockBits((New-Object Drawing.Rectangle 0, 0, $S, $S), 'ReadOnly', 'Format32bppArgb'); $raw = New-Object byte[] ($S * $S * 4); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $raw, 0, $raw.Length); $bmp.UnlockBits($bd)
-    $ms = New-Object IO.MemoryStream; $w = New-Object IO.BinaryWriter $ms; $mask = (($S + 31) -shr 5) * 4 * $S; $size = 40 + $S * $S * 4 + $mask
-    $w.Write([uint16]0); $w.Write([uint16]2); $w.Write([uint16]1); $w.Write([byte]$S); $w.Write([byte]$S); $w.Write([byte]0); $w.Write([byte]0); $w.Write([uint16]5); $w.Write([uint16]4); $w.Write([uint32]$size); $w.Write([uint32]22)
-    $w.Write([uint32]40); $w.Write([int32]$S); $w.Write([int32](2 * $S)); $w.Write([uint16]1); $w.Write([uint16]32); $w.Write([uint32]0); $w.Write([uint32]($S * $S * 4)); $w.Write([int32]0); $w.Write([int32]0); $w.Write([uint32]0); $w.Write([uint32]0)
-    for ($y = $S - 1; $y -ge 0; $y--) { $w.Write($raw, $y * $S * 4, $S * 4) }
-    $w.Write((New-Object byte[] $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
-}
-$CurIds = @{ pointer = 32512; beam = 32513; busy = 32514; precision = 32515; alternate = 32516; dgn1 = 32642; dgn2 = 32643; horz = 32644; vert = 32645; move = 32646; unavailable = 32648; link = 32649; working = 32650; help = 32651 }
 function Read-Cur32($file) {   # 32-bit .cur -> @{ w; h; hx; hy; raw = BGRA top-down }, else $null
     try {
         $b = [IO.File]::ReadAllBytes($file); $n = [BitConverter]::ToUInt16($b, 4); $best = $null
@@ -3266,63 +3263,66 @@ function Read-Cur32($file) {   # 32-bit .cur -> @{ w; h; hx; hy; raw = BGRA top-
         @{ w = $w; h = $h; hx = $best.hx; hy = $best.hy; raw = $raw }
     } catch { $null }
 }
-function Write-CurFile($file, $raw, $W, $H, $hx, $hy) {
-    $ms = New-Object IO.MemoryStream; $bw = New-Object IO.BinaryWriter $ms; $mask = (($W + 31) -shr 5) * 4 * $H; $size = 40 + $W * $H * 4 + $mask
-    $bw.Write([uint16]0); $bw.Write([uint16]2); $bw.Write([uint16]1); $bw.Write([byte]$W); $bw.Write([byte]$H); $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([uint16]$hx); $bw.Write([uint16]$hy); $bw.Write([uint32]$size); $bw.Write([uint32]22)
-    $bw.Write([uint32]40); $bw.Write([int32]$W); $bw.Write([int32](2 * $H)); $bw.Write([uint16]1); $bw.Write([uint16]32); $bw.Write([uint32]0); $bw.Write([uint32]($W * $H * 4)); $bw.Write([int32]0); $bw.Write([int32]0); $bw.Write([uint32]0); $bw.Write([uint32]0)
-    for ($y = $H - 1; $y -ge 0; $y--) { $bw.Write($raw, $y * $W * 4, $W * 4) }
-    $bw.Write((New-Object byte[] $mask)); $bw.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
-}
-function Scale-Cur($info, $k, $file) {   # a little bigger than the pack's 32 px, smooth
-    $W = [int][Math]::Round($info.w * $k); $H = [int][Math]::Round($info.h * $k)
-    $src = New-Object Drawing.Bitmap $info.w, $info.h, ([Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $bd = $src.LockBits((New-Object Drawing.Rectangle 0, 0, $info.w, $info.h), 'WriteOnly', 'Format32bppArgb'); [Runtime.InteropServices.Marshal]::Copy($info.raw, 0, $bd.Scan0, $info.raw.Length); $src.UnlockBits($bd)
-    $dst = New-Object Drawing.Bitmap $W, $H, ([Drawing.Imaging.PixelFormat]::Format32bppArgb); $g = [Drawing.Graphics]::FromImage($dst); $g.InterpolationMode = 'HighQualityBicubic'; $g.PixelOffsetMode = 'HighQuality'; $g.CompositingMode = 'SourceCopy'
-    $g.DrawImage($src, 0, 0, $W, $H); $g.Dispose()
-    $bd = $dst.LockBits((New-Object Drawing.Rectangle 0, 0, $W, $H), 'ReadOnly', 'Format32bppArgb'); $raw = New-Object byte[] ($W * $H * 4); [Runtime.InteropServices.Marshal]::Copy($bd.Scan0, $raw, 0, $raw.Length); $dst.UnlockBits($bd)
-    Write-CurFile $file $raw $W $H ([int][Math]::Round($info.hx * $k)) ([int][Math]::Round($info.hy * $k))
-}
 function Make-BlankCur($file) {
     $S = 32; $mask = (($S + 31) -shr 5) * 4 * $S; $size = 40 + $S * $S * 4 + $mask; $ms = New-Object IO.MemoryStream; $w = New-Object IO.BinaryWriter $ms
     $w.Write([uint16]0); $w.Write([uint16]2); $w.Write([uint16]1); $w.Write([byte]$S); $w.Write([byte]$S); $w.Write([byte]0); $w.Write([byte]0); $w.Write([uint16]0); $w.Write([uint16]0); $w.Write([uint32]$size); $w.Write([uint32]22)
     $w.Write([uint32]40); $w.Write([int32]$S); $w.Write([int32](2 * $S)); $w.Write([uint16]1); $w.Write([uint16]32); $w.Write([uint32]0); $w.Write([uint32]($S * $S * 4)); $w.Write([int32]0); $w.Write([int32]0); $w.Write([uint32]0); $w.Write([uint32]0)
     $w.Write((New-Object byte[] ($S * $S * 4))); $w.Write([byte[]](,[byte]255 * $mask)); $w.Flush(); [IO.File]::WriteAllBytes($file, $ms.ToArray())
 }
-$script:CurFiles = @{}; $script:BlankFile = $null; $script:Blanked = $false
-function Set-Pointers($blank) {   # blank = hide the real pointer (the AI's own arrow is drawn instead), else the session cursors
-    if ($script:Blanked -eq $blank -or -not $script:CurFiles.Count) { return }
-    $script:Blanked = $blank
-    if ($blank) { foreach ($id in @($CurIds.Values)) { $h = [O.C]::LoadCursorFromFile($script:BlankFile); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$id) } } }
-    else { Restore-Cursors; foreach ($k in @($script:CurFiles.Keys)) { $h = [O.C]::LoadCursorFromFile($script:CurFiles[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } } }
+$script:BlankFile = $null; $script:Blanked = $false; $script:CursorOn = $false; $script:AnimationsOn = $false
+function Set-Pointers($blank) {
+    if ($script:Blanked -eq $blank) { return }
+    if ($blank) {
+        if (-not $script:BlankFile) { return }
+        $h = [O.C]::LoadCursorFromFile($script:BlankFile)
+        if ($h -ne [IntPtr]::Zero) { $script:Blanked = [O.C]::SetSystemCursor($h, 32512) }
+    } else {
+        [void][O.C]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0)
+        $script:Blanked = $false
+    }
 }
-function Restore-Cursors { [void][O.C]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) }
-function Apply-Cursors {
+function Apply-Cursor {
+    if ($script:CurDir) { return }
     try {
-        $dir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N').Substring(0, 8)); [void](New-Item $dir -ItemType Directory -Force)
-        $t0 = [Diagnostics.Stopwatch]::StartNew(); $got = @{}
-        if ($env:HM_RELAY) {
-            foreach ($k in @('pointer') + @($CurIds.Keys | Where-Object { $_ -ne 'pointer' })) {
-                if ($t0.Elapsed.TotalSeconds -gt 20) { break }
-                $ext = if ($k -eq 'busy' -or $k -eq 'working') { 'ani' } else { 'cur' }
-                try { $rq = [Net.WebRequest]::Create("$($env:HM_RELAY)/cursor/$k.$ext"); $rq.Timeout = 3000; $rs = $rq.GetResponse(); $f = Join-Path $dir "$k.$ext"; $fs = [IO.File]::Create($f); $rs.GetResponseStream().CopyTo($fs); $fs.Close(); $rs.Close(); $got[$k] = $f } catch { }
-            }
+        $dir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N'))
+        $script:CurDir = $dir
+        [void](New-Item -ItemType Directory -Path $dir)
+        $pointer = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Cursors' -Name Arrow -ErrorAction SilentlyContinue).Arrow)
+        $info = if ($pointer -and [IO.File]::Exists($pointer)) { Read-Cur32 $pointer }
+        if (-not $info -and $env:HM_RELAY) {
+            $file = Join-Path $dir 'pointer.cur'
+            try {
+                $rq = [Net.WebRequest]::Create("$($env:HM_RELAY)/cursor/pointer.cur")
+                $rq.Timeout = 1500; $rq.ReadWriteTimeout = 1500
+                $rs = $rq.GetResponse()
+                try {
+                    if ($rs.ContentLength -gt 0 -and $rs.ContentLength -le 128KB) {
+                        $out = [IO.File]::Create($file)
+                        try { $rs.GetResponseStream().CopyTo($out) } finally { $out.Dispose() }
+                        $info = Read-Cur32 $file
+                    }
+                } finally { $rs.Dispose() }
+            } catch { }
         }
-        if (-not $got.ContainsKey('pointer')) { $f = Join-Path $dir 'pointer.cur'; Make-SoftCur $f; $got['pointer'] = $f }
-        else {
-            $info = Read-Cur32 $got['pointer']
-            if ($info) {
-                $pm = New-Object byte[] $info.raw.Length   # premultiplied copy for WPF
-                for ($i = 0; $i -lt $info.raw.Length; $i += 4) { $al = $info.raw[$i + 3]; $pm[$i] = [byte]($info.raw[$i] * $al / 255); $pm[$i + 1] = [byte]($info.raw[$i + 1] * $al / 255); $pm[$i + 2] = [byte]($info.raw[$i + 2] * $al / 255); $pm[$i + 3] = $al }
-                $bs = [Windows.Media.Imaging.BitmapSource]::Create($info.w, $info.h, 96, 96, [Windows.Media.PixelFormats]::Pbgra32, $null, $pm, $info.w * 4); $bs.Freeze()
-                $K = 1.45; $arrowImg.Source = $bs; $arrowImg.Width = $info.w * $K; $arrowImg.Height = $info.h * $K
-                [Windows.Controls.Canvas]::SetLeft($arrowImg, $HX - $info.hx * $K); [Windows.Controls.Canvas]::SetTop($arrowImg, $HY - $info.hy * $K)
-                $arrowImg.RenderTransformOrigin = New-Object Windows.Point ($info.hx / $info.w), ($info.hy / $info.h); $arrow.Visibility = 'Collapsed'; $arrowImg.Visibility = 'Visible'
-                $f2 = Join-Path $dir 'pointer-big.cur'; Scale-Cur $info 1.35 $f2; $got['pointer'] = $f2
+        if ($info) {
+            $pm = New-Object byte[] $info.raw.Length
+            for ($i = 0; $i -lt $pm.Length; $i += 4) {
+                $al = $info.raw[$i + 3]
+                for ($c = 0; $c -lt 3; $c++) { $pm[$i+$c] = [byte]($info.raw[$i+$c] * $al / 255) }
+                $pm[$i+3] = $al
             }
+            $bitmap = [Windows.Media.Imaging.BitmapSource]::Create($info.w, $info.h, 96, 96, [Windows.Media.PixelFormats]::Pbgra32, $null, $pm, $info.w * 4)
+            $bitmap.Freeze()
+            $scale = 1.2
+            $arrowImg.Source = $bitmap; $arrowImg.Width = $info.w * $scale; $arrowImg.Height = $info.h * $scale
+            [Windows.Controls.Canvas]::SetLeft($arrowImg, $HX - $info.hx * $scale)
+            [Windows.Controls.Canvas]::SetTop($arrowImg, $HY - $info.hy * $scale)
+            $arrowImg.RenderTransformOrigin = New-Object Windows.Point ($info.hx / $info.w), ($info.hy / $info.h)
+            $arrow.Visibility = 'Collapsed'; $arrowImg.Visibility = 'Visible'
         }
-        foreach ($k in @($got.Keys)) { $h = [O.C]::LoadCursorFromFile($got[$k]); if ($h -ne [IntPtr]::Zero) { [void][O.C]::SetSystemCursor($h, [uint32]$CurIds[$k]) } }
-        $script:CurFiles = $got; $script:BlankFile = Join-Path $dir 'blank.cur'; Make-BlankCur $script:BlankFile; $script:CurDir = $dir
-    } catch { [Console]::Error.WriteLine('cursors: ' + $_); Restore-Cursors }
+        $script:BlankFile = Join-Path $dir 'blank.cur'
+        Make-BlankCur $script:BlankFile
+    } catch { [Console]::Error.WriteLine('cursor: ' + $_.Exception.GetType().Name) }
 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
 $script:lastActive = -99.0; $script:opacity = 0.0; $script:pressedT = -99.0; $script:dragging = $false
@@ -3345,6 +3345,12 @@ function On-Line($line) {
     if ($f[0] -eq 'glow' -and $f.Count -gt 1) { $script:glowOn = ($f[1] -eq '1'); Apply-State; return }
     if($f[0] -eq 'banner' -and $f.Count -gt 1){$script:bannerOn=($f[1] -eq '1');Apply-State;return}
     if($f[0] -eq 'timer' -and $f.Count -gt 1){$script:timerOn=($f[1] -eq '1');Apply-State;return}
+    if ($f[0] -eq 'cursor' -and $f.Count -gt 1) {
+        $script:CursorOn = $f[1] -eq '1'
+        if ($script:CursorOn) { Apply-Cursor } else { Set-Pointers $false }
+        return
+    }
+    if ($f[0] -eq 'animations' -and $f.Count -gt 1) { $script:AnimationsOn = $f[1] -eq '1'; return }
     if ($f[0] -eq 'note64') { $script:note = $(if ($f.Count -gt 1) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($f[1])) } else { '' }); Apply-State; return }   # base64: stdin is read in the console code page (cp866), so Russian text came out as hieroglyphs
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
     if ($f[0] -eq 'cap') { $script:capHide = $true; foreach ($m in $mons) { $m.win.Opacity = 0 }; $cwin.Opacity = 0; $rwin.Opacity = 0; return }
@@ -3373,7 +3379,10 @@ $timer.Add_Tick({
     if ($sec -ne $script:lastSec) { $script:lastSec = $sec; $t = Clock-Text; foreach ($m in $mons) { $m.tc.Text = $t } }   # the session clock in the label
     $now = $clock.Elapsed.TotalSeconds; $p = [Windows.Forms.Cursor]::Position; $c = Cur
     if ($trail.Count -eq 0 -or $trail[$trail.Count - 1].x -ne $p.X -or $trail[$trail.Count - 1].y -ne $p.Y) { [void]$trail.Add(@{ t = $now; x = $p.X; y = $p.Y }); if ($trail.Count -gt 14) { $trail.RemoveAt(0) } }
-    $active = (($now - $script:lastActive) -lt 8.0) -or $script:dragging
+    $age = $now - $script:lastActive
+    $active = $script:CursorOn -and ($age -lt 0.8 -or ($script:dragging -and $age -lt 3))
+    $pace = if ($active -or ($script:AnimationsOn -and $script:rip)) { 12 } else { 75 }
+    if ($timer.Interval.TotalMilliseconds -ne $pace) { $timer.Interval = [TimeSpan]::FromMilliseconds($pace) }
     $tgt = if ($active) { 1.0 } else { 0.0 }
     if ($script:lastPtr) {   # the tip turns into the direction of movement (the arrow points up-left at rest), and settles back when the pointer stops
         $script:vx = $script:vx * 0.6 + ($p.X - $script:lastPtr.X) * 0.4; $script:vy = $script:vy * 0.6 + ($p.Y - $script:lastPtr.Y) * 0.4
@@ -3381,7 +3390,7 @@ $timer.Add_Tick({
         elseif ($now - $script:movingT -gt 0.45) { $script:rotTgt = 0.0 }
         $d = (($script:rotTgt - $script:lean + 540) % 360) - 180; $script:lean += $d * 0.2
     }
-    $script:lastPtr = $p; $arrowRot.Angle = $script:lean
+    $script:lastPtr = $p; $arrowRot.Angle = $(if ($script:AnimationsOn) { $script:lean } else { 0 })
     Set-Pointers $active
     $script:opacity += ($tgt - $script:opacity) * 0.22
     if ($script:opacity -lt 0.03 -and -not $active) { if ($script:cursorShown) { $cwin.Hide(); $script:cursorShown = $false } }
@@ -3397,12 +3406,12 @@ $timer.Add_Tick({
          $cwin.Opacity = $(if ($script:capHide) { 0 } else { [Math]::Min(1.0, $script:opacity) })
         $haloStops[0].Color = [Windows.Media.Color]::FromArgb(128, $c.R, $c.G, $c.B); $haloStops[1].Color = [Windows.Media.Color]::FromArgb(41, $c.R, $c.G, $c.B); $haloStops[2].Color = [Windows.Media.Color]::FromArgb(0, $c.R, $c.G, $c.B); $br = Brush $c
         $pa = $now - $script:pressedT
-        $s = if ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
+        $s = if (-not $script:AnimationsOn) { 1.0 } elseif ($script:dragging) { 0.9 } elseif ($pa -ge 0 -and $pa -lt 0.2) { 1 - 0.16 * [Math]::Sin([Math]::PI * $pa / 0.2) } else { 1.0 }
         $arrowScale.ScaleX = $s; $arrowScale.ScaleY = $s; $haloScale.ScaleX = $s; $haloScale.ScaleY = $s
-        if ($script:dragging) { $ring.Visibility = 'Visible'; $ring.Stroke = $br; $ring.Fill = Brush (C $c.R $c.G $c.B 46); $rr = 23 + 3 * [Math]::Sin($now * 8); Place $ring $HX $HY $rr } else { $ring.Visibility = 'Collapsed' }
+        if ($script:AnimationsOn -and $script:dragging) { $ring.Visibility = 'Visible'; $ring.Stroke = $br; $ring.Fill = Brush (C $c.R $c.G $c.B 46); $rr = 23 + 3 * [Math]::Sin($now * 8); Place $ring $HX $HY $rr } else { $ring.Visibility = 'Collapsed' }
         for ($i = 0; $i -lt $trailDots.Count; $i++) {   # comet tail
             $e = $trailDots[$i]; $k = $trail.Count - 2 - $i
-            if ($k -ge 0 -and ($now - $trail[$k].t) -lt 0.3) {
+            if ($script:AnimationsOn -and $k -ge 0 -and ($now - $trail[$k].t) -lt 0.3) {
                 $age = ($now - $trail[$k].t) / 0.3; $e.Visibility = 'Visible'; $e.Fill = Brush (C $c.R $c.G $c.B ([int](82 * (1 - $age))))
                 $e.Width = 12 * (1 - $age) + 2; $e.Height = $e.Width
                 [Windows.Controls.Canvas]::SetLeft($e, $HX + $trail[$k].x - $p.X + 3 - $e.Width / 2); [Windows.Controls.Canvas]::SetTop($e, $HY + $trail[$k].y - $p.Y + 5 - $e.Width / 2)
@@ -3420,7 +3429,7 @@ $timer.Add_Tick({
             } else { $chev[$i].Visibility = 'Collapsed' }
         }
     }
-    if ($script:rip -and ($now - $script:rip.t) -gt 0.9) { $script:rip = $null }
+    if ($script:rip -and (-not $script:AnimationsOn -or ($now - $script:rip.t) -gt 0.9)) { $script:rip = $null }
     if ($script:rip) {
         $r = $script:rip; if (-not $script:ripShown) { $rwin.Show(); $script:ripShown = $true }
         $rwin.Left = $r.x / $dpi - $RW / 2; $rwin.Top = $r.y / $dpi - $RW / 2; $rb = Brush $r.c
@@ -3437,9 +3446,6 @@ $timer.Add_Tick({
     } elseif ($script:ripShown) { $rwin.Hide(); $script:ripShown = $false }
 })
 $timer.Start()
-$once = New-Object Windows.Threading.DispatcherTimer; $once.Interval = [TimeSpan]::FromMilliseconds(400)
-$once.Add_Tick({ $once.Stop(); Apply-Cursors })   # after the glow is on screen (downloading the pack can take a moment)
-$once.Start()
 $wd = New-Object Windows.Threading.DispatcherTimer
 $wd.Interval = [TimeSpan]::FromSeconds(1.5)
 $wd.Add_Tick({
@@ -3448,7 +3454,7 @@ $wd.Add_Tick({
 })
 $wd.Start()
 [Windows.Threading.Dispatcher]::Run()
-Restore-Cursors
+Set-Pointers $false
 if ($script:CurDir) { Remove-Item $script:CurDir -Recurse -Force -ErrorAction SilentlyContinue }
 '@
 function Start-Overlay {
@@ -3473,7 +3479,6 @@ function Cleanup-Children {
     try { [K__BUILD__.Keys]::Stop() } catch { }
     foreach ($c in $Children.Values) { Stop-Tree $c.p }
     if ($script:OverlayProc) { try { $script:OverlayIn.Close(); if (-not $script:OverlayProc.WaitForExit(3000)) { $script:OverlayProc.Kill() } } catch { try { $script:OverlayProc.Kill() } catch { } } }
-    try { [void][H.U__BUILD__]::SystemParametersInfo(0x57, 0, [IntPtr]::Zero, 0) } catch { }   # system cursors back, whatever happened to the overlay
     try { [F__BUILD__.Live]::Stop() } catch { }   # iex runs in the user's window: the filming thread must not outlive the session
     foreach ($d in @($script:NodeDir) + $script:TmpDirs) { if ($d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue } }
 }
@@ -3655,7 +3660,15 @@ function Forget-Session {
 function Set-ConsoleMenu {
     $startup = if ($script:Preferences.startup) { T 'Автозапуск включён' 'Autostart on' } else { T 'Автозапуск выключен' 'Autostart off' }
     $quiet = if ($script:Preferences.quiet) { T 'Тихий режим включён' 'Quiet mode on' } else { T 'Тихий режим выключен' 'Quiet mode off' }
-    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet, (T 'Завершить сеанс' 'End session'))
+    $look = @(
+        (T 'Подсветка' 'Glow'), (T 'Звук' 'Sound'), (T 'Плашка' 'Banner'),
+        (T 'Таймер' 'Timer'), (T 'Курсор' 'Cursor'), (T 'Анимации' 'Animations')
+    )
+    $enabled = @($script:GlowOn, $script:SoundOn, $script:BannerOn, $script:TimerOn, $script:CursorOn, $script:AnimationsOn)
+    $items = for ($i = 0; $i -lt $look.Count; $i++) {
+        $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
+    }
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + (T 'Завершить сеанс' 'End session')
 }
 function Read-ConsoleMenu {
     $choice = [K__BUILD__.Keys]::MenuAction
@@ -3663,6 +3676,18 @@ function Read-ConsoleMenu {
     [K__BUILD__.Keys]::MenuAction = 0
     if ($choice -eq 1) {
         Write-Host ((Do-AgentLog @{ lines = 18 }).text) -ForegroundColor DarkCyan
+        return
+    }
+    if ($choice -ge 4) {
+        $keys = 'glow','sound','banner','timer','cursor','animations'
+        $enabled = @($script:GlowOn, $script:SoundOn, $script:BannerOn, $script:TimerOn, $script:CursorOn, $script:AnimationsOn)
+        $n = $choice - 4
+        try {
+            $change = @{}; $change[$keys[$n]] = -not $enabled[$n]
+            $look = (Api '/a/appearance' $change $script:Token 6).Content | ConvertFrom-Json
+            [void](Do-Look $look)
+            Write-Host ([K__BUILD__.Keys]::MenuLabels[$choice]) -ForegroundColor Green
+        } catch { Write-Orange (T 'Настройка не сохранена. Проверьте подключение.' 'Could not save the setting. Check the connection.') }
         return
     }
     $key = if ($choice -eq 2) { 'startup' } else { 'quiet' }
@@ -4095,9 +4120,12 @@ function Start-Helper {
     Set-ConsoleMenu
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
     if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound;if($null -ne $r.look.banner){$script:BannerOn=[bool]$r.look.banner};if($null -ne $r.look.timer){$script:TimerOn=[bool]$r.look.timer} }
+    if ($r.look) { $script:CursorOn = [bool]$r.look.cursor; $script:AnimationsOn = [bool]$r.look.animations }
+    Set-ConsoleMenu
     Play-Sound 'ok'
     Start-Overlay
     Overlay-Send 'state wait'; if ($script:GlowOn) { Overlay-Send 'glow 1' };Overlay-Send ('banner '+[int]$script:BannerOn);Overlay-Send ('timer '+[int]$script:TimerOn)
+    Overlay-Send ('cursor ' + [int]$script:CursorOn); Overlay-Send ('animations ' + [int]$script:AnimationsOn)
     $k = [K__BUILD__.Keys]; $k::VT = $script:VT; $k::Overlay = $script:OverlayIn
     $k::ConfirmEnd = (T 'Сеанс завершён. Код больше не работает.' 'Session ended. The code no longer works.')
     $k::StPaused = (T 'Пауза: помощник ждёт. Esc — меню' 'Paused: the helper is waiting. Esc = menu'); $k::Continuing = (T 'продолжаем' 'continuing')

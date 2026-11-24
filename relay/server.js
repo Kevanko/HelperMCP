@@ -53,8 +53,8 @@ const unseal = (buf) => {
 };
 let saveTimer = null;
 // what a new link starts with (changed in the admin panel): the edge glow and the sounds are OFF unless someone turns them on; a session can override it
-const lookKeys = ['glow', 'sound', 'banner', 'timer'];
-const settings = { glow: false, sound: false, banner: false, timer: false };
+const lookKeys = ['glow', 'sound', 'banner', 'timer', 'cursor', 'animations'];
+const settings = Object.fromEntries(lookKeys.map((key) => [key, false]));
 const effLook = (s) => Object.fromEntries(lookKeys.map((key) => [key, s[key] ?? settings[key]]));
 function save() {
   if (!STATE_FILE || saveTimer) return;
@@ -62,7 +62,7 @@ function save() {
     saveTimer = null;
     try {
       const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, glow: s.glow, sound: s.sound, banner:s.banner, timer:s.timer, events: (s.events || []).slice(-30) })),
+        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
         viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
         devices: [...devices].map(([dh, code]) => ({ dh, code })),
         settings,
@@ -133,12 +133,12 @@ function lookOf(s) {
   return { color: s.lookForce || (st && st.color) || s.lookColor || '', note: note.slice(0, 120) };   // a colour picked by a person wins over the plan's
 }
 // a person changes the glow colour or the task text from the viewer / the admin panel
-async function humanLook(code, color, note, glow, sound, banner, timer) {
+async function humanLook(code, update) {
+  const { color, note } = update;
   const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
   if (color !== undefined && color !== '') { if (!/^#[0-9a-f]{6}$/i.test(color)) throw new Error('bad colour (use #RRGGBB)'); s.lookForce = color.toLowerCase(); }
   if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').trim().slice(0, 90); s.lastNoteAt = 0; }
-  if (typeof glow === 'boolean') s.glow = glow;
-  if (typeof sound === 'boolean') s.sound = sound;if(typeof banner==='boolean')s.banner=banner;if(typeof timer==='boolean')s.timer=timer;
+  for (const key of lookKeys) if (typeof update[key] === 'boolean') s[key] = update[key];
   evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', glow: effLook(s).glow, sound: effLook(s).sound, by: 'operator' } }); save();
   if (!isOnline(s)) { s.lookPending = true; return 'saved; applies when the device reconnects'; }
   return pushLook(String(code).toUpperCase(), s);
@@ -298,6 +298,7 @@ const safeEq = (a, b) => {
 // ---- session / command plumbing ------------------------------------------
 const TAKEOVER_MS = 5 * 60_000;
 const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   // the operator is fixing something by hand in the live viewer
+const desktopObservations = new Set(['screenshot', 'sysinfo', 'agent_log']);
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
@@ -305,13 +306,14 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
   if (s.ending && tool !== 'bye') return Promise.reject(new Error('The session is ending.'));
-  if (takenOver(s) && !opts.human && tool !== 'bye') {
+  if (takenOver(s) && !opts.human && tool !== 'bye' && !desktopObservations.has(tool)) {
     return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
   if (!isOnline(s) && !s.pending.size && tool !== 'bye') {
     if (s.persist) return Promise.reject(new Error(`The remote PC is offline (last seen ${contactText(s)}: internet loss, VPN change, sleep or reboot). This session is KEPT and its agent reconnects by itself with the same code. Use wait_online to wait for it, then session_log to read what happened.`));
     return Promise.reject(new Error(`The remote PC is offline (last seen ${contactText(s)}: internet/VPN change or sleep). The agent reconnects by itself; try again in a few seconds. list_sessions shows "online".`));
   }
+  if (!opts.release && tool !== 'bye' && s.pending.size >= 64) return Promise.reject(new Error('This device already has 64 pending commands. Wait for work to finish before sending more.'));
   // in "ask" mode a human must click through prompts, give them time
   if (s.mode === 'confirm' && tool !== 'bye') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
@@ -1273,7 +1275,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (vw[2] === '/look') {   // glow colour and the task text (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}');
-        try { return json(res, 200, { text: await humanLook(v.code, b.color, b.note, b.glow, b.sound,b.banner,b.timer) }); } catch (e) { return json(res, 400, { error: e.message }); }
+        try { return json(res, 200, { text: await humanLook(v.code, b) }); } catch (e) { return json(res, 400, { error: e.message }); }
       }
       if (vw[2] === '/sysdata') {   // the System tabs: JSON from the agent (control link only: command lines and startup entries are not for view-only guests)
         if (!v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
@@ -1395,8 +1397,6 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
 
     if (p === '/a/register' && req.method === 'POST') {
       const ip = clientIp(req);
-      const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
-      if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const rl = regRate.get(ip) || { n: 0, t: Date.now() }; if (Date.now() - rl.t > 60_000) { rl.n = 0; rl.t = Date.now(); }   // a client PC cannot flood the server with registrations
       if (++rl.n > 20) return json(res, 429, { error: 'slow down' }); regRate.set(ip, rl);
       const info = JSON.parse((await body(req, 10_000)) || '{}');
@@ -1412,6 +1412,8 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true, look: effLook(old) });
       }
+      const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
+      if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const dh = info.device_id ? sha(String(info.device_id).slice(0, 300)) : null;   // a persistent per-install identity (like an AnyDesk/RustDesk ID): the same device always gets the same code back
       let code = want && !old ? want : null;   // same code after a server reset
       if (!code && dh && devices.has(dh)) code = devices.get(dh);
@@ -1432,6 +1434,13 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!s) return json(res, 401, { error: 'unknown token' });
       s.lastSeen = Date.now(); s.lastSeenKnown = true; s.awaitingReconnect = false; s.restoredAt = 0;
       if (p === '/a/poll') save();
+      if (p === '/a/appearance' && req.method === 'POST') {
+        if (s.ending) return json(res, 410, { error: 'session ending' });
+        const update = JSON.parse((await body(req, 1024)) || '{}');
+        for (const key of lookKeys) if (typeof update?.[key] === 'boolean') s[key] = update[key];
+        save();
+        return json(res, 200, effLook(s));
+      }
       if (p === '/a/deps/yamldotnet-18.1.0.dll' && req.method === 'GET') {
         const bytes = fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/YamlDotNet.dll'));
         const manifest = JSON.parse(fs.readFileSync(path.join(AGENT_DIR, 'vendor/yamldotnet/manifest.json'), 'utf8'));

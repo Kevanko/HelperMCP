@@ -104,7 +104,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     }
     if (api === 'look') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
-      try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b.color, b.note, b.glow, b.sound,b.banner,b.timer) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
+      try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
     }
     if (api === 'settings') {   // global actions apply to existing devices AND defaults for new ones
       if (Object.keys(d.settings).some((key) => typeof b[key] === 'boolean')) {

@@ -392,22 +392,25 @@ async function requestAccess(code) {
   const s = sessions.get(code);
   if (!s || !isOnline(s) || s.ending) throw new Error('The device is offline or ending its session.');
   if (hasAccess(s)) return;
-  if (s.accessRequest) throw new Error('The device already has a pending access request.');
+  if (s.accessRequest) return s.accessRequest.result;
   if (Date.now() - (s.lastAccessRequest || 0) < 10_000) throw new Error('Wait before requesting access again.');
   s.lastAccessRequest = Date.now();
-  const request = crypto.randomUUID();
+  const request = { id: crypto.randomUUID() };
   s.accessRequest = request;
-  try {
-    const reply = await call(code, 'request_access', { request, deadline_ms: Date.now() + 40_000 }, 42_000, { human: true });
-    if (sessions.get(code) !== s || s.accessRequest !== request || s.ending || reply?.approved !== true) {
-      throw new Error('The user did not approve access.');
+  request.result = (async () => {
+    try {
+      const reply = await call(code, 'request_access', { request: request.id, deadline_ms: Date.now() + 40_000 }, 42_000, { human: true });
+      if (sessions.get(code) !== s || s.accessRequest !== request || s.ending || reply?.approved !== true) {
+        throw new Error('The user did not approve access.');
+      }
+      s.accessGranted = true;
+      evPush(s, { t: Date.now(), type: 'access_granted' });
+      save();
+    } finally {
+      if (s.accessRequest === request) s.accessRequest = null;
     }
-    s.accessGranted = true;
-    evPush(s, { t: Date.now(), type: 'access_granted' });
-    save();
-  } finally {
-    if (s.accessRequest === request) s.accessRequest = null;
-  }
+  })();
+  return request.result;
 }
 
 function drop(code, why) {
@@ -1517,6 +1520,16 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         req.socket.setNoDelay(true);res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','x-accel-buffering':'no','x-input-clock':String(Date.now())});res.flushHeaders();res.write('\n');
         const ping=setInterval(()=>{if(s.paused||s.mode==='confirm'||!isOnline(s)||res.writableLength>16384)res.end();else res.write('\n');},750);
         res.on('close',()=>{clearInterval(ping);if(s.fastInput===res)s.fastInput=null;});return;
+      }
+      if (p === '/a/wake' && req.method === 'POST') {
+        if (s.waiting) {
+          const waiting = s.waiting;
+          s.waiting = null;
+          clearTimeout(s.waitTimer);
+          waiting.writeHead(204);
+          waiting.end();
+        }
+        return json(res, 200, {});
       }
       if (p === '/a/poll' && req.method === 'GET') {
         s.lastPoll = Date.now();   // the main loop asked for work: unlike the picture upload, this proves the agent can take commands

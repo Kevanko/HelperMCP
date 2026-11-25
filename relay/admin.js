@@ -58,9 +58,14 @@
   // our own dialogs instead of the browser's prompt / confirm / alert
   function modal(title, content, { ok = 'OK', danger = false, cancel = 'Cancel', onok } = {}) {
     return new Promise((resolve) => {
-      const prev = document.activeElement, err = el('div', { class: 'err' });
+      const prev = document.activeElement, err = el('div', { class: 'err', role: 'alert' });
       const close = (v) => { document.removeEventListener('keydown', key, true); back.remove(); if (prev && prev.focus) prev.focus(); resolve(v); };
-      const yes = el('button', { class: danger ? 'go bad' : 'go', text: ok, onclick: async () => { try { const v = onok ? await onok() : true; close(v === undefined ? true : v); } catch (e) { err.textContent = e.message; } } });
+      const yes = el('button', { class: danger ? 'go bad' : 'go', text: ok, onclick: async () => {
+        yes.disabled = true; err.textContent = '';
+        try { const v = onok ? await onok() : true; close(v === undefined ? true : v); }
+        catch (e) { err.textContent = e.message; }
+        finally { yes.disabled = false; }
+      } });
       const key = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(null); } else if (e.key === 'Enter' && e.target.tagName !== 'BUTTON' && e.target.tagName !== 'TEXTAREA') { e.preventDefault(); yes.click(); } };
       const back = el('div', { class: 'back', onmousedown: (e) => { if (e.target === back) close(null); } }, el('div', { class: 'dlg', role: 'dialog', 'aria-modal': 'true', 'aria-label': title }, el('h2', { text: title }), content, err, el('div', { class: 'btns' }, cancel ? el('button', { text: cancel, onclick: () => close(null) }) : null, yes)));
       document.addEventListener('keydown', key, true); document.body.append(back); (back.querySelector('input,textarea') || yes).focus();
@@ -145,11 +150,23 @@
     if (tab === 'sessions') {
       function accessButton(s) {
         if (s.access === 'active') return null;
+        if (s.access === 'pending') return el('span', { class: 'waiting', role: 'status', text: 'Ждём согласия' });
         return el('button', { class: 'go', disabled: !s.online || s.access === 'pending', onclick: async () => {
           try {
-            await modal('Запрос доступа', el('p', { text: 'На устройстве появится окно подтверждения.' }), {
+            const info = el('p', { role: 'status', text: 'На устройстве появится окно подтверждения.' });
+            await modal('Запрос доступа', info, {
               ok: 'Отправить запрос',
-              onok: async () => { await call('request-access', { code: s.code }); return true; },
+              cancel: 'Закрыть',
+              onok: async () => {
+                info.textContent = 'Ждём согласия на устройстве. Запрос действует 40 секунд.';
+                try { await call('request-access', { code: s.code }); return true; }
+                catch (e) {
+                  info.textContent = 'Запрос завершён.';
+                  if (e.status === 409) throw new Error('Доступ не подтверждён. Проверьте статус устройства перед повторным запросом.');
+                  throw e;
+                }
+                finally { await draw(); }
+              },
             });
             await draw();
           } catch (e) { guard(e); }
@@ -164,23 +181,25 @@
       const draw = async () => {
         try {
           const rows = await call('sessions');
-          body.replaceChildren(rows.length ? el('table', null, el('thead', null, el('tr', null, ['', 'Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', ''].map((h) => el('th', { text: h })))),
+          body.replaceChildren(rows.length ? el('div', { class: 'table-scroll', role: 'region', 'aria-label': 'Устройства', tabindex: '0' },
+            el('table', null, el('thead', null, el('tr', null, ['', 'Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', 'Actions'].map((h) => el('th', { text: h, scope: 'col' })))),
             el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off' },
               el('td', { class: 'pv' }, previewTile(s)),
-              el('td', null, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null,
+              el('th', { scope: 'row' }, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null),
+              el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os, title: s.os }),
+                s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool).join(' · ') }) : null,
                 el('div', { class: 'device-switches', 'aria-label': 'Настройки устройства ' + s.code },
                   ...Object.keys(appearance).map((key) => deviceToggle(key, !!s[key], async (e) => {
                     e.currentTarget.disabled = true;
                     try { await call('look', { code: s.code, [key]: !s[key] }); await draw(); }
                     catch (err) { guard(err); }
                   })))),
-              el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os }), s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool + (r.args ? ' ' + r.args.slice(0, 40) : '')).join(' · ') }) : null),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
               el('td', null, el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
               el('td', { text: s.last_seen_s == null ? 'unknown' : ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
               el('td', { class: 'ac' }, el('div', { class: 'acts' }, accessButton(s), forgetButton(s), el('button', { class: 'go', disabled: s.access !== 'active', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
                 el('button', { title: 'glow colour and task text for this device', onclick: () => lookBox(s).then(draw).catch(guard) }, label('eye', 'Look')),
-                el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End')))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
+                el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End'))))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
         } catch (e) { guard(e); }
       };
       refreshDevices = draw; draw(); timer = setInterval(() => { draw(); top(); }, 3000);

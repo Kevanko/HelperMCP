@@ -306,3 +306,17 @@ if (Start-HelperTray) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'releas
         Remove-Item -LiteralPath $StateDir -Recurse -Force
     }
 }
+
+# A wide terminal must show all choices; a short terminal must keep the selection on screen.
+& {
+    $menu = [regex]::Match($agentSource, '(?s)Add-Type -TypeDefinition @"\r?\nusing System; using System.Collections.Concurrent;.*?\r?\n"@')
+    Assert $menu.Success 'missing console menu renderer'
+    Invoke-Expression ($menu.Value.Replace('__BUILD__','MenuFixture'))
+    $labels = @('Continue','Logs','Autostart','Quiet','Glow','Sound','Banner','Timer','Cursor','Animations','Revoke','Detach','End session')
+    $wide = [KMenuFixture.Keys]::MenuLines($labels,'HelperMCP','Access locked','Enter applies',0,100,28)
+    foreach ($label in $labels) { Assert (@($wide | Where-Object { $_.Contains($label) }).Count -eq 1) "wide menu lost $label" }
+    $short = [KMenuFixture.Keys]::MenuLines($labels,'HelperMCP','Access locked','Enter applies',12,34,10)
+    Assert ($short.Count -lt 10 -and @($short | Where-Object { $_.Contains('End session') }).Count -eq 1) 'short menu lost the selected item'
+    Assert (@($short | Where-Object { $_.Length -ge 34 }).Count -eq 0) 'narrow menu line wraps'
+    Write-Output 'Console menu lists all choices and keeps the selection visible at narrow sizes PASS'
+}

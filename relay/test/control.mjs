@@ -222,7 +222,22 @@ try {
   assert.equal((await admin('open',{code:consent.code})).status,403);
   assert.equal((await fetch(base+'/a/input',{headers:{Authorization:'Bearer '+consent.token}})).status,409);
   consent.approveAccess=true;
-  assert.equal((await admin('request-access',{code:consent.code})).status,200);
+  consent.pausePolling=true;
+  const ask = () => admin('request-access',{code:consent.code});
+  const firstAsk = ask();
+  let pending = false;
+  for (let n=0; n<40 && !pending; n++) {
+    const devices = await (await admin('sessions')).json();
+    pending = devices.find(s => s.code === consent.code)?.access === 'pending';
+    if (!pending) await sleep(25);
+  }
+  assert.ok(pending,'waiting for approval was not exposed to the admin');
+  const secondAsk = ask();
+  assert.equal(await Promise.race([secondAsk.then(r => r.status), sleep(200).then(() => 'pending')]), 'pending',
+    'duplicate request did not join the pending approval');
+  consent.pausePolling=false;
+  assert.deepEqual((await Promise.all([firstAsk,secondAsk])).map(r => r.status),[200,200]);
+  assert.equal(commands.filter(c => c.code === consent.code && c.tool === 'request_access').length,1,'duplicate access dialog');
   const granted = await (await admin('open',{code:consent.code})).json();
   assert.equal((await preview()).status,200);
   const resumed = await post(base+'/a/register',{resume:consent.code,resume_token:consent.token,mode:'auto',persist:true,access_request:1});

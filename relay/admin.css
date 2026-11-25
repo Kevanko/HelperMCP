@@ -60,3 +60,16 @@ td.pv,th:first-child{width:1%;padding-right:.2rem}
 .chk input{padding:0;width:auto}
 .device-switches{display:flex;gap:.35rem;margin-top:.4rem;flex-wrap:wrap}.device-toggle{min-width:34px;min-height:32px;font-size:16px;padding:.18rem .4rem;white-space:nowrap;color:var(--mut)}.device-toggle.on{color:var(--g);border-color:var(--line2)}button:disabled{opacity:.5;cursor:wait}.defaults>b{color:var(--g);margin-right:.3rem}
 .recent{max-width:24rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.defaults .mut{flex-basis:100%}.acts{gap:.3rem}
+.table-scroll{max-inline-size:100%;max-block-size:72vh;overflow:auto;container-type:inline-size}
+.table-scroll:focus-visible{outline:2px solid var(--g);outline-offset:2px}
+.table-scroll thead th{position:sticky;inset-block-start:0;z-index:1;background:var(--panel)}
+.table-scroll tbody th{font-weight:normal;border-bottom:1px solid rgba(22,72,43,.4);white-space:nowrap}
+.table-scroll .device-switches{flex-wrap:nowrap}
+.table-scroll .device-toggle{flex:none}
+.table-scroll .code{white-space:nowrap}
+.waiting{align-self:center;color:var(--warn)}
+@container (width < 1020px){
+  .table-scroll td.ac,.table-scroll th:last-child{white-space:normal;width:auto}
+  .table-scroll .acts{flex-wrap:wrap;min-inline-size:10rem}
+  .table-scroll .recent{max-inline-size:16rem}
+}

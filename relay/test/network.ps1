@@ -247,8 +247,10 @@ try {
     function Get-ScheduledTask { @{ TaskName = 'fixture-existing-task' } }
     function Write-AgentLog($message) { }
     function Invoke-WebRequest { @{ Content = $script:copyFixture } }
-    $fn = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Install-Autostart' }, $true)
-    Invoke-Expression $fn.Extent.Text
+    foreach ($name in 'Save-AgentCopy','Install-Autostart') {
+        $fn = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        Invoke-Expression $fn.Extent.Text
+    }
     $file = Join-Path $StateDir 'agent.ps1'
     try {
         [IO.File]::WriteAllText($file, '# working previous copy')
@@ -264,6 +266,43 @@ try {
         Write-Output 'Autostart update preserves previous valid copy and UTF-8 BOM PASS'
     } finally {
         $env:HELPER_NO_AUTOSTART = $previousNoAutostart
+        Remove-Item -LiteralPath $StateDir -Recurse -Force
+    }
+}
+
+# The actual child launch and tray handshake must wait for the console to release the session.
+& {
+    $StateDir = Join-Path $env:TEMP ('helper-detach-test-' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($StateDir)
+    $script:Code = 'TEST-CODE'; $script:Token = 'fixture-token'; $script:Persist = $true
+    function Load-Session { @{ token = $script:Token; code = $script:Code } }
+    function T($ru,$en) { $en }
+    function Check-Esc { }
+    $names = 'Save-AgentCopy','Start-DetachedHelper','Start-HelperTray'
+    $definitions = @{}
+    foreach ($name in $names) {
+        $fn = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        $definitions[$name] = $fn.Extent.Text.Replace('__BUILD__', 'DetachFixture')
+        Invoke-Expression $definitions[$name]
+    }
+    $fixture = @'
+$ErrorActionPreference = 'Stop'
+function T($ru,$en) { $en }
+if (Start-HelperTray) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'released'), 'ready') }
+'@
+    function Invoke-WebRequest { @{ Content = $definitions['Start-HelperTray'] + "`r`n" + $fixture } }
+    try {
+        Start-DetachedHelper
+        Assert ($null -ne $script:DetachGo) 'console did not receive tray readiness'
+        $releaseFile = Join-Path $StateDir 'released'
+        Assert (-not [IO.File]::Exists($releaseFile)) 'child started before console handoff'
+        [void]$script:DetachGo.Set()
+        $until = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not [IO.File]::Exists($releaseFile) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+        Assert ([IO.File]::Exists($releaseFile)) 'child did not continue after console handoff'
+        Write-Output 'Detach starts the tray before releasing the console and waits for handoff PASS'
+    } finally {
+        if ($script:DetachGo) { $script:DetachGo.Dispose(); $script:DetachGo = $null }
         Remove-Item -LiteralPath $StateDir -Recurse -Force
     }
 }

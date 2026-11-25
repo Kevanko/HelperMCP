@@ -77,6 +77,7 @@ They open it, run the line for their system and send you the code. Tell your AI:
 - **Everything is visible.** A glowing screen edge, a label with the current step, the AI's own smooth pointer.
 - **They stay in charge.** By default every action asks `Y / A(lways) / N`. **Esc** pauses or ends the session.
 - **Kept sessions reconnect.** After internet loss, VPN changes or reboot, the agent retries with the saved code when a working route is available.
+- **Detach to the notification area on Windows.** In the Helper console, press Esc and choose **Detach to notification area**. The Helper launcher can close once the icon is ready. Right-click the icon and choose **End Helper session** to stop the agent. Modes 1 and 2 require a new local approval after the handoff. In mode 1, individual requests appear in a dialog while detached. Detach applies to the current run. The separate autostart setting controls the next logon.
 
 ## The live view: System and Files
 

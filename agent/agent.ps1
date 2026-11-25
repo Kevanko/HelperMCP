@@ -1965,6 +1965,7 @@ function Confirm-LocalAccess($message, [int]$seconds) {
     if ($seconds -le 0 -or -not [Environment]::UserInteractive) { return $false }
     $dialog = New-Object Windows.Forms.Form
     $timer = New-Object Windows.Forms.Timer
+    $deadline = [DateTime]::UtcNow.AddSeconds($seconds)
     try {
         $dialog.Text = 'HelperMCP'
         $dialog.ClientSize = New-Object Drawing.Size 470, 172
@@ -1984,8 +1985,12 @@ function Confirm-LocalAccess($message, [int]$seconds) {
         $reject.SetBounds(336, 116, 112, 34)
         $dialog.Controls.AddRange([Windows.Forms.Control[]]@($label, $accept, $reject))
         $dialog.CancelButton = $reject; $dialog.AcceptButton = $reject; $dialog.ActiveControl = $reject
-        $timer.Interval = [Math]::Min(40000, $seconds * 1000)
-        $timer.Add_Tick({ $dialog.DialogResult = 'No'; $dialog.Close() })
+        $timer.Interval = if ($script:Detached) { 200 } else { [Math]::Min(40000, $seconds * 1000) }
+        $timer.Add_Tick({
+            if ([DateTime]::UtcNow -ge $deadline -or ($script:Detached -and [B__BUILD__.Tray]::End)) {
+                $dialog.DialogResult = 'No'; $dialog.Close()
+            }
+        })
         $timer.Start()
         return ($dialog.ShowDialog() -eq [Windows.Forms.DialogResult]::Yes)
     } finally { $timer.Dispose(); $dialog.Dispose() }
@@ -3662,21 +3667,25 @@ function Load-Session {
         @{ code = $d.code; token = $tok; mode = $d.mode; boot = [int]$d.boot }
     } catch { $null }
 }
+function Save-AgentCopy($f, [switch]$ForDetach) {
+    [void](New-Item $StateDir -ItemType Directory -Force)
+    $copy = [string](Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput($copy, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors.Count) { throw 'Downloaded Helper has PowerShell syntax errors; retaining the previous copy' }
+    if ($ForDetach -and -not $copy.Contains('function Start-HelperTray {')) { throw 'Downloaded Helper cannot detach.' }
+    $pending = $f + '.' + [guid]::NewGuid().ToString('N') + '.pending'
+    try {
+        [IO.File]::WriteAllText($pending, $copy, (New-Object Text.UTF8Encoding $true))
+        if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
+    } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
+}
 function Install-Autostart {   # after a reboot the helper starts again by itself, in a visible window, and resumes the same session
     if ($env:HELPER_NO_AUTOSTART) { return }
     if ($script:Preferences -and -not $script:Preferences.startup) { return }
     try {
-        [void](New-Item $StateDir -ItemType Directory -Force)
         $f = Join-Path $StateDir 'agent.ps1'
-        $copy = [string](Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content
-        $parseErrors = $null
-        [void][Management.Automation.Language.Parser]::ParseInput($copy, [ref]$null, [ref]$parseErrors)
-        if ($parseErrors.Count) { throw 'Downloaded autostart copy has PowerShell syntax errors; retaining the previous copy' }
-        $pending = $f + '.' + [guid]::NewGuid().ToString('N') + '.pending'
-        try {
-            [IO.File]::WriteAllText($pending, $copy, (New-Object Text.UTF8Encoding $true))
-            if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
-        } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
+        Save-AgentCopy $f
         $scriptPath = "'" + $f.Replace("'", "''") + "'"
         $savedPath = "'" + $SessionFile.Replace("'", "''") + "'"
         $launch = 'if (Test-Path -LiteralPath ' + $savedPath + ') { $env:HELPER_LOGON = ''1''; & ' + $scriptPath + ' }'
@@ -3703,6 +3712,95 @@ function Forget-Session {
     try { if (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction Stop } } catch { Write-AgentLog "cannot remove the logon task (needs administrator): $_" }
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
 }
+function Start-DetachedHelper {
+    $saved = Load-Session
+    if (-not $script:Persist -or -not $saved -or $saved.token -ne $script:Token -or $saved.code -ne $script:Code) {
+        throw 'Detach needs a saved copy of the current session.'
+    }
+    $name = 'Local\HelperMCP-' + [guid]::NewGuid().ToString('N')
+    $ready = New-Object Threading.EventWaitHandle($false, 'ManualReset', ($name + '-ready'))
+    $go = $null
+    $child = $null
+    $file = Join-Path $StateDir ('detach-' + $name.Substring($name.Length - 32) + '.ps1')
+    try {
+        $go = New-Object Threading.EventWaitHandle($false, 'ManualReset', ($name + '-go'))
+        Save-AgentCopy $file -ForDetach
+        $psi = New-Object Diagnostics.ProcessStartInfo (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.Arguments = '-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -File "' + $file + '"'
+        $psi.EnvironmentVariables['HELPER_DETACH'] = $name
+        $psi.EnvironmentVariables.Remove('HELPER_NEW')
+        $psi.EnvironmentVariables.Remove('HELPER_LOGON')
+        $child = [Diagnostics.Process]::Start($psi)
+        $until = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not $ready.WaitOne(150)) {
+            if ($child.HasExited -or [DateTime]::UtcNow -ge $until) { throw 'The Helper tray did not start.' }
+            Check-Esc
+        }
+        Check-Esc
+        $script:DetachGo = $go
+        Write-Host (T 'Helper продолжит работу в области уведомлений.' 'Helper will continue in the notification area.')
+    } finally {
+        $ready.Dispose()
+        if (-not $script:DetachGo) {
+            if ($child -and -not $child.HasExited) { try { $child.Kill(); [void]$child.WaitForExit(2000) } catch { } }
+            if ($go) { $go.Dispose() }
+            Remove-Item -LiteralPath $file -ErrorAction SilentlyContinue
+        }
+        if ($child) { $child.Dispose() }
+    }
+}
+function Start-HelperTray {
+    Add-Type -ReferencedAssemblies System.Drawing, System.Windows.Forms -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Threading;
+using System.Windows.Forms;
+namespace B__BUILD__ {
+  public static class Tray {
+    public static volatile bool End;
+    public static volatile string Status = "HelperMCP";
+    public static void Start(string endLabel) {
+      using (var ready = new ManualResetEventSlim()) {
+        bool visible = false;
+        var thread = new Thread(() => {
+          try {
+            using (var menu = new ContextMenuStrip())
+            using (var icon = new NotifyIcon()) {
+              menu.Items.Add(endLabel, null, (sender, args) => { End = true; });
+              icon.Icon = SystemIcons.Application;
+              icon.Text = "HelperMCP";
+              icon.ContextMenuStrip = menu;
+              icon.Visible = true;
+              icon.MouseMove += (sender, args) => { if (icon.Text != Status) icon.Text = Status; };
+              visible = true;
+              ready.Set();
+              Application.Run();
+            }
+          } catch { if (!visible) ready.Set(); else End = true; }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        ready.Wait();
+        if (!visible) throw new InvalidOperationException("HelperMCP tray could not start.");
+      }
+    }
+  }
+}
+"@
+    $ready = [Threading.EventWaitHandle]::OpenExisting($env:HELPER_DETACH + '-ready')
+    $go = [Threading.EventWaitHandle]::OpenExisting($env:HELPER_DETACH + '-go')
+    try {
+        [B__BUILD__.Tray]::Start((T 'Завершить сеанс Helper' 'End Helper session'))
+        [void]$ready.Set()
+        return ($go.WaitOne(45000) -and -not [B__BUILD__.Tray]::End)
+    } finally {
+        $go.Dispose()
+        $ready.Dispose()
+    }
+}
 function Set-ConsoleMenu {
     $startup = if ($script:Preferences.startup) { T 'Автозапуск включён' 'Autostart on' } else { T 'Автозапуск выключен' 'Autostart off' }
     $quiet = if ($script:Preferences.quiet) { T 'Тихий режим включён' 'Quiet mode on' } else { T 'Тихий режим выключен' 'Quiet mode off' }
@@ -3714,7 +3812,7 @@ function Set-ConsoleMenu {
     $items = for ($i = 0; $i -lt $look.Count; $i++) {
         $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
     }
-    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Завершить сеанс' 'End session'))
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Перейти в область уведомлений' 'Detach to notification area'), (T 'Завершить сеанс' 'End session'))
 }
 function Read-ConsoleMenu {
     $choice = [K__BUILD__.Keys]::MenuAction
@@ -3722,6 +3820,11 @@ function Read-ConsoleMenu {
     [K__BUILD__.Keys]::MenuAction = 0
     if ($choice -eq 1) {
         Write-Host ((Do-AgentLog @{ lines = 18 }).text) -ForegroundColor DarkCyan
+        return
+    }
+    if ($choice -eq 11) {
+        try { Start-DetachedHelper }
+        catch { Write-Orange (T 'Не удалось запустить значок Helper. Консоль остаётся открытой.' 'The Helper tray could not start. The console stays open.'); Write-AgentLog ('detach failed: ' + $_.Exception.GetType().Name) }
         return
     }
     if ($choice -eq 10) {
@@ -3884,10 +3987,23 @@ function Focus-Before-Question {   # the window to give the focus back to: the f
     if ((Is-Console $fg) -and $script:AiFg -ne [IntPtr]::Zero) { return $script:AiFg }
     $fg
 }
-function Check-Esc { if ([K__BUILD__.Keys]::Esc) { $script:EndRequested = $true; throw 'The user ended the session (pressed Esc). Stop all work on this PC now and tell the operator; do not retry.' } }
+function Check-Esc {
+    if ($script:Detached -and [B__BUILD__.Tray]::End) {
+        $script:FinalEnd = $true
+        [K__BUILD__.Keys]::Esc = $true
+    }
+    if ([K__BUILD__.Keys]::Esc) { $script:EndRequested = $true; throw 'The user ended the session. Stop all work on this PC now and tell the operator; do not retry.' }
+}
 function Ask-Permission($name, $a) {
     $g = $AskGroup[$name]; if ($script:Allowed[$g]) { return }
     $fg = Focus-Before-Question; $d = @(Describe-Action $name $a)
+    if ($script:Detached) {
+        $message = (T 'Разрешить действие:' 'Allow action:') + "`n" + ($d -join "`n")
+        if (-not (Confirm-LocalAccess (Cut $message 450) 35)) { throw 'The user denied this action or did not respond. Do not repeat it.' }
+        Check-Esc
+        Restore-Focus $fg
+        return
+    }
     Play-Sound 'ask'; Flash-Console; $title = $null; try { $title = $Host.UI.RawUI.WindowTitle; $Host.UI.RawUI.WindowTitle = '>> ' + (T 'ТРЕБУЕТСЯ ПОДТВЕРЖДЕНИЕ' 'CONFIRMATION NEEDED') } catch { }
     [ConsoleKey]$k = [ConsoleKey]::NoName; while ([K__BUILD__.Keys]::Q.TryDequeue([ref]$k)) { }   # keys typed before the question must not answer it
     Write-Host ''
@@ -4134,6 +4250,7 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
 
 function Start-Helper {
     $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
+    if ($script:Detached -and (-not $saved -or -not (Start-HelperTray))) { return }
     if ($env:HELPER_LOGON -and (-not $saved -or -not $script:Preferences.startup)) { return }
     $mode = Norm-Mode $env:HELPER_MODE
     if ($saved -and (Norm-Mode $saved.mode)) { $mode = Norm-Mode $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
@@ -4158,6 +4275,7 @@ function Start-Helper {
     if ($saved) { Write-Host ('  ' + (T 'Продолжаю прошлый сеанс ' 'Resuming the previous session ') + $saved.code) -ForegroundColor Yellow; $note = if ([Math]::Abs($saved.boot - (Get-BootTime)) -gt 90) { 'after a reboot' } else { 'restarted' }; Write-AgentLog "resuming session $($saved.code) ($note)" }
     $wait = 1.0; $startupFailureShown = $false
     while ($true) {   # the server can be unreachable right at the start (no internet yet, VPN still connecting): keep trying
+        if ($script:Detached -and [B__BUILD__.Tray]::End) { Forget-Session; [F__BUILD__.Route]::Stop(); return }
         try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
         catch {
             if ($saved -and [int]$_.Exception.Response.StatusCode -eq 410) {
@@ -4198,10 +4316,15 @@ function Start-Helper {
         }
     }
     Write-AgentLog "session $code $(if ($r.resumed) { 'resumed' } else { 'started' }) persist=$($script:Persist) relay=$RELAY"
-    $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
-    Enable-VT; Draw-Header $code $copied
+    if ($script:Detached) {
+        [B__BUILD__.Tray]::Status = 'HelperMCP · ' + $code
+    } else {
+        $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
+        Enable-VT; Draw-Header $code $copied
+    }
     Set-ConsoleMenu
-    [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false; try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { }
+    [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false
+    if (-not $script:Detached) { try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { } }
     if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound;if($null -ne $r.look.banner){$script:BannerOn=[bool]$r.look.banner};if($null -ne $r.look.timer){$script:TimerOn=[bool]$r.look.timer} }
     if ($r.look) { $script:CursorOn = [bool]$r.look.cursor; $script:AnimationsOn = [bool]$r.look.animations }
     Set-ConsoleMenu
@@ -4218,7 +4341,8 @@ function Start-Helper {
     try {
         while ($true) {
             Read-ConsoleMenu
-            if ($script:EndRequested) { return }
+            if ($script:EndRequested -or $script:DetachGo) { return }
+            if ($script:Detached -and [B__BUILD__.Tray]::End) { $script:FinalEnd = $true; return }
             if($script:Mode -ne 'confirm'){Start-RealtimeInput}
             if ([K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
@@ -4236,6 +4360,7 @@ function Start-Helper {
                             Stop-RealtimeInput
                             $script:Deferred.Clear()
                             $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token
+                            if ($script:Detached) { [B__BUILD__.Tray]::Status = 'HelperMCP · ' + $code }
                             if ($script:Persist) { Save-Session $code $script:Token $script:Mode }
                             Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
@@ -4274,7 +4399,12 @@ function Start-Helper {
         if ($final) { Forget-Session }
         try { if ((Get-Clipboard -Raw).Trim() -eq $code) { Set-Clipboard -Value ' ' } } catch { }   # the session code does not stay in the clipboard
         if ($script:VT) { try { $e = [char]27; [Console]::Write("$e[r$e[$([Console]::WindowHeight);1H`n") } catch { } }   # the header's scroll region off, the prompt back at the bottom
+        if ($script:DetachGo) {
+            try { if (-not $final) { [void]$script:DetachGo.Set() } } finally { $script:DetachGo.Dispose() }
+        }
     }
 }
-Start-Helper
-$ErrorActionPreference = $prevEAP
+$script:Detached = $env:HELPER_DETACH -match '^Local\\HelperMCP-[0-9a-f]{32}$' -and $PSCommandPath -eq (Join-Path $StateDir ('detach-' + ($env:HELPER_DETACH -split '-')[-1] + '.ps1'))
+if ($script:Detached) { Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue }
+try { Start-Helper }
+finally { $ErrorActionPreference = $prevEAP }

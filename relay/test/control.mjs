@@ -89,6 +89,9 @@ try {
   await admin('settings',{sound:false});
   const urls=await(await admin('open',{code:first.code})).json();
   const viewer=urls.watch,ctl=new URL(urls.control).hash.slice(3),client='a'.repeat(32),other='b'.repeat(32);
+  const viewerPolicy = (await fetch(viewer)).headers.get('content-security-policy');
+  const socketSource = viewer.replace('http:', 'ws:') + '/input-ws';
+  assert.equal(viewerPolicy.match(/connect-src ([^;]+);/)[1], "'self' " + socketSource,'viewer policy does not allow its exact socket');
   const CH={'x-ctl':ctl,'x-viewer-client':client};
   assert.equal((await post(viewer+'/look',{note:'  Desktop   diagnosis  '},CH)).status,200);
   assert.equal((await(await fetch(viewer+'/state')).json()).look.note,'Desktop diagnosis');

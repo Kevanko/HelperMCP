@@ -1149,7 +1149,7 @@ function monMap(ms,cur){const k=JSON.stringify(ms)+cur;if(k===mapKey)return;mapK
  mk(-1,ru?'все':'all',all);
  ms.forEach((x,i)=>{const u=document.createElement('u');u.style.cssText='width:'+Math.max(10,Math.round(x[2]*s*1.6))+'px;height:'+Math.max(7,Math.round(x[3]*s*1.6))+'px';mk(i,(i+1)+' '+x[2]+'\u00d7'+x[3]+(x[4]?'\u2605':''),u)})}
 function pick(v){mon=v<0?'':String(v);if(abort)abort.abort()}
-addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||control)return;if(!/^[0-9]$/.test(e.key))return;
+addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||(control&&e.target===cv))return;if(!/^[0-9]$/.test(e.key))return;
  const n=+e.key,ms=window.__mons||[];if(n===0)pick(-1);else if(n<=ms.length)pick(n-1)});
 function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
  if(ty==='S'){try{sysPanel(JSON.parse(td.decode(p)))}catch(_){}return}
@@ -1298,7 +1298,15 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
       const s = sessions.get(v.code);
       if (s && !hasAccess(s)) return json(res, 403, { error: 'Request access on the device first.' });
-      if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
+      if (!vw[2]) {
+        const origin = new URL(baseUrl(req));
+        if (v.ctl && ['https:', 'http:'].includes(origin.protocol) && /^[a-z0-9.:[\]-]+$/i.test(origin.host)) {
+          const ws = (origin.protocol === 'https:' ? 'wss://' : 'ws://') + origin.host + p + '/input-ws';
+          const policy = String(res.getHeader('content-security-policy'));
+          res.setHeader('content-security-policy', policy.replace("connect-src 'self';", "connect-src 'self' " + ws + ";"));
+        }
+        return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
+      }
       if (!s) return json(res, 410, { error: 'session ended' });
       const client = String(req.headers['x-viewer-client'] || 'legacy');
       if (!/^(legacy|[a-zA-Z0-9-]{16,64})$/.test(client)) return json(res, 400, { error: 'invalid viewer client' });

@@ -256,7 +256,9 @@ if (useps) {
   assert.ok(!agentOut.includes(privateInput.slice(0, 35)), 'agent console must not preview private text');
   const ag = txt(await tool('ui_tree', { session: code, window: 'HM UI Test', query: 'Agree' })); const agId = /\n(\d+) check "Agree"/.exec(ag)[1];
   assert.match(txt(await tool('ui_click', { session: code, id: Number(agId) })), /toggled \(now on\)/);
-  const bad = await raw('ui_click', { session: code, name: 'no-such-control-xyz', window: 'HM UI Test' }); assert.ok(bad.isError && /No control named/.test(txt(bad)), 'a missing control says so'); console.log('ui_tree / ui_click / ui_set ok');
+  const bad = await tool('ui_click', { session: code, name: 'no-such-control-xyz', window: 'HM UI Test' });
+  assert.ok(bad.isError && /No control named/.test(txt(bad)), 'a missing control says so: ' + txt(bad));
+  console.log('ui_tree / ui_click / ui_set ok');
   form.kill();
   // a window that draws its own text (no controls for UI Automation: like a game): ui_tree falls back to reading the picture (OCR), ui_click presses the text
   const ocrFile = path.join(tmp, 'ocrform.ps1');

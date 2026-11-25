@@ -50,6 +50,7 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
     const r=await fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+a.token},signal:a.abort.signal});
     if(r.status===204){await sleep(50);continue;}if(!r.ok)break;
     const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args});
+    if(c.tool==='press_key'&&a.holdPress)await a.holdPress;
     if(c.tool==='stream'){if(c.args.on)startStream(a);else{a.upload?.end();a.upload=null;}}
     let data={text:'ok'};
     if(c.tool==='request_access')data={approved:a.approveAccess === true};
@@ -140,6 +141,17 @@ try {
     assert.equal((await mouse('up',2)).status,200);
     assert.ok(!(await queuedKey).isError,'queued bot input did not resume after the manual gesture');
     assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).args.after_viewer_input,true,'bot kept its pre-gesture focus bookmark');
+    let finishBotKey;
+    first.holdPress = new Promise(resolve => { finishBotKey = resolve; });
+    const runningKey = sharedKey();
+    try {
+      for (let n=0; n<40 && commands.filter(c=>c.code===first.code&&c.tool==='press_key').length<keyCount+2; n++) await sleep(25);
+      assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').length,keyCount+2);
+      const busy = await post(viewer+'/input',{a:'click',x:20,y:40},CH);
+      assert.equal(busy.status,409);
+      assert.equal((await busy.json()).error,'desktop-busy','manual click overlapped a running bot key');
+    } finally { first.holdPress=null; finishBotKey(); }
+    assert.ok(!(await runningKey).isError);
     assert.equal((await post(viewer+'/takeover',{on:true},CH)).status,200);
   } finally { await Promise.all(observers.map((observer) => observer.close())); }
   const upload=await fetch(viewer+'/upload?drop=1&name='+encodeURIComponent('../Тестовый файл.txt'),{method:'POST',headers:CH,body:'private fixture content'});
@@ -156,11 +168,11 @@ try {
   assert.equal((await post(viewer+'/input',{a:'keyboard',phase:'down',vk:162,seq:3},CH)).status,200);
   assert.equal((await post(viewer+'/input',{a:'keyboard',phase:'up',vk:162,seq:4},CH)).status,200);
   assert.equal((await post(viewer+'/input',{a:'keyboard',phase:'down',vk:1000,seq:5},CH)).status,400);
+  const pointer=commands.find(c=>c.tool==='viewer_pointer'&&c.args.op==='down'&&c.args.gesture===gesture);
   const keyboard=commands.find(c=>c.tool==='viewer_pointer'&&c.args.op==='kdown');
-  assert.equal(keyboard.args.x,162);assert.equal(keyboard.args.owner,commands.find(c=>c.tool==='viewer_pointer'&&c.args.op==='down').args.owner);
+  assert.equal(keyboard.args.x,162);assert.equal(keyboard.args.owner,pointer.args.owner);
   const pointerLog=await(await fetch(viewer+'/log')).json();
   assert.ok(pointerLog.filter(e=>e.tool==='viewer_pointer').every(e=>!e.args.includes('owner')&&!e.args.includes('gesture')),'pointer logs leaked protocol identifiers');
-  const pointer=commands.find(c=>c.tool==='viewer_pointer'&&c.args.op==='down');
   assert.match(pointer.args.owner,/^[a-f0-9]{64}$/);assert.equal(pointer.args.gesture,gesture);
   assert.equal((await post(viewer+'/input',{a:'pointer',phase:'down',gesture,seq:-1},CH)).status,400);
   assert.equal((await post(viewer+'/takeover',{on:false},CH)).status,200);

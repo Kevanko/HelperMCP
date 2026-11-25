@@ -79,7 +79,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     if (api === 'status') { send(res, 200, d.status()); return true; }
     if (api === 'sessions') {
       send(res, 200, [...d.sessions].map(([code, s]) => ({
-        code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, online: d.isOnline(s), paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
+        code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, online: d.isOnline(s), access: d.hasAccess(s) ? 'active' : s.accessRequest ? 'pending' : 'required', paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
         last_seen_s: d.contactAge(s), created: s.created, ip: s.ip, running: s.pending.size, queued: s.queue.length, note: s.note || '', color: s.lookForce || s.lookColor || '', ...d.effLook(s),
         recent: (s.log || []).slice(-6).map((l) => ({ ago_s: Math.round((now - l.t) / 1000), tool: l.tool, args: l.args })),
       })).sort((a, b) => Number(b.online) - Number(a.online) || (a.last_seen_s ?? Infinity) - (b.last_seen_s ?? Infinity))); return true;
@@ -88,19 +88,32 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     if (api === 'preview') {   // a small square screenshot for the sessions list; cached briefly so the list poll doesn't hammer the agent
       const code = String(url.searchParams.get('code') || '').toUpperCase(), s = d.sessions.get(code);
       if (!s) { res.writeHead(404); return res.end(); }
+      if (!d.hasAccess(s)) { previews.delete(code); res.writeHead(403); return res.end(); }
       const cached = previews.get(code);
-      if (cached && now - cached.t < PREVIEW_TTL) { res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(cached.buf); }
+      const epoch = s.accessEpoch;
+      if (cached && cached.session === s && cached.epoch === epoch && now - cached.t < PREVIEW_TTL) { res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); return res.end(cached.buf); }
       try {
         const r = await d.call(code, 'screenshot', { view: true, max_width: 220, quality: 45 }, 12_000, { human: true });
-        if (!r.jpeg) { res.writeHead(204); return res.end(); }
-        previews.set(code, { buf: r.jpeg, t: now }); res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); res.end(r.jpeg);
+        if (!r.jpeg || !d.hasAccess(s) || s.accessEpoch !== epoch || d.sessions.get(code) !== s) { res.writeHead(204); return res.end(); }
+        previews.set(code, { buf: r.jpeg, t: now, session: s, epoch }); res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store' }); res.end(r.jpeg);
       } catch { res.writeHead(204); res.end(); } return true;
     }
     if (req.method !== 'POST') { send(res, 404, { error: 'unknown' }); return true; }
     const b = JSON.parse((await d.body(req, 5000)) || '{}');
     if (api === 'open') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      if (!d.hasAccess(d.sessions.get(code))) { send(res, 403, { error: 'Request access on the device first.' }); return true; }
       const l = d.makeViewer(code, d.baseUrl(req)); d.audit('admin_open', { code }); send(res, 200, { control: l.control, watch: l.watch }); return true;
+    }
+    if (api === 'request-access') {
+      const code = String(b.code || '').toUpperCase();
+      if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      try {
+        await d.requestAccess(code);
+        d.audit('admin_access_approved', { code });
+        send(res, 200, { access: 'active' });
+      } catch (e) { send(res, 409, { error: e.message }); }
+      return true;
     }
     if (api === 'look') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
@@ -119,7 +132,12 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
       try {
         const r = await d.call(code, 'set_mode', { mode }, 15_000, { human: true });
-        const s = d.sessions.get(code); if (s) { s.mode = mode; d.save(); }   // the agent applied it; keep the relay's own record in step
+        const s = d.sessions.get(code);
+        if (s) {
+          if (s.info?.access_request && s.mode === 'unattended' && mode !== 'unattended') d.clearAccess(code, s, 'Access mode changed on the device.');
+          s.mode = mode;
+          d.save();
+        }
         d.audit('admin_mode', { code, mode }); send(res, 200, { text: r?.text || mode });
       } catch (e) { send(res, 400, { error: e.message }); } return true;
     }
@@ -127,6 +145,15 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
       await d.endSession(code);
       d.audit('admin_end', { code }); send(res, 200, {}); return true;
+    }
+    if (api === 'forget') {
+      const code = String(b.code || '').toUpperCase();
+      if (!d.sessions.has(code)) { send(res, 404, { error: 'no such device' }); return true; }
+      await d.forgetDevice(code);
+      previews.delete(code);
+      d.audit('admin_forget', { code });
+      send(res, 200, {});
+      return true;
     }
     if (api === 'password') {
       const adm = readAdmin(d.dir), np = String(b.new || '');

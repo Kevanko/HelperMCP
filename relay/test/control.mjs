@@ -39,8 +39,8 @@ function startStream(a) {
   const timer=setInterval(send,300);send();
 }
 async function post(url,body,headers={}) { return fetch(url,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)}); }
-async function fakeAgent(host,pointer=0,realtime=0) {
-  const a=await(await post(base+'/a/register',{os:'Windows 11 (synthetic fixture)',host,user:'Test',mode:'auto',persist:true,viewer_pointer:pointer,viewer_keyboard:pointer,viewer_realtime:realtime})).json();
+async function fakeAgent(host,pointer=0,realtime=0,options={}) {
+  const a=await(await post(base+'/a/register',{os:'Windows 11 (synthetic fixture)',host,user:'Test',mode:'auto',persist:true,viewer_pointer:pointer,viewer_keyboard:pointer,viewer_realtime:realtime,...options})).json();
   a.abort=new AbortController();agents.push(a);
   a.inputLines=[];
   if(realtime){const stream=await fetch(base+'/a/input',{headers:{Authorization:'Bearer '+a.token},signal:a.abort.signal});assert.equal(stream.status,200);
@@ -52,6 +52,7 @@ async function fakeAgent(host,pointer=0,realtime=0) {
     const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args});
     if(c.tool==='stream'){if(c.args.on)startStream(a);else{a.upload?.end();a.upload=null;}}
     let data={text:'ok'};
+    if(c.tool==='request_access')data={approved:a.approveAccess === true};
     if(c.tool==='screenshot')data={jpeg:picture.toString('base64'),mime:'image/png',h:'fixture',sc:1};
     if(c.tool==='sysdata')data={text:JSON.stringify(c.args.kind==='procs'?{p:[]}:c.args.kind==='adapters'?'Ethernet [Up] if=14 1 Gbit/s; synthetic fixture':{})};
     if(c.tool==='net_check')data={text:JSON.stringify({fixture:true,mode:c.args.mode,routes:[]})};
@@ -211,6 +212,28 @@ try {
   assert.ok(!stopped.some(s=>s.code===realtime.code),'end retained the session');
   assert.ok(commands.some(c=>c.code===realtime.code&&c.tool==='bye'),'end did not tell the agent to exit');
   console.log('Viewer end requires the control link and closes only the selected session PASS');
+  // Secure standby on modes 1 and 2, with approval delivered by the paired agent.
+  const denied = await fakeAgent('Consent-denied',0,0,{access_request:1,mode:'confirm'});
+  assert.equal((await admin('request-access',{code:denied.code})).status,409);
+  assert.equal((await admin('open',{code:denied.code})).status,403);
+  const consent = await fakeAgent('Consent-approved',0,0,{access_request:1,device_id:'consent-fixture-device'});
+  const preview = () => admin('preview?code='+consent.code);
+  assert.equal((await preview()).status,403);
+  assert.equal((await admin('open',{code:consent.code})).status,403);
+  assert.equal((await fetch(base+'/a/input',{headers:{Authorization:'Bearer '+consent.token}})).status,409);
+  consent.approveAccess=true;
+  assert.equal((await admin('request-access',{code:consent.code})).status,200);
+  const granted = await (await admin('open',{code:consent.code})).json();
+  assert.equal((await preview()).status,200);
+  const resumed = await post(base+'/a/register',{resume:consent.code,resume_token:consent.token,mode:'auto',persist:true,access_request:1});
+  assert.equal(resumed.status,200);
+  assert.equal((await fetch(granted.watch)).status,404,'a pre-reconnect viewer survived');
+  assert.equal((await preview()).status,403,'cached preview survived a reconnect');
+  assert.equal((await admin('forget',{code:consent.code})).status,200);
+  assert.equal((await post(base+'/a/register',{resume:consent.code,resume_token:consent.token,access_request:1})).status,410);
+  const fresh = await (await post(base+'/a/register',{device_id:'consent-fixture-device',access_request:1})).json();
+  assert.ok(fresh.code && fresh.code !== consent.code,'forgotten device inherited the old code');
+  console.log('Consent gates preview, viewer and native input, resets on reconnect and forget revokes the old code PASS');
   if(process.argv.includes('--serve')) {
     const out=process.env.UI_FIXTURE_PATH;
     if(out)fs.writeFileSync(out,JSON.stringify({base,user:creds.user,password:creds.password,control:urls.control,watch:urls.watch,temp}));

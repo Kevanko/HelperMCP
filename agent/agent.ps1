@@ -1943,6 +1943,16 @@ function Do-TaskDone($a) {
 }
 function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
     $m = Norm-Mode $a.mode; if (-not $m) { throw "unknown mode '$($a.mode)'" }
+    $levels = @{ confirm = 0; auto = 1; unattended = 2 }
+    if ($levels[$m] -gt $levels[$script:Mode]) {
+        $message = if ($m -eq 'unattended') {
+            T 'Разрешить постоянный доступ без запроса при подключении, в том числе после входа в Windows?' 'Allow unattended access without a prompt, including after signing in to Windows?'
+        } else {
+            T 'Разрешить помощнику выполнять действия без отдельного подтверждения каждого действия?' 'Allow the helper to perform actions without asking for each action?'
+        }
+        if (-not (Confirm-LocalAccess $message 35)) { throw 'The user declined the requested access mode.' }
+    }
+    if ($script:Mode -eq 'unattended' -and $m -ne 'unattended') { $script:AccessApproved = $false; Stop-RealtimeInput }
     $script:Mode = $m; [K__BUILD__.Keys]::Unattended = ($m -eq 'unattended')
     if($m -eq 'confirm'){Stop-RealtimeInput}else{Start-RealtimeInput}
     if ($script:Persist) { Save-Session $script:Code $script:Token $m; if (-not $env:HELPER_NO_AUTOSTART) { Install-Autostart } }
@@ -1950,6 +1960,42 @@ function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch
     Write-Host ('  ' + (T 'Администратор сменил режим на ' 'The administrator switched the mode to ') + $m) -ForegroundColor Yellow
     Draw-Header $script:Code $false; Show-Status
     @{ text = $m }
+}
+function Confirm-LocalAccess($message, [int]$seconds) {
+    if ($seconds -le 0 -or -not [Environment]::UserInteractive) { return $false }
+    $dialog = New-Object Windows.Forms.Form
+    $timer = New-Object Windows.Forms.Timer
+    try {
+        $dialog.Text = 'HelperMCP'
+        $dialog.ClientSize = New-Object Drawing.Size 470, 172
+        $dialog.StartPosition = 'CenterScreen'
+        $dialog.FormBorderStyle = 'FixedDialog'
+        $dialog.MaximizeBox = $false; $dialog.MinimizeBox = $false; $dialog.TopMost = $true
+        $label = New-Object Windows.Forms.Label
+        $label.Text = $message
+        $label.SetBounds(20, 20, 430, 82)
+        $accept = New-Object Windows.Forms.Button
+        $accept.Text = T 'Разрешить' 'Allow'
+        $accept.DialogResult = 'Yes'
+        $accept.SetBounds(210, 116, 112, 34)
+        $reject = New-Object Windows.Forms.Button
+        $reject.Text = T 'Отклонить' 'Decline'
+        $reject.DialogResult = 'No'
+        $reject.SetBounds(336, 116, 112, 34)
+        $dialog.Controls.AddRange([Windows.Forms.Control[]]@($label, $accept, $reject))
+        $dialog.CancelButton = $reject; $dialog.AcceptButton = $reject; $dialog.ActiveControl = $reject
+        $timer.Interval = [Math]::Min(40000, $seconds * 1000)
+        $timer.Add_Tick({ $dialog.DialogResult = 'No'; $dialog.Close() })
+        $timer.Start()
+        return ($dialog.ShowDialog() -eq [Windows.Forms.DialogResult]::Yes)
+    } finally { $timer.Dispose(); $dialog.Dispose() }
+}
+function Do-RequestAccess($a) {
+    if ([string]$a.request -notmatch '^[0-9a-f-]{36}$' -or -not $a.deadline_ms) { return @{ approved = $false } }
+    $left = [Math]::Floor(([long]$a.deadline_ms - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) / 1000)
+    $message = T 'Оператор Helper запрашивает доступ к экрану и управлению. Разрешайте только если ждёте помощи.' 'A Helper operator is requesting screen access and control. Allow only if you are expecting assistance.'
+    $script:AccessApproved = Confirm-LocalAccess $message ([int][Math]::Max(0, [Math]::Min(35, $left)))
+    @{ approved = $script:AccessApproved }
 }
 function Do-PressKey($a) {
     $kc = $null; try { $kc = [V__BUILD__.Caret]::Get() } catch { }; $kr = [V__BUILD__.Probe]::FgRect(); $am = Arrow-Mask; $pb = Probe-Take $kr (@(Caret-Mask $kc) + $am)
@@ -3668,7 +3714,7 @@ function Set-ConsoleMenu {
     $items = for ($i = 0; $i -lt $look.Count; $i++) {
         $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
     }
-    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + (T 'Завершить сеанс' 'End session')
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Завершить сеанс' 'End session'))
 }
 function Read-ConsoleMenu {
     $choice = [K__BUILD__.Keys]::MenuAction
@@ -3676,6 +3722,24 @@ function Read-ConsoleMenu {
     [K__BUILD__.Keys]::MenuAction = 0
     if ($choice -eq 1) {
         Write-Host ((Do-AgentLog @{ lines = 18 }).text) -ForegroundColor DarkCyan
+        return
+    }
+    if ($choice -eq 10) {
+        if ($script:Mode -eq 'unattended') {
+            Write-Orange (T 'В режиме постоянного доступа завершите сеанс.' 'In unattended mode, end the session to stop access.')
+            return
+        }
+        $script:AccessApproved = $false
+        Stop-RealtimeInput
+        [F__BUILD__.Live]::Stop()
+        $script:Deferred.Clear()
+        try {
+            [void](Api '/a/access/revoke' @{} $script:Token 6)
+            Write-Host (T 'Доступ отозван. Helper ждёт нового запроса.' 'Access revoked. Helper is waiting for a new request.')
+        } catch {
+            $script:EndRequested = $true
+            $script:FinalEnd = $true
+        }
         return
     }
     if ($choice -ge 4) {
@@ -3931,6 +3995,7 @@ function Stop-RealtimeInput {
 }
 function Start-RealtimeInput {
     if($script:Mode -eq 'confirm' -or -not $script:Token){return}
+    if ($script:Mode -ne 'unattended' -and -not $script:AccessApproved) { return }
     $uri=[Uri]$RELAY;$proxy=[F__BUILD__.Route]::Proxy;$proxyUri=''
     if(-not $proxy.IsBypassed($uri)){$proxyUri=$proxy.GetProxy($uri).AbsoluteUri}
     if($script:FastInputProc -and -not $script:FastInputProc.HasExited -and $script:FastInputToken -eq $script:Token -and $script:FastInputProxy -eq $proxyUri){return}
@@ -3995,7 +4060,7 @@ function Process-Command($cmd) {
     $manualInput = $a.viewer_input -and $name -in 'move','click','drag','scroll','type_text','press_key','viewer_pointer'
     if ($manualInput) { $script:AiAt = $null }   # handback must not restore a window from before the human's edits
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
-    $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode'
+    $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode', 'request_access'
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
@@ -4010,6 +4075,9 @@ function Process-Command($cmd) {
     $quietCall = $Quiet.ContainsKey($name) -or $meta -or $viewFrame -or $name -eq 'viewer_pointer'; if (-not $quietCall) { Overlay-Send 'busy' }
     try {
         Check-Esc
+        if ($script:Mode -ne 'unattended' -and -not $script:AccessApproved -and $name -notin 'request_access','look','set_mode') {
+            throw 'ACCESS_REQUIRED: the user must first approve access on the device.'
+        }
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta -and -not $pointerRelease) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
         $needsConsent = $AskTools -contains $name -or ($name -eq 'net_check' -and $a.mode -eq 'profile')
         if ($script:Mode -eq 'confirm' -and $needsConsent -and -not ($name -eq 'net_recover' -and $a.op -in 'list', 'templates', 'status', 'rollback') -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
@@ -4018,6 +4086,7 @@ function Process-Command($cmd) {
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
             actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; ui_tree = 'Do-UiTree'; ui_click = 'Do-UiClick'; ui_set = 'Do-UiSet'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; net_check = 'Do-NetCheck'; net_recover = 'Do-NetRecover'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if ($name -eq 'viewer_pointer') { $fn='Do-ViewerPointer' }
+        if ($name -eq 'request_access') { $fn='Do-RequestAccess' }
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true
         $res.data = if ($manualInput -and $name -notin 'drag','viewer_pointer') { Do-ViewerInput $name $a } else { & $fn $a }
@@ -4057,7 +4126,7 @@ function Net-State($st) {
 
 function Register-Agent($mode, $resume, $resumeToken, $note) {
     $os = try { (Static-Sys).os } catch { [Environment]::OSVersion.VersionString }
-    $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1;viewer_realtime=1 }
+    $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1; viewer_realtime = 1; access_request = 1 }
     if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
@@ -4149,6 +4218,7 @@ function Start-Helper {
     try {
         while ($true) {
             Read-ConsoleMenu
+            if ($script:EndRequested) { return }
             if($script:Mode -ne 'confirm'){Start-RealtimeInput}
             if ([K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
             if ($script:Deferred.Count) { $cmd = $script:Deferred[0]; $script:Deferred.RemoveAt(0) }
@@ -4161,7 +4231,13 @@ function Start-Helper {
                     if ($sc -eq 410) { Write-Host (T 'сессия закрыта (помощник завершил её)' 'session closed (ended by the helper)'); $script:FinalEnd = $true; return }
                     if ($sc -eq 401) {   # unknown to the server: it was reset or we were away too long -> register again, same code if possible
                         try {
-                            $r = Register-Agent $script:Mode $code $script:Token 'relay lost its state'; $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; if ($script:Persist) { Save-Session $code $script:Token $script:Mode }; Write-AgentLog 'registered again after the relay lost its state'
+                            $r = Register-Agent $script:Mode $code $script:Token 'relay lost its state'
+                            $script:AccessApproved = $false
+                            Stop-RealtimeInput
+                            $script:Deferred.Clear()
+                            $script:Token = $r.token; $code = $script:Code = $r.code; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token
+                            if ($script:Persist) { Save-Session $code $script:Token $script:Mode }
+                            Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
                         } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }

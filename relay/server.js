@@ -263,6 +263,7 @@ function safeUploadName(raw){
 }
 
 function makeViewer(c, base = lastBase) {
+  if (!hasAccess(sessions.get(c))) throw new Error('Request access on the device first.');
   const token = crypto.randomBytes(18).toString('hex'), ctl = crypto.randomBytes(12).toString('hex');
   viewers.set(token, { code: c, exp: Date.now() + VIEWER_TTL_MS, ctl }); save();
   return { watch: `${base}/v/${token}`, control: `${base}/v/${token}#c=${ctl}` };
@@ -299,6 +300,8 @@ const safeEq = (a, b) => {
 const TAKEOVER_MS = 5 * 60_000;
 const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   // the operator is fixing something by hand in the live viewer
 const desktopObservations = new Set(['screenshot', 'sysinfo', 'agent_log']);
+const hasAccess = (s) => !!s && (!s.info?.access_request || s.mode === 'unattended' || s.accessGranted === true);
+const standbyTools = new Set(['request_access', 'look', 'set_mode', 'bye']);
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
@@ -306,6 +309,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
     return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
   }
   if (s.ending && tool !== 'bye') return Promise.reject(new Error('The session is ending.'));
+  if (!hasAccess(s) && !standbyTools.has(tool)) return Promise.reject(new Error('ACCESS_REQUIRED: request access and wait for the user to approve it on the device.'));
   if (takenOver(s) && !opts.human && tool !== 'bye' && !desktopObservations.has(tool)) {
     return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
@@ -315,7 +319,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   }
   if (!opts.release && tool !== 'bye' && s.pending.size >= 64) return Promise.reject(new Error('This device already has 64 pending commands. Wait for work to finish before sending more.'));
   // in "ask" mode a human must click through prompts, give them time
-  if (s.mode === 'confirm' && tool !== 'bye') timeoutMs += 120_000;
+  if (s.mode === 'confirm' && tool !== 'bye' && tool !== 'request_access') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
   const passivePointer = tool === 'viewer_pointer' && ['move','keep','kkeep'].includes(args.op);
@@ -364,15 +368,54 @@ function flush(s) {
 }
 
 const ended = new Map();   // codes the user (or operator) ended: an agent that still tries to come back with one is told to stop (for an hour)
+function clearAccess(code, s, reason) {
+  s.accessGranted = false;
+  s.accessEpoch = (s.accessEpoch || 0) + 1;
+  s.accessRequest = null;
+  s.viewerShown = false;
+  s.log.length = 0;
+  s.took = null;
+  s.lastC = null;
+  s.lastS = null;
+  s.takeover = 0;
+  s.takeoverOwner = '';
+  liveEnd(s);
+  s.fastInput?.end();
+  s.queue.length = 0;
+  for (const pending of s.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error(reason)); }
+  s.pending.clear();
+  for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }
+  for (const [token, viewer] of viewers) if (viewer.code === code) viewers.delete(token);
+}
+
+async function requestAccess(code) {
+  const s = sessions.get(code);
+  if (!s || !isOnline(s) || s.ending) throw new Error('The device is offline or ending its session.');
+  if (hasAccess(s)) return;
+  if (s.accessRequest) throw new Error('The device already has a pending access request.');
+  if (Date.now() - (s.lastAccessRequest || 0) < 10_000) throw new Error('Wait before requesting access again.');
+  s.lastAccessRequest = Date.now();
+  const request = crypto.randomUUID();
+  s.accessRequest = request;
+  try {
+    const reply = await call(code, 'request_access', { request, deadline_ms: Date.now() + 40_000 }, 42_000, { human: true });
+    if (sessions.get(code) !== s || s.accessRequest !== request || s.ending || reply?.approved !== true) {
+      throw new Error('The user did not approve access.');
+    }
+    s.accessGranted = true;
+    evPush(s, { t: Date.now(), type: 'access_granted' });
+    save();
+  } finally {
+    if (s.accessRequest === request) s.accessRequest = null;
+  }
+}
+
 function drop(code, why) {
   const s = sessions.get(code);
   if (!s) return;
   ended.set(code, Date.now());
-  sessions.delete(code); s.log.length = 0; s.queue.length = 0; liveEnd(s);s.fastInput?.end();
-  for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }   // files fetched in this session die with it
-  for (const [t, v] of viewers) if (v.code === code) { v.last = null; viewers.delete(t); }                          // so do viewer links and their last frame
+  sessions.delete(code); s.log.length = 0; clearAccess(code, s, why);
   save();
-  for (const p of s.pending.values()) { clearTimeout(p.timer); p.reject(new Error(why)); }
   if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 410, { error: why }); }
 }
 
@@ -395,6 +438,12 @@ function endSession(code) {
     if (sessions.get(code) === s) drop(code, 'The operator ended the session. STOP and do not retry.');
   });
   return s.ending;
+}
+
+async function forgetDevice(code) {
+  for (const [id, remembered] of devices) if (remembered === code) devices.delete(id);
+  await endSession(code);
+  save();
 }
 
 setInterval(() => {
@@ -471,7 +520,7 @@ const tools = [
     run: async () => ({
       text: JSON.stringify([...sessions].map(([code, s]) => ({
         code, os: s.info.os, host: s.info.host, user: s.info.user, mode: s.mode,
-        online: isOnline(s), last_seen_s: contactAge(s), ...(s.lastPoll && isOnline(s) && Date.now() - s.lastPoll > 20_000 ? { stuck_s: Math.round((Date.now() - s.lastPoll) / 1000), stuck_in: s.took?.tool || '?' } : {}),
+        online: isOnline(s), access: hasAccess(s) ? 'active' : s.accessRequest ? 'pending' : 'required', last_seen_s: contactAge(s), ...(s.lastPoll && isOnline(s) && Date.now() - s.lastPoll > 20_000 ? { stuck_s: Math.round((Date.now() - s.lastPoll) / 1000), stuck_in: s.took?.tool || '?' } : {}),
         connected_s: Math.round((Date.now() - s.created) / 1000), paused: s.paused, kept: s.persist, events: s.events.length,
         last_event: s.events.length ? { type: s.events[s.events.length - 1].type, ago_s: Math.round((Date.now() - s.events[s.events.length - 1].t) / 1000) } : undefined,
       })), null, 2),
@@ -553,7 +602,7 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session (it was ended)');
       const until = Date.now() + (a.timeout_s || 40) * 1000;
-      while (Date.now() < until) { if (!sessions.has(c)) throw new Error('The session was ended by the user'); if (isOnline(s) && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
+      while (Date.now() < until) { if (sessions.get(c) !== s) throw new Error('The session was ended by the user'); if (isOnline(s) && !hasAccess(s)) return { text: 'online; access required' }; if (isOnline(s) && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
       return { text: takenOver(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${contactText(s)}); call wait_online again or ask the operator` };
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
@@ -689,6 +738,9 @@ const tools = [
     props: { job: str('Job id from the "still running" message'), wait_s: { type: 'integer', minimum: 1, maximum: 55, description: 'default 40' } }, required: ['job'],
     run: async (a) => waitJob(a.job, (a.wait_s || 40) * 1000) },
   { name: 'mcp_stop', agent: true, description: 'Stop an MCP server started with mcp_start.', props: { name: str('Name') }, required: ['name'] },
+  { name: 'request_access', session: true, props: {},
+    description: 'Ask the local device user for permission to start remote help. A refusal means stop. Required before accessing a Windows device marked access: required.',
+    run: async (code) => { await requestAccess(code.toUpperCase()); return { text: 'Access approved.' }; } },
   { name: 'open_viewer', session: true, props: {},
     description: 'Get a link to a live view of the remote screen (updates about once a second, plus a log of what the AI is doing). Open it in a browser so the operator can watch; on the operator\'s PC e.g. `start <url>` (Windows), `xdg-open <url>` (Linux), `open <url>` (macOS).',
     run: async (code) => {
@@ -818,7 +870,7 @@ function buildMcp(fixed) {
       if (hint) out.content.push({ type: 'text', text: hint });
       if (name === 'sysinfo' && sx && !sx.pitfallsShown) { sx.pitfallsShown = true; const pf = pitfalls(sx); if (pf) out.content.push({ type: 'text', text: pf }); }
       if (sx?.uploads?.length) { out.content.push({ type: 'text', text: 'The operator put these files on the remote PC from the live view: ' + sx.uploads.splice(0).join('; ') }); }
-      if (sx && !sx.viewerShown && name !== 'open_viewer' && name !== 'end_session') {   // the first answer carries the live view: the operator gets it right away
+      if (hasAccess(sx) && !sx.viewerShown && name !== 'open_viewer' && name !== 'end_session') {   // the first answer carries the live view: the operator gets it right away
         sx.viewerShown = true; const l = makeViewer(String(session).toUpperCase());
         out.content.push({ type: 'text', text: `LIVE VIEW of this session for the operator: open it in their browser now if you can run commands on their machine (Windows: start "" "${l.control}"; macOS: open; Linux: xdg-open), otherwise give them this link at once: ${l.control}` });
       }
@@ -1118,7 +1170,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, globalLook, settings, effLook, isOnline, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, endSession, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, globalLook, settings, effLook, isOnline, hasAccess, requestAccess, clearAccess, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, endSession, forgetDevice, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1173,7 +1225,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
     const fm = p.match(/^\/f\/([0-9a-f]{24})\/[^/]+$/);   // download of a file fetched from a remote PC
     if (fm) {
       const f = files.get(fm[1]);
-      if (!f || f.exp < Date.now()) return text(res, 404, 'file expired or invalid');
+      if (!f || f.exp < Date.now() || !hasAccess(sessions.get(f.code))) return text(res, 404, 'file expired or invalid');
       const fallback=f.name.replace(/[^\x20-\x7e]/g,'_'),utf8=encodeURIComponent(f.name).replace(/['()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());
       res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size, 'content-disposition': `attachment; filename="${fallback}"; filename*=UTF-8''${utf8}`, 'cache-control': 'no-store' });
       const dec = crypto.createDecipheriv('aes-256-gcm', f.key, f.iv); dec.setAuthTag(f.tag);
@@ -1185,6 +1237,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const v = viewers.get(vw[1]);
       if (!v || v.exp < Date.now()) { viewers.delete(vw[1]); return text(res, 404, 'viewer link expired or invalid'); }
       const s = sessions.get(v.code);
+      if (s && !hasAccess(s)) return json(res, 403, { error: 'Request access on the device first.' });
       if (!vw[2]) return text(res, 200, viewerPage(s), 'text/html; charset=utf-8');
       if (!s) return json(res, 410, { error: 'session ended' });
       const client = String(req.headers['x-viewer-client'] || 'legacy');
@@ -1404,25 +1457,29 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const old = want && sessions.get(want);
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
+        if (old.info.access_request || info.access_request === 1) clearAccess(want, old, 'The device reconnected. Request access again.');
         old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
         old.info.viewer_keyboard = info.viewer_keyboard === 1 ? 1 : 0;
+        old.info.access_request = old.info.access_request || info.access_request === 1;
         old.fastInput?.end();old.info.viewer_realtime=info.viewer_realtime===1?1:0;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
         console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true, look: effLook(old) });
       }
+      if (old) return json(res, 403, { error: 'invalid resume credentials' });
       const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
       if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const dh = info.device_id ? sha(String(info.device_id).slice(0, 300)) : null;   // a persistent per-install identity (like an AnyDesk/RustDesk ID): the same device always gets the same code back
       let code = want && !old ? want : null;   // same code after a server reset
-      if (!code && dh && devices.has(dh)) code = devices.get(dh);
+      const remembered = dh && devices.get(dh);
+      if (!code && remembered && !sessions.has(remembered) && !ended.has(remembered)) code = remembered;
       if (!code) do code = newCode(); while (sessions.has(code));
       if (dh) { devices.set(dh, code); save(); }
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
         th: sha(token), ip, mode: normMode(info.mode), created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
-        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0 },
+        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0, access_request: info.access_request === 1 },
       });
       sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
@@ -1434,6 +1491,12 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!s) return json(res, 401, { error: 'unknown token' });
       s.lastSeen = Date.now(); s.lastSeenKnown = true; s.awaitingReconnect = false; s.restoredAt = 0;
       if (p === '/a/poll') save();
+      if (p === '/a/access/revoke' && req.method === 'POST') {
+        if (!s.info.access_request || s.mode === 'unattended') return json(res, 409, { error: 'End the session to revoke unattended or legacy access.' });
+        clearAccess(code, s, 'The device user ended remote control.');
+        save();
+        return json(res, 200, {});
+      }
       if (p === '/a/appearance' && req.method === 'POST') {
         if (s.ending) return json(res, 410, { error: 'session ending' });
         const update = JSON.parse((await body(req, 1024)) || '{}');
@@ -1449,7 +1512,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         return res.end(bytes);
       }
       if(p==='/a/input'&&req.method==='GET'){
-        if(s.mode==='confirm'||s.paused||s.info?.viewer_realtime!==1)return json(res,409,{error:'live input unavailable'});
+        if(!hasAccess(s)||s.ending||s.mode==='confirm'||s.paused||s.info?.viewer_realtime!==1)return json(res,409,{error:'live input unavailable'});
         s.fastInput?.end();s.fastInput=res;
         req.socket.setNoDelay(true);res.writeHead(200,{'content-type':'text/plain; charset=utf-8','cache-control':'no-store','x-accel-buffering':'no','x-input-clock':String(Date.now())});res.flushHeaders();res.write('\n');
         const ping=setInterval(()=>{if(s.paused||s.mode==='confirm'||!isOnline(s)||res.writableLength>16384)res.end();else res.write('\n');},750);
@@ -1467,6 +1530,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       }
       if (p === '/a/speed' && req.method === 'POST') { let n = 0; req.on('data', (d) => { n += d.length; }); req.on('end', () => json(res, 200, { n })); req.on('error', () => {}); return; }   // the agent measures its upload speed through each route
       if (p === '/a/stream' && req.method === 'POST') {   // the live picture: one long upload, frames forwarded as they come
+        if (!hasAccess(s) || s.ending) return json(res, 403, { error: 'Access required' });
         try { s.ingest?.destroy(); } catch { /* gone */ }
         s.ingest = req; let buf = Buffer.alloc(0);
         req.on('data', (chunk) => {
@@ -1501,6 +1565,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         return json(res, 200, {});
       }
       if (p === '/a/file' && req.method === 'POST') {
+        if (!hasAccess(s) || s.ending) return json(res, 403, { error: 'Access required' });
         try { return json(res, 200, await storeFile(req, url.searchParams.get('name'), code)); } catch (e) { return json(res, 413, { error: e.message }); }
       }
       if (p === '/a/state' && req.method === 'POST') {   // the user paused / resumed from the console (Esc menu)
@@ -1517,6 +1582,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         const b = JSON.parse((await body(req, 2000)) || '{}');
         if (s.persist && !b.final) {   // the window closed / the PC is going down but the user did not end the session: keep it for the PC to come back
           console.log(`- ${code} left (kept)`); s.awaitingReconnect = true;s.fastInput?.end(); evPush(s, { t: Date.now(), type: 'agent_left' });
+          if (s.info.access_request) clearAccess(code, s, 'The device closed the connection.');
           for (const pd of s.pending.values()) { clearTimeout(pd.timer); pd.reject(new Error('The agent went away (reboot or closed window). The session is kept: use wait_online.')); } s.pending.clear(); save();
           return json(res, 200, {});
         }
@@ -1565,7 +1631,7 @@ server.on('upgrade',(req,socket,head)=>{
   inputSockets.handleUpgrade(req,socket,head,ws=>{
     socket.setNoDelay(true);let owner='',client='',authenticated=false,count=0,at=Date.now(),alive=true;
     const authTimer=setTimeout(()=>ws.close(1008,'authentication required'),3000);
-    const check=()=>{const s=sessions.get(v.code);if(!s||v.exp<Date.now()||v.disconnected?.has(client)||s.paused||s.mode==='confirm'||!isOnline(s)||!s.fastInput||!takenOver(s)||s.takeoverOwner!==owner)throw Error('live control unavailable');return s;};
+    const check=()=>{const s=sessions.get(v.code);if(!hasAccess(s)||s.ending||!viewers.has(match[1])||v.exp<Date.now()||v.disconnected?.has(client)||s.paused||s.mode==='confirm'||!isOnline(s)||!s.fastInput||!takenOver(s)||s.takeoverOwner!==owner)throw Error('live control unavailable');return s;};
     ws.on('pong',()=>{alive=true;});
     const heartbeat=setInterval(()=>{if(authenticated){try{check();if(!alive){ws.terminate();return;}alive=false;ws.ping();}catch{ws.close(1008,'control released');}}},1000);
     ws.on('message',data=>{try{

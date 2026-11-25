@@ -34,7 +34,7 @@ try {
   assert.match(ps, /TimeoutSec 12/); assert.match(ps, /startup failed/);
   assert.ok(ps.includes(base + '/h') && !ps.includes('9444'), 'launcher must use the configured endpoint only');
   const agent = spawn('powershell', ['-NoProfile', '-Command', `irm ${base}/h | iex`], { env: {
-    ...process.env, HELPER_MODE: 'full', HELPER_STATE_DIR: path.join(temp, 'agent'), HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1',
+    ...process.env, HELPER_MODE: 'unattended', HELPER_STATE_DIR: path.join(temp, 'agent'), HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1',
   } }); kids.push(agent);
   agent.stdout.on('data', (s) => { output += s; }); agent.stderr.on('data', (s) => { output += s; });
   client = new Client({ name: 'network-test', version: '1' });

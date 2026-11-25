@@ -7,9 +7,11 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
 import {createHash} from 'node:crypto';
+import {createAdmin} from '../admin.mjs';
 
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'hm-session-state-'));
 const port=22000+Math.floor(Math.random()*1000), base=`http://127.0.0.1:${port}`, key='state-fixture-only';
+const credentials=createAdmin(dir);
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let child, output='';
 async function start() {
@@ -41,11 +43,34 @@ try {
   s=await status();assert.equal(s.counts.online,1);assert.equal(s.sessions[0].code,reg.code);
   await post('/a/bye',{final:true},reg.token);
   assert.equal((await status()).counts.sessions,0,'confirmed end retained the session');
+
+  const fixture = { os:'Windows synthetic', host:'Forgotten fixture', mode:'auto', persist:true, device_id:'forgotten-test-device' };
+  const forgotten = await (await post('/a/register',fixture,'')).json();
+  assert.equal((await post('/a/bye',{final:false},forgotten.token)).status,200);
+  const login = await post('/admin/api/login',{user:credentials.user,pass:credentials.password},'');
+  assert.equal(login.status,200);
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const {csrf} = await login.json();
+  const forget = await fetch(base+'/admin/api/forget',{
+    method:'POST',headers:{cookie,'x-csrf':csrf,'content-type':'application/json'},body:JSON.stringify({code:forgotten.code}),
+  });
+  assert.equal(forget.status,200);
+  await halt();await start();
+  const resume = { ...fixture, resume:forgotten.code, resume_token:forgotten.token };
+  assert.equal((await status()).counts.sessions,0,'a relay restart restored a forgotten offline session');
+  assert.equal((await post('/a/register',resume,'')).status,410,'a restart lost the revocation');
+  const fresh = await post('/a/register',fixture,'');
+  assert.equal(fresh.status,200,'the device could not start a fresh session');
+  assert.notEqual((await fresh.json()).code,forgotten.code,'a clean start inherited the forgotten code');
   await halt();
   const legacyToken='legacy-fixture-token';
   const created=Date.now()-86400_000;
-  fs.writeFileSync(path.join(dir,'state.json'),JSON.stringify({sessions:[{code:'LEGA-CY23',th:createHash('sha256').update(legacyToken).digest('hex'),created,persist:true,info:{os:'Windows synthetic legacy'},events:[]}]}));
+  fs.writeFileSync(path.join(dir,'state.json'),JSON.stringify({
+    sessions:[{code:'LEGA-CY23',th:createHash('sha256').update(legacyToken).digest('hex'),created,persist:true,info:{os:'Windows synthetic legacy'},events:[]}],
+    revoked:[createHash('sha256').update(forgotten.token).digest('hex')],
+  }));
   await start();
+  assert.equal((await post('/a/register',resume,'')).status,410,'token worked after the temporary code cooldown was absent');
   s=await status();assert.equal(s.counts.online,0);
   assert.equal(s.sessions[0].last_seen_s,null,'legacy creation time was presented as last contact');
   const legacyPoll=await fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+legacyToken}});
@@ -54,4 +79,5 @@ try {
   s=await status();assert.equal(s.counts.online,1);assert.ok(s.sessions[0].last_seen_s!==null&&s.sessions[0].last_seen_s<3,'real contact did not replace legacy unknown');
   await post('/a/bye',{final:true},legacyToken);
   console.log('Kept window-close survives cleanup, restart stays offline until authenticated poll, same token/code PASS');
-}catch(e){console.error(output);throw e;}finally{await halt();}
+  console.log('Offline Forget persists before acknowledgement, and old credentials stay revoked after the code cooldown PASS');
+}catch(e){console.error(output);throw e;}finally{await halt();fs.rmSync(dir,{recursive:true,force:true});}

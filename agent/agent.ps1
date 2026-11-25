@@ -4325,7 +4325,7 @@ function Start-Helper {
         if ($script:Detached -and [B__BUILD__.Tray]::End) { Forget-Session; [F__BUILD__.Route]::Stop(); return }
         try { $r = $(if ($saved) { Register-Agent $mode $saved.code $saved.token $note } else { Register-Agent $mode $null $null '' }); break }
         catch {
-            if ($saved -and [int]$_.Exception.Response.StatusCode -eq 410) {
+            if ($saved -and [int]$_.Exception.Response.StatusCode -in 403,410) {
                 Forget-Session
                 [F__BUILD__.Route]::Stop()
                 Write-Host (T 'Предыдущий сеанс завершён. Запустите Helper снова, чтобы начать новый.' 'The previous session has ended. Start Helper again to open a new session.') -ForegroundColor Yellow
@@ -4414,7 +4414,7 @@ function Start-Helper {
                             Write-AgentLog 'registered again after the relay lost its state'
                             [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; Write-Host "[helper] registered again, session code: $code"
                             $fails = 0; $delay = 1.0; Net-State 'ok'; continue
-                        } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -eq 410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }
+                        } catch { $sc2 = 0; try { $sc2 = [int]$_.Exception.Response.StatusCode } catch { }; if ($sc2 -in 403,410) { Write-Host (T 'сессия закрыта' 'session closed'); $script:FinalEnd = $true; return } }
                     }
                     $failed = $true; try { [F__BUILD__.Route]::Failed() } catch { }
                 }

@@ -56,22 +56,27 @@ let saveTimer = null;
 const lookKeys = ['glow', 'sound', 'banner', 'timer', 'cursor', 'animations'];
 const settings = Object.fromEntries(lookKeys.map((key) => [key, false]));
 const effLook = (s) => Object.fromEntries(lookKeys.map((key) => [key, s[key] ?? settings[key]]));
+function writeState() {
+  if (!STATE_FILE) return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  const out = {
+    sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
+    viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
+    devices: [...devices].map(([dh, code]) => ({ dh, code })),
+    settings,
+    ended: [...ended].filter(([, t]) => Date.now() - t < 3600_000).map(([code, t]) => ({ code, t })),
+    revoked: [...revokedTokens],
+  };
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
+  fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
+}
 function save() {
   if (!STATE_FILE || saveTimer) return;
   saveTimer = setTimeout(() => {
-    saveTimer = null;
-    try {
-      const out = {
-        sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
-        viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
-        devices: [...devices].map(([dh, code]) => ({ dh, code })),
-        settings,
-        ended: [...ended].filter(([, t]) => Date.now() - t < 3600_000).map(([code, t]) => ({ code, t })),   // an ended session stays ended across a relay restart: its agent must not slip back in
-      };
-      fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-      fs.writeFileSync(STATE_FILE + '.tmp', seal(JSON.stringify(out)), { mode: 0o600 });
-      fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
-    } catch (e) { console.error('state save failed:', e.message); }
+    try { writeState(); }
+    catch (e) { console.error('state save failed:', e.message); }
   }, 300);
 }
 // ---- mistakes: an action that missed (a tap on nothing, a wrong screen) is kept with the path that led to it, to analyse and fix later
@@ -418,6 +423,7 @@ function flush(s) {
 }
 
 const ended = new Map();   // codes the user (or operator) ended: an agent that still tries to come back with one is told to stop (for an hour)
+const revokedTokens = new Set(); // operator-initiated End or Forget outlasts the temporary code cooldown
 function clearAccess(code, s, reason) {
   s.accessGranted = false;
   s.accessEpoch = (s.accessEpoch || 0) + 1;
@@ -473,14 +479,15 @@ function drop(code, why) {
   if (!s) return;
   ended.set(code, Date.now());
   sessions.delete(code); s.log.length = 0; clearAccess(code, s, why);
-  save();
   if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 410, { error: why }); }
+  save();
 }
 
 function endSession(code) {
   const s = sessions.get(code);
   if (!s) return Promise.resolve();
   if (s.ending) return s.ending;
+  revokedTokens.add(s.th);
   s.queue.splice(0).forEach(({ id }) => {
     const pending = s.pending.get(id);
     if (!pending) return;
@@ -494,6 +501,7 @@ function endSession(code) {
     new Promise((resolve) => setTimeout(resolve, 2000)),
   ]).then(() => {
     if (sessions.get(code) === s) drop(code, 'The operator ended the session. STOP and do not retry.');
+    writeState();
   });
   return s.ending;
 }
@@ -501,7 +509,6 @@ function endSession(code) {
 async function forgetDevice(code) {
   for (const [id, remembered] of devices) if (remembered === code) devices.delete(id);
   await endSession(code);
-  save();
 }
 
 setInterval(() => {
@@ -509,6 +516,7 @@ setInterval(() => {
   for (const [id, f] of files) if (f.exp < Date.now()) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }
   for (const [ip, f] of authFails) if (Date.now() >= f.until) authFails.delete(ip);
   for (const [ip, r] of regRate) if (Date.now() - r.t > 60_000) regRate.delete(ip);
+  for (const [code, t] of ended) if (Date.now() - t >= 3600_000) ended.delete(code);
   // an agent busy with a long call (browser, slow command) doesn't poll; its pending calls have their own timeouts
   for (const [code, s] of sessions) if (!s.pending.size && Date.now() - Math.max(s.lastSeen, s.restoredAt || 0) > (s.persist ? (s.keepMs || KEEP_MS) : SESSION_IDLE_MS)) drop(code, 'Agent disconnected.');
 }, 10_000).unref();
@@ -1568,10 +1576,13 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const rl = regRate.get(ip) || { n: 0, t: Date.now() }; if (Date.now() - rl.t > 60_000) { rl.n = 0; rl.t = Date.now(); }   // a client PC cannot flood the server with registrations
       if (++rl.n > 20) return json(res, 429, { error: 'slow down' }); regRate.set(ip, rl);
       const info = JSON.parse((await body(req, 10_000)) || '{}');
+      const resumeHash = typeof info.resume_token === 'string' ? sha(info.resume_token) : null;
+      if (resumeHash && revokedTokens.has(resumeHash)) return json(res, 410, { error: 'this session was ended' });
       const want = /^[A-Z2-9]{4}-[A-Z2-9]{4}$/.test(info.resume || '') ? info.resume : null;
       const old = want && sessions.get(want);
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
-      if (old && info.resume_token && safeEq(sha(info.resume_token), old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
+      if (old && resumeHash && safeEq(resumeHash, old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
+        if (old.ending) return json(res, 410, { error: 'this session is ending' });
         if (old.info.access_request || info.access_request === 1) clearAccess(want, old, 'The device reconnected. Request access again.');
         old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
@@ -1589,7 +1600,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       let code = want && !old ? want : null;   // same code after a server reset
       const remembered = dh && devices.get(dh);
       if (!code && remembered && !sessions.has(remembered) && !ended.has(remembered)) code = remembered;
-      if (!code) do code = newCode(); while (sessions.has(code));
+      if (!code) do code = newCode(); while (sessions.has(code) || ended.has(code));
       if (dh) { devices.set(dh, code); save(); }
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
@@ -1727,7 +1738,9 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
 if (STATE_FILE && fs.existsSync(STATE_FILE)) {
   try {
     const st = JSON.parse(unseal(fs.readFileSync(STATE_FILE)));
+    for (const hash of st.revoked || []) if (/^[a-f0-9]{64}$/.test(hash)) revokedTokens.add(hash);
     for (const x of st.sessions || []) {
+      if (revokedTokens.has(x.th)) continue;
       const s = newSession(x);
       s.lastSeen = Number(x.lastSeen) || Number(x.created) || Date.now();
       const resumed = Math.max(0,...(x.events || []).filter(e=>e.type==='resumed').map(e=>Number(e.t)||0));
@@ -1737,7 +1750,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     }
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
-    for (const x of st.ended || []) ended.set(x.code, x.t);
+    for (const x of st.ended || []) if (Date.now() - x.t < 3600_000) ended.set(x.code, x.t);
     if (st.settings) for (const key of lookKeys) if (typeof st.settings[key] === 'boolean') settings[key] = st.settings[key];
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);
   } catch (e) { console.error('state load failed:', e.message); }

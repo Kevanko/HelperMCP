@@ -51,6 +51,11 @@ function Mark-State { $script:Marks++ }
 function Post-Result($r,$token) { $script:Result=$r }
 function T($ru,$en){$en}
 function Cut($s,$n){$s}
+$script:AccessApproved=$false
+[H.UViewerFixture]::Events.Clear()
+Process-Command ([pscustomobject]@{id='standby-fixture';tool='type_text';args=@{text='blocked';viewer_input=$true}})
+Assert (-not $script:Result.ok -and [H.UViewerFixture]::Events.Count -eq 0 -and $script:Asks -eq 0) 'standby dispatched viewer input'
+$script:AccessApproved=$true
 Process-Command ([pscustomobject]@{id='manual-fixture';tool='type_text';args=@{text='direct';viewer_input=$true}})
 Assert ($script:Result.ok -and $script:Result.data.text -eq 'ok') 'manual dispatcher failed'
 Assert ($script:Asks -eq 1) 'manual acceleration bypassed confirm mode'

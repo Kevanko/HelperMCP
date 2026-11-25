@@ -7,7 +7,8 @@
     catch (e) { status(e.message, 'bad'); }
   };
   if (!CTL) return;
-  const button = $('ctl'); button.hidden = false; button.textContent = L.take;
+  const button = $('ctl'); button.hidden = false; button.textContent = ru ? 'Включить ввод' : 'Enable input';
+  let desiredInput = true, claiming = false, online = false, desktopFocused = false;
   const endButton = $('disc');
   endButton.textContent = ru ? 'Завершить' : 'End session';
   endButton.title = ru ? 'Завершить сеанс Helper на устройстве' : 'End the Helper session on the device';
@@ -43,12 +44,22 @@
   paintLook();
   let realtimeEnabled=false,liveSocket=null,socketReady=false;
   const isLive=action=>action.a==='pointer'||action.a==='keyboard';
+  function inputError(error) {
+    return error === 'desktop-busy'
+      ? (ru ? 'Помощник выполняет действие на экране. Повторите ввод через мгновение.' : 'The helper is using the desktop. Try the input again in a moment.')
+      : error;
+  }
   function sendLive(action){if(!socketReady||!liveSocket)return false;if(liveSocket.bufferedAmount>8192){liveSocket.close();clearInput();status(ru?'Канал ввода перегружен — клавиши отпущены':'Input link overloaded — keys released','bad');return true;}liveSocket.send(JSON.stringify(action));return true;}
   function connectInput(){
     if(!realtimeEnabled||!control||gone||liveSocket)return;
     const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+base+'/input-ws');liveSocket=ws;
     ws.onopen=()=>ws.send(JSON.stringify({auth:CTL,client:viewerClient}));
-    ws.onmessage=e=>{try{if(JSON.parse(e.data).ready&&liveSocket===ws){socketReady=true;drain();}}catch{ws.close();}};
+    ws.onmessage=e=>{try{
+      if(liveSocket!==ws)return;
+      const message=JSON.parse(e.data);
+      if(message.ready){socketReady=true;drain();}
+      if(message.busy){clearInput();status(inputError('desktop-busy'),'bad');}
+    }catch{ws.close();}};
     ws.onerror=()=>ws.close();
     ws.onclose=()=>{if(liveSocket!==ws)return;liveSocket=null;socketReady=false;clearInput();if(control&&realtimeEnabled&&!gone)setTimeout(connectInput,750);};
   }
@@ -66,7 +77,18 @@
     if(held?.live && !gone)request('/input',pointerAction('cancel',held)).catch(()=>{});
     if(heldKeys.size){heldKeys.clear();if(!gone)request('/input',keyboardAction('cancel')).catch(()=>{});}clearInterval(keyTimer);keyTimer=null;
   }
-  window.ViewerInput={setPointer(on){if(pointerEnabled && !on)clearInput();pointerEnabled=on&&!pointerFailed;},setKeyboard(on){if(keyboardEnabled&&!on)clearInput();keyboardEnabled=on&&!keyboardFailed;},setRealtime(on){realtimeEnabled=on;if(on)connectInput();else if(liveSocket)liveSocket.close();},setLook(value){lookState={...lookState,...value};paintLook();}};
+  window.ViewerInput={
+    setPointer(on){if(pointerEnabled && !on)clearInput();pointerEnabled=on&&!pointerFailed;},
+    setKeyboard(on){if(keyboardEnabled&&!on)clearInput();keyboardEnabled=on&&!keyboardFailed;},
+    setRealtime(on){realtimeEnabled=on;if(on)connectInput();else if(liveSocket)liveSocket.close();},
+    setLook(value){lookState={...lookState,...value};paintLook();},
+    setOnline(on){
+      const reconnected = on && !online;
+      online = on;
+      if (!on && control) paint(false);
+      if (reconnected && desiredInput && !gone) take(true);
+    },
+  };
   async function drain() {
     if (sending) return;
     sending = true;
@@ -77,16 +99,18 @@
         if(isLive(next.action)&&sendLive(next.action))continue;
         try { await request('/input', next.action); }
         catch (e) {
-          const pointer=next.action.a==='pointer';if(pointer&&!realtimeEnabled){pointerFailed=true;pointerEnabled=false;}
-          if(next.action.a==='keyboard'&&!realtimeEnabled){keyboardFailed=true;keyboardEnabled=false;}
-          clearInput(); if (!gone) status(e.message+(pointer?(ru?' · доступно обычное перетаскивание':' · completed drag remains available'):''), 'bad'); break;
+          const pointer=next.action.a==='pointer';
+          if(e.message!=='desktop-busy'){
+            if(pointer&&!realtimeEnabled){pointerFailed=true;pointerEnabled=false;}
+            if(next.action.a==='keyboard'&&!realtimeEnabled){keyboardFailed=true;keyboardEnabled=false;}
+          }
+          clearInput(); if (!gone) status(inputError(e.message), 'bad'); break;
         }
       }
     } finally { sending = false; }
   }
   function input(action) {
     if (!control || ended || gone) return;
-    if(realtimeEnabled&&isLive(action)&&!socketReady&&!['up','cancel'].includes(action.phase)){connectInput();status(ru?'Подключаю канал ввода…':'Connecting input channel…','bad');return;}
     if(!sending&&!pending.length&&isLive(action)&&sendLive(action))return;
     if(action.a==='keyboard'&&action.phase==='up')pending=pending.filter(x=>!(x.action.a==='keyboard'&&x.action.phase==='keep'));
     if(action.a==='keyboard'&&action.phase==='keep'&&pending.some(x=>x.action.a==='keyboard'&&x.action.phase==='keep'))return;
@@ -104,24 +128,28 @@
     pending.push({ generation, action }); drain();
   }
   function paint(on) {
-    control = on; clearInput(); button.className = on ? 'on' : ''; button.textContent = on ? L.give : L.take;
+    control = on; clearInput(); button.className = on ? 'on' : '';
+    button.textContent = on ? (ru ? 'Выключить ввод' : 'Disable input') : (ru ? 'Включить ввод' : 'Enable input');
     button.setAttribute('aria-pressed', String(on)); cv.className = on ? 'ctl' : '';
     kb.style.display = on ? 'flex' : 'none'; document.documentElement.style.setProperty('--kb', on ? (kb.offsetHeight || 52) + 'px' : '0px');
-    $('tag').style.display = on ? 'block' : 'none'; $('tag').textContent = L.tag+(on?(ru?' · нажмите экран и печатайте':' · click the screen and type'):'');
+    $('tag').style.display = on ? 'block' : 'none';
+    $('tag').textContent = ru ? 'Совместное управление · нажмите на экран для ввода' : 'Shared control · click the screen to send input';
     if(on)connectInput();else if(liveSocket)liveSocket.close();
   }
   async function take(on) {
+    if (claiming || gone) return;
+    claiming = true;
     button.disabled = true;
     if (!on) paint(false);
-    try { await request('/takeover', { on }); if (!gone) { paint(on); if (on) cv.focus({ preventScroll: true }); } }
+    try { await request('/takeover', { on, shared: true }); if (!gone) paint(on && desiredInput); }
     catch (e) { paint(false); if (!gone) status(e.message, 'bad'); }
-    finally { button.disabled = gone; }
+    finally { claiming = false; button.disabled = gone; }
   }
-  button.onclick = () => take(!control);
+  function toggleInput(on) { desiredInput = on; return take(on); }
+  button.onclick = () => toggleInput(!control);
   cv.addEventListener('pointerdown', (e) => {
     if (!control || gone || down || e.button < 0 || e.button > 2) return;
-    e.preventDefault(); cv.focus({ preventScroll: true });
-    if(realtimeEnabled&&!socketReady){connectInput();status(ru?'Подключаю канал ввода…':'Connecting input channel…','bad');return;}
+    e.preventDefault(); cv.focus({ preventScroll: true }); desktopFocused = true;
     try { cv.setPointerCapture(e.pointerId); } catch {}
     down = { p: real(e), t: Date.now(), button: e.button, id: e.pointerId, live:pointerEnabled };
     if(down.live) {
@@ -140,7 +168,7 @@
   cv.addEventListener('pointercancel', clearInput);
   cv.addEventListener('lostpointercapture', (e) => { if(down && down.id===e.pointerId)clearInput(); });
   cv.addEventListener('pointermove', (e) => {
-    if (!control || gone || (down && !down.live)) return;
+    if (!control || gone || !desktopFocused || (down && !down.live)) return;
     hover = real(e);
     if(down?.live)down.p=hover;
     if (hoverTimer) return;
@@ -148,7 +176,7 @@
   });
   cv.addEventListener('contextmenu', (e) => { if (control) e.preventDefault(); });
   cv.addEventListener('wheel', (e) => {
-    if (!control || gone || e.ctrlKey || e.metaKey) return;
+    if (!control || gone || !desktopFocused || e.ctrlKey || e.metaKey) return;
     e.preventDefault(); wheel += Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 100));
     const point = real(e); clearTimeout(wheelTimer);
     wheelTimer = setTimeout(() => { const amount = Math.max(-20, Math.min(20, wheel)); wheel = 0; input({ a: 'scroll', ...point, amount }); }, 100);
@@ -159,8 +187,7 @@
   cv.addEventListener('keydown', (e) => {
     if (!control || gone || e.isComposing) return;
     // Ctrl+Alt+Shift is the local escape chord, so focus can always leave the PC.
-    if (e.ctrlKey && e.altKey && e.shiftKey) { e.preventDefault(); take(false); return; }
-    if(realtimeEnabled&&!socketReady){e.preventDefault();connectInput();status(ru?'Подключаю канал ввода…':'Connecting input channel…','bad');return;}
+    if (e.ctrlKey && e.altKey && e.shiftKey) { e.preventDefault(); toggleInput(false); return; }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return; // paste event supplies text, never both text and Ctrl+V
     const vk=keyboardEnabled?nativeCode(e):0;
     if(vk){e.preventDefault();const extended=['Insert','Delete','Home','End','PageUp','PageDown','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','ControlRight','AltRight','MetaLeft','MetaRight','NumpadEnter'].includes(e.code||e.key);heldKeys.set(e.code||e.key,{vk,extended});input(keyboardAction('down',vk,extended));if(!keyTimer)keyTimer=setInterval(()=>{if(heldKeys.size&&control&&!gone)input(keyboardAction('keep'));},500);return;}
@@ -181,8 +208,10 @@
   for (const [text, key] of [['Ctrl+C','ctrl+c'],['Ctrl+V','ctrl+v'],['Alt+Tab','alt+tab'],['Win','win']]) {
     const b = document.createElement('button'); b.textContent = text; b.onclick = () => input({ a: 'key', keys: key }); kb.append(b);
   }
-  addEventListener('blur', clearInput);
-  cv.addEventListener('blur', clearInput);
+  function leaveDesktop() { desktopFocused = false; clearInput(); }
+  addEventListener('blur', leaveDesktop);
+  cv.addEventListener('blur', leaveDesktop);
+  cv.addEventListener('focus', () => { desktopFocused = true; });
   addEventListener('visibilitychange',()=>{if(document.hidden)clearInput();});
   addEventListener('pagehide', clearInput);
   addEventListener('helper-disconnected', clearInput);
@@ -205,5 +234,5 @@
   // Never navigate to an untrusted dropped URL or implicitly upload text/HTML.
   addEventListener('dragover',e=>{if(fileDrag(e))e.preventDefault();});
   addEventListener('drop',e=>{if(fileDrag(e))e.preventDefault();});
-  setInterval(() => { if (control && !gone) request('/takeover', { on: true }).catch((e) => { paint(false); if (!gone) status(e.message, 'bad'); }); }, 30000);
+  setInterval(() => { if (control && !gone) request('/takeover', { on: true, shared: true }).catch((e) => { paint(false); if (!gone) status(e.message, 'bad'); }); }, 30000);
 })();

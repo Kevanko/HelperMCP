@@ -232,8 +232,19 @@ function scheduleViewerHandback(token,v,s,client){
   const owner=token+'/'+client;
   setTimeout(()=>{
     if(s.takeoverOwner!==owner||[...(s.live||[])].some(x=>x.viewer===token&&x.client===client)||[...inputSockets.clients].some(x=>x.helperOwner===owner&&x.readyState===1))return;
-    cancelViewerCommands(s,owner);releaseViewerPointer(v.code,s,owner);s.takeover=0;s.takeoverOwner='';evPush(s,{t:Date.now(),type:'handback',data:{reason:'viewer channels closed'}});
+    cancelViewerCommands(s,owner);releaseViewerPointer(v.code,s,owner);
+    clearViewerControl(s);
+    evPush(s,{t:Date.now(),type:'handback',data:{reason:'viewer channels closed'}});
   },3000).unref();
+}
+function clearViewerControl(s) {
+  s.takeover = 0;
+  s.takeoverOwner = '';
+  s.sharedControl = false;
+  s.manualUntil = 0;
+  s.manualHeld?.clear();
+  clearTimeout(s.manualTimer);
+  flush(s);
 }
 function detachViewer(token, v, s, client) {
   (v.disconnected ??= new Set()).add(client);
@@ -241,7 +252,7 @@ function detachViewer(token, v, s, client) {
   for (const lv of s.live || []) if (lv.viewer === token && lv.client === client) { s.live.delete(lv); try { lv.res.end(); } catch {} }
   cancelViewerCommands(s, token + '/' + client);
   releaseViewerPointer(v.code, s, token + '/' + client);
-  if (s.takeoverOwner === token + '/' + client) { s.takeover = 0; s.takeoverOwner = ''; evPush(s, { t: Date.now(), type: 'handback', data: { reason: 'viewer disconnected' } }); }
+  if (s.takeoverOwner === token + '/' + client) { clearViewerControl(s); evPush(s, { t: Date.now(), type: 'handback', data: { reason: 'viewer disconnected' } }); }
   if (!s.live?.size) streamCtl(v.code, s, { on: false });
 }
 
@@ -299,7 +310,23 @@ const safeEq = (a, b) => {
 // ---- session / command plumbing ------------------------------------------
 const TAKEOVER_MS = 5 * 60_000;
 const takenOver = (s) => s.takeover && Date.now() - s.takeover < TAKEOVER_MS;   // the operator is fixing something by hand in the live viewer
+const exclusiveControl = (s) => takenOver(s) && !s.sharedControl;
 const desktopObservations = new Set(['screenshot', 'sysinfo', 'agent_log']);
+const desktopInputTools = new Set([...SHOT_TOOLS, 'trace', 'viewer_pointer']);
+function markManualInput(s, op, now, key) {
+  if (!s.sharedControl || op === 'hover' || op === 'move') return;
+  const held = s.manualHeld ??= new Set();
+  if (!(s.manualUntil > now)) held.clear();
+  if (op === 'down') held.add('pointer');
+  if (op === 'up' || op === 'cancel') held.delete('pointer');
+  if (op === 'kdown') held.add(key);
+  if (op === 'kup') held.delete(key);
+  if (op === 'kcancel') for (const item of held) if (typeof item === 'number') held.delete(item);
+  if (!['keep', 'kkeep', 'cancel', 'kcancel'].includes(op)) s.userInputRevision = (s.userInputRevision || 0) + 1;
+  // The Windows worker also releases held input if its three-second lease expires.
+  s.manualUntil = now + (held.size ? 3_100 : 350);
+  flush(s);
+}
 const hasAccess = (s) => !!s && (!s.info?.access_request || s.mode === 'unattended' || s.accessGranted === true);
 const standbyTools = new Set(['request_access', 'look', 'set_mode', 'bye']);
 function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
@@ -310,7 +337,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   }
   if (s.ending && tool !== 'bye') return Promise.reject(new Error('The session is ending.'));
   if (!hasAccess(s) && !standbyTools.has(tool)) return Promise.reject(new Error('ACCESS_REQUIRED: request access and wait for the user to approve it on the device.'));
-  if (takenOver(s) && !opts.human && tool !== 'bye' && !desktopObservations.has(tool)) {
+  if (exclusiveControl(s) && !opts.human && tool !== 'bye' && !desktopObservations.has(tool)) {
     return Promise.reject(new Error('TAKEOVER: the operator is fixing something by hand in the live viewer right now. Do not act on this device: wait_online returns when they hand control back; then take a screenshot and continue from the new state.'));
   }
   if (!isOnline(s) && !s.pending.size && tool !== 'bye') {
@@ -336,7 +363,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
       s.pending.delete(id); s.queue = s.queue.filter((q) => q.id !== id);   // a caller that gave up must not have its command run later
       reject(new Error(stuckText(s, timeoutMs, tool)));
     }, timeoutMs);
-    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view, viewerOwner: opts.viewerOwner });
+    s.pending.set(id, { resolve, reject, timer, t0: Date.now() - (args.view ? FAKE_LATENCY_MS : 0), tool, argStr, view: !!args.view, viewerOwner: opts.viewerOwner, automatedDesktop: !opts.human && desktopInputTools.has(tool) });
     if (opts.release) s.queue.unshift({ id, tool, args }); else s.queue.push({ id, tool, args });
     flush(s);
   });
@@ -359,10 +386,33 @@ function stuckText(s, timeoutMs, tool) {
 }
 function flush(s) {
   if (s.waiting && s.queue.length) {
+    clearTimeout(s.manualTimer);
+    const delay = takenOver(s) && s.sharedControl ? Math.max(0, (s.manualUntil || 0) - Date.now()) : 0;
+    const index = s.queue.findIndex((q) => !s.pending.get(q.id)?.automatedDesktop || (!exclusiveControl(s) && !delay && !s.automatedDesktop));
+    if (index < 0) {
+      if (s.waitingLight) {
+        const res = s.waiting;
+        s.waiting = null;
+        clearTimeout(s.waitTimer);
+        res.writeHead(204); res.end();
+        return;
+      }
+      if (delay) s.manualTimer = setTimeout(() => flush(s), delay + 1).unref();
+      return;
+    }
     const res = s.waiting;
     s.waiting = null;
     clearTimeout(s.waitTimer);
-    const cmd = s.queue.shift(); if (!s.pending.get(cmd.id)?.view) s.took = { id: cmd.id, tool: cmd.tool, t: Date.now() };   // what the agent is doing now: a time-out can then say "stuck in X" instead of guessing
+    const [cmd] = s.queue.splice(index, 1);
+    const pending = s.pending.get(cmd.id);
+    if (pending?.automatedDesktop) {
+      s.automatedDesktop = cmd.id;
+      if (s.userInputRevision !== s.automatedInputRevision) {
+        cmd.args = { ...cmd.args, after_viewer_input: true };
+        s.automatedInputRevision = s.userInputRevision;
+      }
+    }
+    if (!pending?.view) s.took = { id: cmd.id, tool: cmd.tool, t: Date.now() };   // what the agent is doing now: a time-out can then say "stuck in X" instead of guessing
     json(res, 200, cmd);
   }
 }
@@ -379,6 +429,11 @@ function clearAccess(code, s, reason) {
   s.lastS = null;
   s.takeover = 0;
   s.takeoverOwner = '';
+  s.sharedControl = false;
+  s.automatedDesktop = null;
+  s.manualUntil = 0;
+  s.manualHeld?.clear();
+  clearTimeout(s.manualTimer);
   liveEnd(s);
   s.fastInput?.end();
   s.queue.length = 0;
@@ -605,8 +660,8 @@ const tools = [
     run: async (code, a) => {
       const c = String(code).toUpperCase(); const s = sessions.get(c); if (!s) throw new Error('No such session (it was ended)');
       const until = Date.now() + (a.timeout_s || 40) * 1000;
-      while (Date.now() < until) { if (sessions.get(c) !== s) throw new Error('The session was ended by the user'); if (isOnline(s) && !hasAccess(s)) return { text: 'online; access required' }; if (isOnline(s) && !s.paused && !takenOver(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
-      return { text: takenOver(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${contactText(s)}); call wait_online again or ask the operator` };
+      while (Date.now() < until) { if (sessions.get(c) !== s) throw new Error('The session was ended by the user'); if (isOnline(s) && !hasAccess(s)) return { text: 'online; access required' }; if (isOnline(s) && !s.paused && !exclusiveControl(s)) return { text: 'online' }; await new Promise((r) => setTimeout(r, 1000)); }
+      return { text: exclusiveControl(s) ? 'the operator still controls the screen by hand: wait and call wait_online again' : s.paused ? 'still paused by the user' : `still offline (last seen ${contactText(s)}); call wait_online again or ask the operator` };
     } },
   { name: 'agent_log', agent: true, description: 'The last lines of the log the agent keeps on the remote machine (errors, network outages with diagnosis, repairs, reboots). Works after a reboot too.', props: { lines: { type: 'integer', minimum: 5, maximum: 400, description: 'default 80' } } },
   { name: 'sysinfo', agent: true, description: 'OS, hostname, user, CPU/RAM, screen size, admin status of the remote machine.', props: {} },
@@ -999,6 +1054,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 #frame i:before{right:-8px;top:-8px;border-left:0;border-bottom:0}#frame i:after{left:-8px;bottom:-8px;border-right:0;border-top:0}
 #cv{max-width:100%;max-height:calc(100vh - 44px - var(--kb) - 28px);background:#000;box-shadow:0 0 0 1px var(--line),0 0 40px rgba(0,0,0,.6);display:block}
 #cv{transition:none}#cv.pan{cursor:grab}#zr{padding:.3rem .55rem}#cv.ctl{cursor:crosshair;box-shadow:0 0 0 2px var(--warn),0 0 30px rgba(255,209,102,.18)}
+#cv:focus-visible{outline:2px solid var(--fg);outline-offset:4px}
 #tag{position:absolute;left:14px;top:12px;color:var(--warn);background:rgba(2,10,6,.85);border:1px solid var(--warn);border-radius:4px;padding:.1rem .5rem;display:none}
 #side{border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
 #side h2{margin:0;padding:.65rem .9rem .35rem;font-size:12px;font-weight:600;color:var(--mut)}
@@ -1137,7 +1193,8 @@ const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function info(){while(!ended){try{
  const r=await fetch(base+'/log');if(ended)break;if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
  const q=await fetch(base+'/state');if(q.ok){const s=await q.json();
-  window.ViewerInput?.setPointer(!!s.live_pointer);window.ViewerInput?.setKeyboard(!!s.live_keyboard);window.ViewerInput?.setRealtime(!!s.realtime_capable);window.ViewerInput?.setLook(s.look||{});
+  const native= !s.realtime_capable || s.live_realtime;
+  window.ViewerInput?.setPointer(!!s.live_pointer && native);window.ViewerInput?.setKeyboard(!!s.live_keyboard && native);window.ViewerInput?.setRealtime(!!s.live_realtime);window.ViewerInput?.setLook(s.look||{});window.ViewerInput?.setOnline(!!s.online && !s.paused);
   $('note').textContent=s.note||'';const c=s.color||'#38ff7a';document.documentElement.style.setProperty('--st',c);
   const p=s.plan;$('hPlan').hidden=!p;$('plan').innerHTML=p?p.stages.map((x,i)=>'<li style="--c:'+esc(x.color||c)+'" class="'+(i===p.current?'cur':(p.done||[]).includes(i)||i<p.current?'done':'')+'">'+esc(x.title)+'</li>').join(''):'';
   if(!s.online)status(L.off,'bad');else if(s.paused)status(L.paused,'bad')}}catch(e){}
@@ -1365,8 +1422,19 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         const owner = vw[1] + '/' + client;
         if (vw[2] === '/takeover') {
           if (takenOver(s) && s.takeoverOwner && s.takeoverOwner !== owner) return json(res, 409, { error: 'another operator is in control' });
-          if (!b.on) { cancelViewerCommands(s, owner); releaseViewerPointer(v.code, s, owner); }
-          s.takeover = b.on ? Date.now() : 0; s.takeoverOwner = b.on ? owner : ''; evPush(s, { t: Date.now(), type: b.on ? 'takeover' : 'handback' }); return json(res, 200, { on: !!b.on });
+          const changed = !takenOver(s) || s.sharedControl !== (b.shared === true);
+          if (!b.on) {
+            cancelViewerCommands(s, owner); releaseViewerPointer(v.code, s, owner);
+            clearViewerControl(s);
+          } else {
+            if (!takenOver(s)) { s.manualUntil = 0; s.manualHeld?.clear(); }
+            s.takeover = Date.now();
+            s.takeoverOwner = owner;
+            s.sharedControl = b.shared === true;
+          }
+          if (!b.on || changed) evPush(s, { t: Date.now(), type: !b.on ? 'handback' : s.sharedControl ? 'shared_control' : 'takeover' });
+          flush(s);
+          return json(res, 200, { on: !!b.on, shared: s.sharedControl });
         }
         if (takenOver(s) && s.takeoverOwner && s.takeoverOwner !== owner) return json(res, 409, { error: 'another operator is in control' });
         if (['pointer','keyboard'].includes(b.a) && b.phase !== 'cancel' && (!takenOver(s) || s.takeoverOwner !== owner)) return json(res,409,{error:'take control before sending live input'});
@@ -1392,13 +1460,23 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         else if (b.a === 'text') { tool = 'type_text'; a2 = { text: String(b.text || '').slice(0, 2000) }; }
         else if (b.a === 'key') { tool = 'press_key'; a2 = { keys: String(b.keys || '').slice(0, 40) }; }
         else return json(res, 400, { error: 'unknown input' });
+        const op = a2.op || b.a;
+        if (s.sharedControl && s.automatedDesktop && !['release','cancel','kcancel','up','kup'].includes(op)) {
+          if (op === 'hover' || op === 'move') return json(res, 200, { accepted: false });
+          return json(res, 409, { error: 'desktop-busy' });
+        }
         if (['pointer','keyboard'].includes(b.a) && b.phase === 'cancel') cancelViewerCommands(s,owner);
-        else { s.takeover=now; s.takeoverOwner=owner; }
+        else {
+          if (!takenOver(s)) clearViewerControl(s);
+          s.takeover=now; s.takeoverOwner=owner;
+        }
+        if (s.paused) return json(res,409,{error:'input paused on the device'});
         if(['pointer','keyboard'].includes(b.a)&&s.info?.viewer_realtime===1){
-          if(s.paused)return json(res,409,{error:'input paused on the device'});
           if(!fastInput(s,a2))return json(res,409,{error:'live input channel reconnecting'});
+          markManualInput(s,op,now,a2.x);
           return json(res,202,{accepted:true});
         }
+        markManualInput(s,op,now,a2.x);
         a2.viewer_input = true; // immediate human input; skip AI focus restoration/probe delays
         try { const d = await call(v.code, tool, a2, 30_000, { human: true, viewerOwner: owner, release: ['pointer','keyboard'].includes(b.a) && b.phase === 'cancel' }); return json(res, 200, { ok: true, text: d?.text || '' }); }
         catch (e) { return json(res, 503, { error: e.message }); }
@@ -1533,10 +1611,12 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       }
       if (p === '/a/poll' && req.method === 'GET') {
         s.lastPoll = Date.now();   // the main loop asked for work: unlike the picture upload, this proves the agent can take commands
+        if (url.searchParams.get('w') !== '0' && s.automatedDesktop && !s.pending.has(s.automatedDesktop)) s.automatedDesktop = null;
         if (s.lookPending) { s.lookPending = false; pushLook(code, s).catch(() => { s.lookPending = true; }); }
         if (url.searchParams.get('w') === '0' && !s.queue.length) { res.writeHead(204); return res.end(); }   // agent busy with a long call: just peek
         if (s.waiting) { clearTimeout(s.waitTimer); json(s.waiting, 204, {}); } // superseded poll: its timer must go too, or it fires on a finished response and takes the relay down
         s.waiting = res;
+        s.waitingLight = url.searchParams.get('w') === '0';
         s.waitTimer = setTimeout(() => { if (s.waiting === res) s.waiting = null; if (!res.headersSent) { res.writeHead(204); res.end(); } }, POLL_MS);
         res.on('close', () => { if (s.waiting === res) { s.waiting = null; clearTimeout(s.waitTimer); } });
         return flush(s);
@@ -1568,6 +1648,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
           let meta = {}; try { meta = JSON.parse(decodeURIComponent((req.headers['x-result-meta'] || '{}').replace(/\+/g, '%20'))); } catch { /* optional */ }
           r = { id: req.headers['x-result-id'], ok: true, data: { ...meta, jpeg: buf, mime: ct } };
         } else r = JSON.parse(await body(req, 25_000_000));
+        if (s.automatedDesktop === r.id) s.automatedDesktop = null;
         const pend = s.pending.get(r.id);
         if (pend) {
           s.pending.delete(r.id); clearTimeout(pend.timer); if (s.took?.id === r.id) s.took = null;
@@ -1575,6 +1656,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
           if (r.ok && r.data?.miss) recordMiss(s, code, 'auto', { tool: pend.tool, args: pend.argStr, note: String(r.data.text || '').slice(0, 400) });
           r.ok ? pend.resolve(r.data) : pend.reject(new Error(r.error || 'agent error'));
         }
+        flush(s);
         return json(res, 200, {});
       }
       if (p === '/a/file' && req.method === 'POST') {
@@ -1651,7 +1733,14 @@ server.on('upgrade',(req,socket,head)=>{
       const b=JSON.parse(data.toString());
       if(!authenticated){if(!v.ctl||!safeEq(String(b.auth||''),v.ctl)||!/^[a-f0-9]{32}$/.test(String(b.client||'')))throw Error('control authentication failed');client=b.client;owner=match[1]+'/'+client;check();authenticated=true;ws.helperOwner=owner;clearTimeout(authTimer);ws.send('{"ready":true}');return;}
       const s=check(),now=Date.now();if(now-at>=1000){at=now;count=0;}if(++count>180)throw Error('input rate exceeded');
-      const args=liveInputArgs(s,owner,b);if(!fastInput(s,args))throw Error('input channel unavailable');s.takeover=now;
+      const args=liveInputArgs(s,owner,b);
+      if (s.sharedControl && s.automatedDesktop && !['cancel','kcancel','up','kup'].includes(args.op)) {
+        if (args.op !== 'move' && args.op !== 'hover') ws.send('{"busy":true}');
+        return;
+      }
+      if(!fastInput(s,args))throw Error('input channel unavailable');
+      s.takeover=now;
+      markManualInput(s,args.op,now,args.x);
     }catch{ws.close(1008,'live input rejected');}});
     ws.on('error',()=>{});
     ws.on('close',()=>{clearTimeout(authTimer);clearInterval(heartbeat);if(authenticated){const s=sessions.get(v.code);if(s){releaseViewerPointer(v.code,s,owner);scheduleViewerHandback(match[1],v,s,client);}}});

@@ -6,7 +6,7 @@ import vm from 'node:vm';
 import {randomUUID} from 'node:crypto';
 
 const elements = new Map(), events = new Map(), sent = [], waiting = [];
-const sockets=[];
+const sockets=[], controlRequests=[];
 class Socket {constructor(){this.bufferedAmount=0;this.sent=[];sockets.push(this);}send(data){this.sent.push(JSON.parse(data));}close(){this.onclose?.();}}
 let failPointer=false;
 function element() {
@@ -23,6 +23,7 @@ const ctx = vm.createContext({
   WebSocket:Socket,location:{protocol:'https:',host:'fixture'},viewerClient:'c'.repeat(32),
   fetch: async (url, opts) => {
     const body=JSON.parse(opts.body);
+    if(url.endsWith('/takeover')) controlRequests.push(body);
     if(url.endsWith('/input')) {
       sent.push(body);
       if(failPointer&&body.phase==='down'){failPointer=false;return {ok:false,status:503,json:async()=>({error:'fixture worker denied'})};}
@@ -33,8 +34,10 @@ const ctx = vm.createContext({
 });
 vm.runInContext(fs.readFileSync(new URL('../viewer-control.js',import.meta.url),'utf8'),ctx);
 const tick = () => new Promise(resolve=>setImmediate(resolve));
-await $('ctl').onclick();
+ctx.window.ViewerInput.setOnline(true);
+await tick();
 assert.equal(ctx.control,true);
+assert.deepEqual(controlRequests,[{on:true,shared:true}],'online control view did not enable shared input by default');
 function key(value, extra={}) { $('cv').handlers.keydown({key:value,preventDefault(){},...extra}); }
 key('a'); key('b'); key('c'); key('Enter'); key('d');
 assert.deepEqual(sent,[{a:'text',text:'a'}]);
@@ -92,10 +95,16 @@ assert.equal(waiting.length,0);
 console.log('Viewer native key down/up ordering, extended NumpadEnter and focus-loss release PASS');
 ctx.gone=false;ctx.ended=false;ctx.window.ViewerInput.setRealtime(true);
 const socket=sockets.at(-1);socket.onopen();assert.equal(socket.sent[0].auth,'fixture');
+const firstBefore=sent.length;
+key('ArrowDown',{code:'ArrowDown'});
+$('cv').handlers.keyup({key:'ArrowDown',code:'ArrowDown',preventDefault(){}});
+assert.equal(sent[firstBefore]?.phase,'down','first key was lost while the WebSocket was opening');
 socket.onmessage({data:'{"ready":true}'});
+waiting.shift()();await tick();
+assert.deepEqual(socket.sent.slice(1).map(a=>a.phase),['up'],'release overtook the first key or was lost during transport handoff');
 const httpBefore=sent.length;
 key('ArrowUp',{code:'ArrowUp'});$('cv').handlers.keyup({key:'ArrowUp',code:'ArrowUp',preventDefault(){}});
-assert.deepEqual(socket.sent.slice(1).map(a=>a.phase),['down','up']);
+assert.deepEqual(socket.sent.slice(2).map(a=>a.phase),['down','up']);
 assert.equal(sent.length,httpBefore,'live keys still wait for HTTP acknowledgements');
 ctx.gone=true;socket.close();
 console.log('Viewer authenticated WebSocket sends ordered down/up without HTTP round trips PASS');

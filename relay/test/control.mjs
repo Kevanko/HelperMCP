@@ -125,6 +125,22 @@ try {
     const mutation = await observers[0].callTool({ name: 'press_key', arguments: { session: first.code, keys: 'enter' } });
     assert.equal(mutation.isError, true, 'bot input collided with manual control');
     assert.match(mutation.content[0].text, /TAKEOVER/);
+    assert.equal((await post(viewer+'/takeover',{on:true,shared:true},CH)).status,200);
+    const sharedKey = () => observers[0].callTool({ name: 'press_key', arguments: { session: first.code, keys: 'enter' } });
+    assert.ok(!(await sharedKey()).isError, 'shared input blocked the bot on an idle desktop');
+    const gesture = '2'.repeat(32);
+    const mouse = (phase,seq) => post(viewer+'/input',{a:'pointer',phase,gesture,seq,x:20,y:40},CH);
+    assert.equal((await mouse('down',1)).status,200);
+    const keyCount = commands.filter(c=>c.code===first.code&&c.tool==='press_key').length;
+    const queuedKey = sharedKey();
+    assert.equal(await Promise.race([queuedKey.then(()=> 'finished'),sleep(220).then(()=> 'held')]),'held','bot input ran during an active mouse press');
+    assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').length,keyCount);
+    const background = await observers[1].callTool({ name: 'sysinfo', arguments: { session: first.code } });
+    assert.ok(!background.isError,'shared gesture blocked observation of the same desktop');
+    assert.equal((await mouse('up',2)).status,200);
+    assert.ok(!(await queuedKey).isError,'queued bot input did not resume after the manual gesture');
+    assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).args.after_viewer_input,true,'bot kept its pre-gesture focus bookmark');
+    assert.equal((await post(viewer+'/takeover',{on:true},CH)).status,200);
   } finally { await Promise.all(observers.map((observer) => observer.close())); }
   const upload=await fetch(viewer+'/upload?drop=1&name='+encodeURIComponent('../Тестовый файл.txt'),{method:'POST',headers:CH,body:'private fixture content'});
   assert.equal(upload.status,200);

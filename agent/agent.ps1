@@ -4222,7 +4222,7 @@ function Do-ViewerInput($name, $a) {
 function Process-Command($cmd) {
     $name = $cmd.tool; $a = $cmd.args
     $manualInput = $a.viewer_input -and $name -in 'move','click','drag','scroll','type_text','press_key','viewer_pointer'
-    if ($manualInput) { $script:AiAt = $null }   # handback must not restore a window from before the human's edits
+    if ($manualInput -or $a.after_viewer_input) { $script:AiAt = $null }   # shared input can switch windows between bot commands
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
     $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode', 'request_access'
     if (-not $viewFrame -and -not $meta) {

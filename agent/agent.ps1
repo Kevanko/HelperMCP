@@ -3717,10 +3717,15 @@ function Save-AgentCopy($f, [switch]$ForDetach) {
         if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
     } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
 }
-function Install-Autostart {   # after a reboot the helper starts again by itself, in a visible window, and resumes the same session
+function Install-Autostart([switch]$Enable) {   # resume the same session in a visible window after logon
     if ($env:HELPER_NO_AUTOSTART) { return }
-    if ($script:Preferences -and -not $script:Preferences.startup) { return }
+    if (-not $Enable -and $script:Preferences -and -not $script:Preferences.startup) { return }
     try {
+        $task = Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue
+        if ($task.State -eq 'Disabled') {
+            if (-not $Enable) { return }
+            if (-not (Test-Admin)) { throw 'Enable the existing startup task from an elevated Helper console.' }
+        }
         $f = Join-Path $StateDir 'agent.ps1'
         Save-AgentCopy $f
         $scriptPath = "'" + $f.Replace("'", "''") + "'"
@@ -3737,11 +3742,13 @@ function Install-Autostart {   # after a reboot the helper starts again by itsel
                 Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
                 Write-AgentLog 'autostart installed (logon task, administrator)'; return
             } catch { Write-AgentLog "logon task failed, using the Run entry: $_" }
-        } elseif (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Write-AgentLog 'autostart: the administrator logon task is already there'; return }
+        } elseif ($task) { Write-AgentLog 'autostart: the administrator logon task is already there'; return }
         Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe ' + $cmd)
-        try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'HelperMCP' -ErrorAction SilentlyContinue } catch { }   # Task Manager's "Startup apps" switch would otherwise keep it off after a reboot
+        if ($Enable) {
+            Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'HelperMCP' -ErrorAction SilentlyContinue
+        }
         Write-AgentLog 'autostart installed'
-    } catch { Write-AgentLog "autostart failed: $_" }
+    } catch { Write-AgentLog "autostart failed: $_"; if ($Enable) { throw } }
 }
 function Forget-Session {
     foreach ($f in $SessionFile, (Join-Path $StateDir 'agent.ps1')) { Remove-Item $f -Force -ErrorAction SilentlyContinue }
@@ -3898,16 +3905,16 @@ function Read-ConsoleMenu {
         return
     }
     $key = if ($choice -eq 2) { 'startup' } else { 'quiet' }
-    $script:Preferences[$key] = -not $script:Preferences[$key]
+    $settings = $script:Preferences.Clone()
+    $settings[$key] = -not $settings[$key]
     try {
+        if ($key -eq 'startup' -and $settings.startup) { Install-Autostart -Enable }
         [void](New-Item -ItemType Directory -Path $StateDir -Force)
-        $script:Preferences | ConvertTo-Json | Set-Content -LiteralPath $PreferencesFile -Encoding UTF8
-        if ($key -eq 'startup') {
-            if ($script:Preferences.startup) { Install-Autostart }
-            else {
-                Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
-                if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
-            }
+        $settings | ConvertTo-Json | Set-Content -LiteralPath $PreferencesFile -Encoding UTF8
+        $script:Preferences = $settings
+        if ($key -eq 'startup' -and -not $settings.startup) {
+            Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
+            if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
         }
         Set-ConsoleMenu
         Write-Host ([K__BUILD__.Keys]::MenuLabels[$choice]) -ForegroundColor Green

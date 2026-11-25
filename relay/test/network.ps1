@@ -243,8 +243,13 @@ try {
     [void](New-Item -ItemType Directory -Path $StateDir)
     $SessionFile = Join-Path $StateDir 'session.json'; $RELAY = 'https://fixture.helper.test'
     $previousNoAutostart = $env:HELPER_NO_AUTOSTART; $env:HELPER_NO_AUTOSTART = $null
+    $RunKey = 'fixture-only'
+    $script:taskFixture = @{ TaskName = 'fixture-existing-task'; State = 'Ready' }
+    $script:startupOverrides = 0
     function Test-Admin { $false }
-    function Get-ScheduledTask { @{ TaskName = 'fixture-existing-task' } }
+    function Get-ScheduledTask { $script:taskFixture }
+    function Set-ItemProperty { }
+    function Remove-ItemProperty { $script:startupOverrides++ }
     function Write-AgentLog($message) { }
     function Invoke-WebRequest { @{ Content = $script:copyFixture } }
     foreach ($name in 'Save-AgentCopy','Install-Autostart') {
@@ -263,6 +268,15 @@ try {
         Assert ($bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191) 'restart copy lacks UTF-8 BOM'
         Assert ([IO.File]::ReadAllText($file) -eq $script:copyFixture) 'restart copy content changed'
         Assert (@(Get-ChildItem -LiteralPath $StateDir -Filter '*.pending').Count -eq 0) 'pending restart copy leaked'
+        $script:taskFixture.State = 'Disabled'
+        [IO.File]::WriteAllText($file, '# disabled task copy')
+        Install-Autostart
+        Assert ([IO.File]::ReadAllText($file) -eq '# disabled task copy') 'automatic refresh touched a disabled logon task'
+        $script:taskFixture = $null
+        Install-Autostart
+        Assert ($script:startupOverrides -eq 0) 'automatic refresh cleared the Windows startup switch'
+        Install-Autostart -Enable
+        Assert ($script:startupOverrides -eq 1) 'an explicit local enable did not clear the Windows startup switch'
         Write-Output 'Autostart update preserves previous valid copy and UTF-8 BOM PASS'
     } finally {
         $env:HELPER_NO_AUTOSTART = $previousNoAutostart

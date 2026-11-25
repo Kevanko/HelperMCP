@@ -22,3 +22,18 @@ public static class VideoTestWorker {
 '@)
 [VideoTestWorker]::Run()
 Write-Output 'Media Foundation worker initialization, RGB encoding, forced IDR and repeated disposal PASS'
+
+# Sample the existing bitmap without a second capture, retaining absolute-coordinate masks.
+$agentSource = [IO.File]::ReadAllText((Join-Path $root 'agent/agent.ps1'))
+$sampler = [regex]::Match($agentSource, '(?s)Add-Type -ReferencedAssemblies Accessibility, System.Drawing -TypeDefinition @"\r?\n.*?\r?\n"@')
+if (-not $sampler.Success) { throw 'Missing screenshot sampler' }
+Invoke-Expression ($sampler.Value.Replace('__BUILD__', 'SampleFixture'))
+$bmp = New-Object Drawing.Bitmap 2, 1
+try {
+    $bmp.SetPixel(0, 0, [Drawing.Color]::Black)
+    $bmp.SetPixel(1, 0, [Drawing.Color]::White)
+    $first = [VSampleFixture.Probe]::Sample($bmp, 100, 50, 2, 1, [int[]]@(100, 50, 1, 1))
+    $second = [VSampleFixture.Probe]::Sample($bmp, 100, 50, 2, 1, [int[]]@(100, 50, 1, 1))
+    if (($first -join ',') -ne '0,255' -or ($second -join ',') -ne '0,255') { throw 'Screenshot fingerprint lost the mask or locked the bitmap' }
+} finally { $bmp.Dispose() }
+Write-Output 'Screenshot fingerprint uses the existing bitmap and retains cursor and overlay masks PASS'

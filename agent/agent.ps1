@@ -125,17 +125,25 @@ namespace V__BUILD__ {
   }
   public static class Probe {   // a coarse grey picture of a part of the screen: enough to tell whether anything changed
     public static byte[] Grab(int x, int y, int w, int h, int gw, int gh, int[] mask) {
-      var r = new byte[gw * gh]; if (w <= 0 || h <= 0) return r;
+      if (w <= 0 || h <= 0) return new byte[gw * gh];
       using (var bmp = new System.Drawing.Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppArgb)) {
         using (var g = System.Drawing.Graphics.FromImage(bmp)) g.CopyFromScreen(x, y, 0, 0, bmp.Size);
-        var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        var px = new byte[bd.Stride * h]; Marshal.Copy(bd.Scan0, px, 0, px.Length); bmp.UnlockBits(bd);
-        for (int j = 0; j < gh; j++) for (int i = 0; i < gw; i++) {
-          int sx = (int)((i + 0.5) * w / gw), sy = (int)((j + 0.5) * h / gh), ax = x + sx, ay = y + sy; bool skip = false;
-          for (int m = 0; m + 3 < mask.Length; m += 4) if (ax >= mask[m] && ay >= mask[m + 1] && ax < mask[m] + mask[m + 2] && ay < mask[m + 1] + mask[m + 3]) { skip = true; break; }
-          if (skip) continue;
-          int o = sy * bd.Stride + sx * 4; r[j * gw + i] = (byte)((px[o] + 2 * px[o + 1] + px[o + 2]) / 4 | 1);
-        }
+        return Sample(bmp, x, y, gw, gh, mask);
+      }
+    }
+    public static byte[] Sample(System.Drawing.Bitmap bmp, int x, int y, int gw, int gh, int[] mask) {
+      int w = bmp.Width, h = bmp.Height;
+      var r = new byte[gw * gh];
+      var bd = bmp.LockBits(new System.Drawing.Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+      int stride = bd.Stride;
+      var px = new byte[stride * h];
+      try { Marshal.Copy(bd.Scan0, px, 0, px.Length); }
+      finally { bmp.UnlockBits(bd); }
+      for (int j = 0; j < gh; j++) for (int i = 0; i < gw; i++) {
+        int sx = (int)((i + 0.5) * w / gw), sy = (int)((j + 0.5) * h / gh), ax = x + sx, ay = y + sy; bool skip = false;
+        for (int m = 0; m + 3 < mask.Length; m += 4) if (ax >= mask[m] && ay >= mask[m + 1] && ax < mask[m] + mask[m + 2] && ay < mask[m + 1] + mask[m + 3]) { skip = true; break; }
+        if (skip) continue;
+        int o = sy * stride + sx * 4; r[j * gw + i] = (byte)((px[o] + 2 * px[o + 1] + px[o + 2]) / 4 | 1);
       }
       return r;
     }
@@ -1412,6 +1420,15 @@ function Do-Screenshot-Inner($a) {
     $g = [Drawing.Graphics]::FromImage($bmp)
     $g.CopyFromScreen($s.Left, $s.Top, 0, 0, $bmp.Size)
     $g.Dispose()
+    $cap = if ($a.max_width) { [int]$a.max_width } elseif ($view) { 1280 } else { 1920 }
+    $w = [Math]::Min($cap, $s.Width)
+    $sc = $s.Width / $w
+    if (-not $view) { $script:Scale = $sc }
+    # Sample the captured bitmap once so an idle view can skip resize and JPEG encoding.
+    $fp = $null
+    try { $fp = [V__BUILD__.Probe]::Sample($bmp, $s.Left, $s.Top, 640, [Math]::Max(8, [int](640 * $s.Height / $s.Width)), [int[]](@(Probe-Mask) + @(([Windows.Forms.Cursor]::Position.X - 90), ([Windows.Forms.Cursor]::Position.Y - 90), 220, 220))) } catch { }
+    $hash = if ($fp) { [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash($fp)).Replace('-', '').ToLowerInvariant() }
+    if ($hash -and $a.prev -eq $hash) { $bmp.Dispose(); return @{ same = $true; h = $hash } }
     if (-not $view -and (Glow-Visible) -and $script:OverlayProc -and -not $script:OverlayProc.HasExited) {
         try {
             $rect = New-Object Drawing.Rectangle 0, 0, $s.Width, $s.Height; $bd = $bmp.LockBits($rect, 'ReadWrite', 'Format32bppArgb')
@@ -1421,11 +1438,7 @@ function Do-Screenshot-Inner($a) {
             [Runtime.InteropServices.Marshal]::Copy($buf, 0, $bd.Scan0, $buf.Length); $bmp.UnlockBits($bd)
         } catch { try { $bmp.UnlockBits($bd) } catch { } }
     }
-    $cap = if ($a.max_width) { [int]$a.max_width } elseif ($view) { 1280 } else { 1920 }
     $qual = if ($a.quality) { [long]$a.quality } elseif ($view) { 65L } else { 70L }
-    $w = [Math]::Min($cap, $s.Width)
-    $sc = $s.Width / $w
-    if (-not $view) { $script:Scale = $sc }
     $out = New-Object Drawing.Bitmap $w, ([int]($s.Height / $sc))
     $g = [Drawing.Graphics]::FromImage($out)
     $g.InterpolationMode = 'HighQualityBicubic'
@@ -1437,9 +1450,7 @@ function Do-Screenshot-Inner($a) {
     $ms = New-Object IO.MemoryStream
     $out.Save($ms, $enc, $p); $out.Dispose()
     $bytes = $ms.ToArray()
-    # the fingerprint ignores the helper's own label, glow and clock: an unchanged screen is recognised as unchanged
-    $fp = try { [V__BUILD__.Probe]::Grab($s.Left, $s.Top, $s.Width, $s.Height, 640, [Math]::Max(8, [int](640 * $s.Height / $s.Width)), [int[]](@(Probe-Mask) + @(([Windows.Forms.Cursor]::Position.X - 90), ([Windows.Forms.Cursor]::Position.Y - 90), 220, 220))) } catch { $bytes }   # and the AI's arrow
-    $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash([byte[]]$fp)).Replace('-', '').ToLower()
+    if (-not $hash) { $hash = [BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
     if ($a.prev -and $a.prev -eq $hash) { return @{ same = $true; h = $hash } }   # nothing changed: send nothing
     @{ jpeg = $bytes; mime = 'image/jpeg'; h = $hash; ox = $s.Left; oy = $s.Top; sc = $sc }
 }

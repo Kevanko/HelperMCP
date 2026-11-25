@@ -27,8 +27,17 @@ class Decoder {
 }
 const video=vm.createContext({ended:false,dec:null,renderEpoch:0,waitFull:false,meta:{},window:{VideoDecoder:Decoder},VideoDecoder:Decoder,
  EncodedVideoChunk:class {constructor(value){Object.assign(this,value);}},performance:{now:()=>10},DataView,TextDecoder,td:new TextDecoder(),frames:0,
+ paintedAt:0,paintSerial:0,displayCodec:'',st:{},ru:false,
  size(){},g:{drawImage:f=>drawn.push(f)},monMap(){},sysPanel(){},abort:{abort(){video.aborted++;}},aborted:0});
-vm.runInContext(source.slice(source.indexOf('function handle(ty,p)'),source.indexOf('async function live(){')),video);
+vm.runInContext(source.slice(source.indexOf('function painted(codec)'),source.indexOf('async function live(){')),video);
+const statistics=Buffer.from(JSON.stringify({capture_fps:30,sent_fps:3,capture_ms:2,prepare_ms:5,encode_write_ms:8}));
+video.handle('Q',statistics);
+assert.match(video.st.title,/Capture 30\.0 fps · sent 3\.0 fps/);
+assert.equal(video.paintSerial,0,'capture telemetry was treated as a visible frame');
+assert.equal(video.streamStall(8000,0,7999,false,0,false,false),'initial-frame','metadata kept a blank stream open');
+assert.equal(video.streamStall(8000,0,7999,true,100,true,false),'no-video-frame','stalled H.264 did not trigger recovery');
+assert.equal(video.streamStall(8000,0,7999,true,100,false,false),'','a still JPEG desktop triggered recovery');
+assert.equal(video.streamStall(23000,0,500,true,100,false,false),'no-packets');
 const config=Buffer.from(JSON.stringify({codec:'avc1.42c01e',w:640,h:360,ox:0,oy:0,sc:1,mon:0,mons:[[0,0,640,360,1]]}));
 const packet=Buffer.alloc(config.length+2);packet.writeUInt16BE(config.length);config.copy(packet,2);
 video.handle('C',packet);const firstDecoder=decoders.at(-1);

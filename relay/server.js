@@ -1115,7 +1115,8 @@ async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_
  catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
 async function lane(){while(!ended&&noLive){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}if(ended)status(L.end,'')}
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
-let gone=false,abort=null,noLive=false,gotEver=false,frames=0,bytes=0,dec=null,chain=Promise.resolve(),renderPending=0,renderEpoch=0,waitFull=false;
+let gone=false,abort=null,noLive=false,frames=0,bytes=0,dec=null,chain=Promise.resolve(),renderPending=0,renderEpoch=0,waitFull=false;
+let paintedAt=0,paintSerial=0,displayCodec='';
 function queuePicture(draw,full){
  if(waitFull&&!full)return;
  if(renderPending>=3){renderEpoch++;waitFull=true;if(abort)abort.abort();return}
@@ -1124,7 +1125,7 @@ function queuePicture(draw,full){
  chain=chain.then(async()=>{if(!ended&&epoch===renderEpoch)await draw(()=>!ended&&epoch===renderEpoch)}).catch(()=>{}).finally(()=>{renderPending--});
 }
 const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
-setInterval(()=>{if(!ended&&gotEver&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when the screen is still: never a number from seconds ago
+setInterval(()=>{if(!ended&&paintSerial&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+displayCodec+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when a JPEG desktop is still
 const jpeg=b=>createImageBitmap(new Blob([b],{type:'image/jpeg'}));
 function size(w,h){if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}}
 const fmtB=n=>n>=1073741824?(n/1073741824).toFixed(1)+'G':n>=1048576?Math.round(n/1048576)+'M':Math.round(n/1024)+'K';
@@ -1151,43 +1152,68 @@ function monMap(ms,cur){const k=JSON.stringify(ms)+cur;if(k===mapKey)return;mapK
 function pick(v){mon=v<0?'':String(v);if(abort)abort.abort()}
 addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||(control&&e.target===cv))return;if(!/^[0-9]$/.test(e.key))return;
  const n=+e.key,ms=window.__mons||[];if(n===0)pick(-1);else if(n<=ms.length)pick(n-1)});
+function painted(codec){paintedAt=performance.now();paintSerial++;frames++;displayCodec=codec}
+function streamStall(now,started,lastData,firstPaint,lastPaint,continuous,hidden) {
+ if(!firstPaint)return now-started>=7000?'initial-frame':'';
+ if(now-lastData>=22000)return 'no-packets';
+ if(continuous&&!hidden&&now-lastPaint>=7000)return 'no-video-frame';
+ return '';
+}
 function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
  if(ty==='S'){try{sysPanel(JSON.parse(td.decode(p)))}catch(_){}return}
+ if(ty==='Q'&&p.length<=2048){try{
+  const q=JSON.parse(td.decode(p)),numeric=n=>typeof n==='number'&&Number.isFinite(n)&&n>=0;
+  if([q.capture_fps,q.sent_fps,q.capture_ms,q.prepare_ms,q.encode_write_ms].every(numeric)){
+   st.title=(ru?'Захват':'Capture')+' '+q.capture_fps.toFixed(1)+' fps · '+(ru?'отправлено':'sent')+' '+q.sent_fps.toFixed(1)+' fps · '+q.capture_ms.toFixed(1)+' / '+q.prepare_ms.toFixed(1)+' / '+q.encode_write_ms.toFixed(1)+' ms';
+  }
+ }catch(_){}return}
  if(ty==='K'){try{if(dec)dec.close()}catch(_){}dec=null;const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n))),img=p.subarray(2+n);
   if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
-  queuePicture(async valid=>{const b=await jpeg(img);try{if(valid()){size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);frames++}}finally{b.close()}},true)}
+  queuePicture(async valid=>{const b=await jpeg(img);try{if(valid()){size(m.w||b.width,m.h||b.height);meta={ox:m.ox,oy:m.oy,sc:m.sc};g.drawImage(b,0,0);painted('JPEG')}}finally{b.close()}},true)}
  else if(ty==='T'){const c=dv.getUint16(0),parts=[];let o=2;
   for(let i=0;i<c;i++){const n=dv.getUint32(o+4);parts.push([dv.getUint16(o),dv.getUint16(o+2),p.subarray(o+8,o+8+n)]);o+=8+n}
-  queuePicture(async valid=>{const bs=await Promise.allSettled(parts.map(q=>jpeg(q[2])));const complete=bs.every(x=>x.status==='fulfilled');bs.forEach((x,i)=>{if(x.status==='fulfilled'){if(valid()&&complete)g.drawImage(x.value,parts[i][0],parts[i][1]);x.value.close()}});if(valid()&&complete)frames++;else if(!complete){waitFull=true;if(abort)abort.abort()}},false)}
+  queuePicture(async valid=>{const bs=await Promise.allSettled(parts.map(q=>jpeg(q[2])));const complete=bs.every(x=>x.status==='fulfilled');bs.forEach((x,i)=>{if(x.status==='fulfilled'){if(valid()&&complete)g.drawImage(x.value,parts[i][0],parts[i][1]);x.value.close()}});if(valid()&&complete)painted('JPEG');else if(!complete){waitFull=true;if(abort)abort.abort()}},false)}
  else if(ty==='C'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n)));meta={ox:m.ox,oy:m.oy,sc:m.sc};
   renderEpoch++;waitFull=false;
   if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
   if(!('VideoDecoder' in window)){noLive=true;if(abort)abort.abort();return}   // no WebCodecs in this browser: pictures instead
   try{if(dec)dec.close()}catch(_){}
-  const current=new VideoDecoder({output:f=>{try{if(!ended&&dec===current){size(f.displayWidth,f.displayHeight);g.drawImage(f,0,0);frames++}}finally{f.close()}},error:()=>{if(dec===current){dec=null;noVideo=true;if(abort)abort.abort()}}});
+  const current=new VideoDecoder({output:f=>{try{if(!ended&&dec===current){size(f.displayWidth,f.displayHeight);g.drawImage(f,0,0);painted('H.264')}}finally{f.close()}},error:()=>{if(dec===current){dec=null;noVideo=true;if(abort)abort.abort()}}});
   dec=current;videoWaitKey=true;try{dec.configure({codec:m.codec,optimizeForLatency:true})}catch(_){try{current.close()}catch(_){}dec=null;noVideo=true;if(abort)abort.abort()}}
  else if(ty==='V'&&dec&&dec.state==='configured'){
   const key=!!(p[0]&1);if(dec.decodeQueueSize>3){videoWaitKey=true;if(abort)abort.abort();return}if(videoWaitKey&&!key)return;if(key)videoWaitKey=false;
   try{dec.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:Math.round(performance.now()*1000),data:p.subarray(1)}))}catch(_){noVideo=true;if(abort)abort.abort()}}}
 let noVideo=false,videoWaitKey=true;
-async function live(){   // -> true if pictures came
- abort=new AbortController();let got=false;const my=abort;
- const quiet=setTimeout(()=>{if(!got)my.abort()},7000);   // nothing in 7 s: this agent does not stream
- try{const r=await fetch(base+'/live?codec='+(!noVideo&&'VideoDecoder' in window?'h264':'jpeg')+(mon?'&mon='+mon:''),{signal:my.signal});
+async function live(){
+ const my=new AbortController();abort=my;
+ const first=paintSerial,started=performance.now(),requestedVideo=!noVideo&&'VideoDecoder' in window;
+ let lastData=started,stall='';
+ const watchdog=setInterval(()=>{
+   stall=streamStall(performance.now(),started,lastData,paintSerial>first,paintedAt,dec?.state==='configured',document.hidden);
+   if(stall)my.abort();
+ },1000);
+ try{const r=await fetch(base+'/live?codec='+(requestedVideo?'h264':'jpeg')+(mon?'&mon='+mon:''),{signal:my.signal});
   if(r.status===410){ended=true;return true}
   if(!r.ok||!r.body)return false;
   const rd=r.body.getReader();let buf=new Uint8Array(0);
-  for(;;){const x=await rd.read();if(x.done)break;bytes+=x.value.length;
+  for(;;){const x=await rd.read();if(x.done)break;lastData=performance.now();bytes+=x.value.length;
    const nb=new Uint8Array(buf.length+x.value.length);nb.set(buf);nb.set(x.value,buf.length);buf=nb;
    while(buf.length>=5){const n=new DataView(buf.buffer,buf.byteOffset).getUint32(0);if(buf.length<5+n)break;
     const ty=String.fromCharCode(buf[4]),pl=buf.slice(5,5+n);buf=buf.subarray(5+n);
-    if(ty!=='P'){got=true;gotEver=true}handle(ty,pl)}}
- }catch(e){}finally{clearTimeout(quiet)}
- return got}
+    handle(ty,pl)}}
+ }catch(e){}finally{
+   clearInterval(watchdog);
+   renderEpoch++;waitFull=true;
+   try{if(dec)dec.close()}catch(_){}dec=null;
+ }
+ if(stall&&requestedVideo&&stall!=='no-packets')noVideo=true;
+ return paintSerial>first&&!stall;
+}
 (async()=>{while(!ended){
  if(noLive){const lanes=[lane(),lane()];await sleep(5000);noLive=false;await Promise.all(lanes);continue} // retry video after startup, reconnect or an older agent's update
+ const hadVideoFallback=noVideo;
  const ok=await live();if(ended)break;
- if(!ok&&!gotEver)noLive=true;else if(!ok)await sleep(1000)}
+ if(!ok&&noVideo===hadVideoFallback)noLive=true}
  status(L.end,'')})();
 const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function info(){while(!ended){try{

@@ -36,6 +36,8 @@ assert.match(video.st.title,/Capture 30\.0 fps · sent 3\.0 fps/);
 assert.equal(video.paintSerial,0,'capture telemetry was treated as a visible frame');
 assert.equal(video.streamStall(8000,0,7999,false,0,false,false),'initial-frame','metadata kept a blank stream open');
 assert.equal(video.streamStall(8000,0,7999,true,100,true,false),'no-video-frame','stalled H.264 did not trigger recovery');
+assert.equal(video.streamStall(8000,0,0,false,0,false,false),'no-packets','a network loss was mistaken for an unsupported codec');
+assert.equal(video.streamStall(8000,0,500,true,100,true,false),'no-packets','an interrupted connection forced a codec downgrade');
 assert.equal(video.streamStall(8000,0,7999,true,100,false,false),'','a still JPEG desktop triggered recovery');
 assert.equal(video.streamStall(23000,0,500,true,100,false,false),'no-packets');
 const config=Buffer.from(JSON.stringify({codec:'avc1.42c01e',w:640,h:360,ox:0,oy:0,sc:1,mon:0,mons:[[0,0,640,360,1]]}));

@@ -192,17 +192,28 @@ function streamCtl(code, s, a) {
   if (s.noStream) return;
   call(code, 'stream', a, 10_000, { human: true }).catch((e) => { if (/Unknown tool|unknown tool/.test(e.message)) s.noStream = true; });   // an old agent: viewers fall back to pictures
 }
-function liveCodec(s) { return s.live?.size && [...s.live].every(v => v.codec === 'h264') ? 'h264' : 'jpeg'; }
+function liveCodec(s) { return s.live?.size ? s.liveFormat : 'jpeg'; }
 function wantKey(code, s) { if (Date.now() - (s.keyAt || 0) > 1000) { s.keyAt = Date.now(); streamCtl(code, s, { on: true, mon: s.liveMon ?? -1, codec: liveCodec(s), key: true }); } }
 function liveFrame(code, s, fr) {
+  if (!s.live?.size) return;
   const type = String.fromCharCode(fr[4]);
   const key = type === 'K' || (type === 'V' && (fr[5] & 1));
+  if (s.liveFormat === 'jpeg' && (type === 'C' || type === 'V')) return;
+  if (s.awaitLiveSource && ['C','K','T','V'].includes(type)) {
+    if (type !== 'C' && type !== 'K') return;
+    try {
+      const meta = JSON.parse(fr.subarray(7, 7 + fr.readUInt16BE(5)).toString());
+      const requestedAvailable = s.liveMon === -1 || meta.mons?.length > s.liveMon;
+      if (Number.isInteger(meta.mon) && meta.mon !== s.liveMon && requestedAvailable) return;
+    } catch { return; }
+    s.awaitLiveSource = false;
+  }
   if (type === 'C') s.lastC = fr;   // a new viewer needs the decoder settings before the next key frame
   if (type === 'K') s.lastC = null;
   if (type === 'S') { s.lastS = fr; for (const lv of s.live || []) if (lv.res.writableLength < LIVE_BACKLOG) lv.res.write(fr); return; }
   for (const lv of s.live || []) {
-    if (lv.res.writableLength > LIVE_BACKLOG) { lv.waitKey = true; wantKey(code, s); continue; }   // the viewer's link is slower than the picture
-    if (lv.waitKey && !key && type !== 'C' && type !== 'P') continue;
+    if (lv.res.writableLength > LIVE_BACKLOG) { lv.waitKey = true; continue; }
+    if (lv.waitKey && !key && type !== 'C' && type !== 'P') { wantKey(code, s); continue; }
     if (key) lv.waitKey = false;
     lv.res.write(fr);
   }
@@ -1125,24 +1136,25 @@ const $=id=>document.getElementById(id),dot=$('dot'),st=$('st'),cv=$('cv'),g=cv.
 $('hNote').textContent=L.note;$('note').dataset.empty=L.noNote;$('hPlan').textContent=L.plan;
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
 const CTL=(location.hash.match(/c=([0-9a-f]+)/)||[])[1]||'';   // the control secret lives in the #fragment: it never reaches a server log
-let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='';
+let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='',monitorEpoch=0,snapshotHash='';
 
 const viewerClient=Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join(''),viewerAbort=new AbortController(),nativeFetch=window.fetch.bind(window);
 window.fetch=(input,init={})=>{const u=new URL(typeof input==='string'?input:input.url,location.href);if(u.origin===location.origin&&u.pathname.startsWith(base+'/')){if(gone)return Promise.reject(new DOMException('Viewer disconnected','AbortError'));const headers=new Headers(init.headers||{});headers.set('x-viewer-client',viewerClient);init={...init,headers,signal:init.signal||viewerAbort.signal}}return nativeFetch(input,init)};
 function status(t,cls){st.textContent=gone?(ru?'отключено':'disconnected'):t;dot.className=gone?'':cls||''}
-async function fetchFrame(my){try{const r=await fetch(base+'/frame?mon='+mon+'&_='+Date.now());if(ended)return;
+async function fetchFrame(my){const epoch=monitorEpoch;try{const r=await fetch(base+'/frame?mon='+mon+'&prev='+encodeURIComponent(snapshotHash));if(ended||epoch!==monitorEpoch)return;
  if(r.status===410){ended=true;return}
  if(r.status===204){status(L.live,'on');await new Promise(x=>setTimeout(x,250));return}
  if(r.ok){const b=await r.blob();const bmp=await createImageBitmap(b);
-  if(!ended&&my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
+  if(!ended&&epoch===monitorEpoch&&my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
+   snapshotHash=r.headers.get('x-frame-hash')||'';
    meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};status(L.live+'  '+Math.round(b.size/1024)+' KB','on')}
   bmp.close()}
  else{let m='';try{m=(await r.json()).error||''}catch(_){}status(/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait,'bad');await new Promise(x=>setTimeout(x,1200))}}
  catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
-async function lane(){while(!ended&&noLive){await fetchFrame(++seq);await new Promise(x=>setTimeout(x,10))}if(ended)status(L.end,'')}
+async function lane(gap){while(!ended&&noLive){await fetchFrame(++seq);await sleep(gap)}if(ended)status(L.end,'')}
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
 let gone=false,abort=null,noLive=false,frames=0,bytes=0,dec=null,chain=Promise.resolve(),renderPending=0,renderEpoch=0,waitFull=false;
-let paintedAt=0,paintSerial=0,displayCodec='';
+let paintedAt=0,paintSerial=0,displayCodec='',streamConflict=false;
 function queuePicture(draw,full){
  if(waitFull&&!full)return;
  if(renderPending>=3){renderEpoch++;waitFull=true;if(abort)abort.abort();return}
@@ -1175,14 +1187,14 @@ function monMap(ms,cur){const k=JSON.stringify(ms)+cur;if(k===mapKey)return;mapK
  ms.forEach(x=>{const u=document.createElement('u');u.style.cssText='position:absolute;left:'+Math.round((x[0]-minx)*s)+'px;top:'+Math.round((x[1]-miny)*s)+'px;width:'+Math.max(4,Math.round(x[2]*s))+'px;height:'+Math.max(4,Math.round(x[3]*s))+'px';all.append(u)});
  mk(-1,ru?'все':'all',all);
  ms.forEach((x,i)=>{const u=document.createElement('u');u.style.cssText='width:'+Math.max(10,Math.round(x[2]*s*1.6))+'px;height:'+Math.max(7,Math.round(x[3]*s*1.6))+'px';mk(i,(i+1)+' '+x[2]+'\u00d7'+x[3]+(x[4]?'\u2605':''),u)})}
-function pick(v){mon=v<0?'':String(v);if(abort)abort.abort()}
+function pick(v){mon=v<0?'':String(v);monitorEpoch++;snapshotHash='';if(abort)abort.abort()}
 addEventListener('keydown',e=>{if(e.target&&/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)||e.ctrlKey||e.metaKey||e.altKey||(control&&e.target===cv))return;if(!/^[0-9]$/.test(e.key))return;
  const n=+e.key,ms=window.__mons||[];if(n===0)pick(-1);else if(n<=ms.length)pick(n-1)});
 function painted(codec){paintedAt=performance.now();paintSerial++;frames++;displayCodec=codec}
 function streamStall(now,started,lastData,firstPaint,lastPaint,continuous,hidden) {
- if(!firstPaint)return now-started>=7000?'initial-frame':'';
+ if(!firstPaint)return now-started>=7000?(lastData===started?'no-packets':'initial-frame'):'';
  if(now-lastData>=22000)return 'no-packets';
- if(continuous&&!hidden&&now-lastPaint>=7000)return 'no-video-frame';
+ if(continuous&&!hidden&&now-lastPaint>=7000)return now-lastData>=7000?'no-packets':'no-video-frame';
  return '';
 }
 function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
@@ -1211,6 +1223,7 @@ function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffse
   try{dec.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:Math.round(performance.now()*1000),data:p.subarray(1)}))}catch(_){noVideo=true;if(abort)abort.abort()}}}
 let noVideo=false,videoWaitKey=true;
 async function live(){
+ streamConflict=false;
  const my=new AbortController();abort=my;
  const first=paintSerial,started=performance.now(),requestedVideo=!noVideo&&'VideoDecoder' in window;
  let lastData=started,stall='';
@@ -1220,6 +1233,7 @@ async function live(){
  },1000);
  try{const r=await fetch(base+'/live?codec='+(requestedVideo?'h264':'jpeg')+(mon?'&mon='+mon:''),{signal:my.signal});
   if(r.status===410){ended=true;return true}
+  if(r.status===409){const refusal=await r.json().catch(()=>({}));streamConflict=refusal.error==='stream-conflict'}
   if(!r.ok||!r.body)return false;
   const rd=r.body.getReader();let buf=new Uint8Array(0);
   for(;;){const x=await rd.read();if(x.done)break;lastData=performance.now();bytes+=x.value.length;
@@ -1236,14 +1250,18 @@ async function live(){
  return paintSerial>first&&!stall;
 }
 (async()=>{while(!ended){
- if(noLive){const lanes=[lane(),lane()];await sleep(5000);noLive=false;await Promise.all(lanes);continue} // retry video after startup, reconnect or an older agent's update
+ if(noLive){
+  snapshotHash='';
+  const lanes=streamConflict?[lane(200)]:[lane(10),lane(10)];
+  await sleep(5000);noLive=false;await Promise.all(lanes);continue
+ } // retry video after startup, reconnect or an older agent's update
  const hadVideoFallback=noVideo;
  const ok=await live();if(ended)break;
  if(!ok&&noVideo===hadVideoFallback)noLive=true}
  status(L.end,'')})();
 const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function info(){while(!ended){try{
- const r=await fetch(base+'/log');if(ended)break;if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
+ const r=await fetch(base+'/log',{priority:'low'});if(ended)break;if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
  const q=await fetch(base+'/state');if(q.ok){const s=await q.json();
   const native= !s.realtime_capable || s.live_realtime;
   window.ViewerInput?.setPointer(!!s.live_pointer && native);window.ViewerInput?.setKeyboard(!!s.live_keyboard && native);window.ViewerInput?.setRealtime(!!s.live_realtime);window.ViewerInput?.setLook(s.look||{});window.ViewerInput?.setOnline(!!s.online && !s.paused);
@@ -1394,17 +1412,33 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (vw[2] === '/log') return json(res, 200, s.log.slice(-25));
       if (vw[2] === '/live') {   // a video-like stream; 501 = this agent cannot stream, the page then polls pictures
         if (s.noStream) return json(res, 501, { error: 'no stream' });
-        const ms = url.searchParams.get('mon'), mon = ms ? Number(ms) : -1; s.liveMon = Number.isInteger(mon) && mon >= 0 && mon < 10 ? mon : -1;
+        const requested = url.searchParams.get('mon');
+        const mon = /^\d$/.test(requested || '') ? Number(requested) : -1;
+        const codec = url.searchParams.get('codec') === 'jpeg' ? 'jpeg' : 'h264';
+        if (s.live?.size) {
+          if (mon !== s.liveMon || (codec === 'jpeg' && s.liveFormat === 'h264')) {
+            return json(res, 409, { error: 'stream-conflict' });
+          }
+        } else {
+          if (s.liveMon !== mon || s.liveFormat !== codec) {
+            s.liveMon = mon;
+            s.liveFormat = codec;
+            s.awaitLiveSource = true;
+            s.lastC = null;
+          }
+          s.keyAt = 0;
+        }
         res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-accel-buffering': 'no' });
+        res.flushHeaders();
         // Earlier viewers already understand C/V frames but do not advertise a
         // codec. They fall back to screenshots themselves without WebCodecs.
-        const lv = { res, waitKey: true, viewer: vw[1], client, codec: url.searchParams.get('codec') === 'jpeg' ? 'jpeg' : 'h264' }; (s.live ??= new Set()).add(lv);
+        const lv = { res, waitKey: true, viewer: vw[1], client, codec }; (s.live ??= new Set()).add(lv);
         if (s.lastC && liveCodec(s) === 'h264') res.write(s.lastC);
         if (s.lastS) res.write(s.lastS);
-        s.keyAt = 0; wantKey(v.code, s);
+        wantKey(v.code, s);
         const ping = setInterval(() => res.write(Buffer.from([0, 0, 0, 0, 80])), 15_000);   // keeps proxies from closing a quiet stream
         req.on('close', () => {
-          clearInterval(ping); const before=liveCodec(s);s.live?.delete(lv);if(s.live?.size&&liveCodec(s)!==before){s.keyAt=0;wantKey(v.code,s);}scheduleViewerHandback(vw[1],v,s,client);
+          clearInterval(ping); s.live?.delete(lv); scheduleViewerHandback(vw[1],v,s,client);
           setTimeout(() => { if (!s.live?.size && sessions.get(v.code) === s) streamCtl(v.code, s, { on: false }); }, 15_000);   // nobody watches: the agent stops filming
         });
         return;
@@ -1545,11 +1579,14 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       v.inflight = (v.inflight || 0) + 1;
       try {
         const mon = url.searchParams.get('mon'); const extra = /^\d$/.test(mon || '') ? { monitor: Number(mon) } : {};
-        const d = await call(v.code, 'screenshot', { view: true, prev: v.hash, ...extra, ...viewParams(s) }, 20_000, { human: true, viewerOwner: vw[1] + '/' + client });
+        const requestedHash = url.searchParams.get('prev');
+        const prev = requestedHash === null ? v.hash : /^[a-z0-9_-]{1,128}$/i.test(requestedHash) ? requestedHash : undefined;
+        const d = await call(v.code, 'screenshot', { view: true, prev, ...extra, ...viewParams(s) }, 20_000, { human: true, viewerOwner: vw[1] + '/' + client });
         if (v.disconnected?.has(client)) return json(res, 409, { error: 'viewer disconnected' });
         if (d.same) { res.writeHead(204, { 'x-same': '1' }); return res.end(); }   // unchanged screen: nothing to send
-        v.hash = d.h; v.last = d.jpeg;
-        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-quality': `${s.vl ?? 3}`, 'x-ox': `${d.ox ?? 0}`, 'x-oy': `${d.oy ?? 0}`, 'x-sc': `${d.sc ?? d.scale ?? 1}` }); return res.end(d.jpeg);
+        const hash = /^[a-z0-9_-]{1,128}$/i.test(d.h || '') ? d.h : '';
+        if (requestedHash === null) v.hash = hash;
+        res.writeHead(200, { 'content-type': 'image/jpeg', 'cache-control': 'no-store', 'x-frame-hash': hash, 'x-quality': `${s.vl ?? 3}`, 'x-ox': `${d.ox ?? 0}`, 'x-oy': `${d.oy ?? 0}`, 'x-sc': `${d.sc ?? d.scale ?? 1}` }); return res.end(d.jpeg);
       } catch (e) { return json(res, 503, { error: e.message }); } finally { v.inflight--; }
     }
 

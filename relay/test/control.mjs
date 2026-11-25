@@ -34,8 +34,13 @@ function startStream(a) {
   if(a.upload)return;
   const req=http.request(base+'/a/stream',{method:'POST',headers:{Authorization:'Bearer '+a.token,'content-type':'application/octet-stream'}},(r)=>r.resume());
   a.upload=req;req.on('error',()=>{});req.on('close',()=>{if(a.upload===req)a.upload=null;clearInterval(timer);});
-  const meta=Buffer.from(JSON.stringify({w:960,h:540,ox:0,oy:0,sc:1,mons:[[0,0,960,540,1]],mon:-1})),len=Buffer.alloc(2);len.writeUInt16BE(meta.length);
-  const send=()=>{if(!req.destroyed)req.write(frame('K',Buffer.concat([len,meta,picture])));};
+  const send=()=>{
+    if(req.destroyed)return;
+    const mon=a.liveMon??-1, ox=mon===1?960:0;
+    const meta=Buffer.from(JSON.stringify({w:960,h:540,ox,oy:0,sc:1,mons:[[0,0,960,540,1],[960,0,960,540,1]],mon}));
+    const len=Buffer.alloc(2);len.writeUInt16BE(meta.length);
+    req.write(frame('K',Buffer.concat([len,meta,picture])));
+  };
   const timer=setInterval(send,300);send();
 }
 async function post(url,body,headers={}) { return fetch(url,{method:'POST',headers:{'content-type':'application/json',...headers},body:JSON.stringify(body)}); }
@@ -51,10 +56,13 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
     if(r.status===204){await sleep(50);continue;}if(!r.ok)break;
     const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args});
     if(c.tool==='press_key'&&a.holdPress)await a.holdPress;
-    if(c.tool==='stream'){if(c.args.on)startStream(a);else{a.upload?.end();a.upload=null;}}
+    if(c.tool==='stream'){if(c.args.on){a.liveMon=c.args.mon;startStream(a);}else{a.upload?.end();a.upload=null;}}
     let data={text:'ok'};
     if(c.tool==='request_access')data={approved:a.approveAccess === true};
-    if(c.tool==='screenshot')data={jpeg:picture.toString('base64'),mime:'image/png',h:'fixture',sc:1};
+    if(c.tool==='screenshot'){
+      const h=c.args.monitor===1?'fixture-monitor-one':'fixture';
+      data=c.args.prev===h?{same:true,h}:{jpeg:picture.toString('base64'),mime:'image/png',h,sc:1,ox:c.args.monitor===1?960:0};
+    }
     if(c.tool==='sysdata')data={text:JSON.stringify(c.args.kind==='procs'?{p:[]}:c.args.kind==='adapters'?'Ethernet [Up] if=14 1 Gbit/s; synthetic fixture':{})};
     if(c.tool==='net_check')data={text:JSON.stringify({fixture:true,mode:c.args.mode,routes:[]})};
     if(c.tool==='net_recover')data={text:JSON.stringify(c.args.op==='start'?{job:'1234567890abcdef12345678',status:'worker_running'}:c.args.op==='list'?{jobs:[]}:{id:c.args.job,status:'rolled_back'})};
@@ -188,10 +196,31 @@ try {
   assert.equal((await post(viewer+'/takeover',{on:false},{'x-ctl':ctl,'x-viewer-client':other})).status,409,'another tab stole ownership');
   const live=await fetch(viewer+'/live',{headers:{'x-viewer-client':client}});assert.equal(live.status,200);const reader=live.body.getReader();await reader.read();
   assert.equal((await(await fetch(viewer+'/state')).json()).stream.codec,'h264','legacy video-capable viewer blocked video');
-  const jpegAbort=new AbortController();const jpeg=await fetch(viewer+'/live?codec=jpeg',{signal:jpegAbort.signal,headers:{'x-viewer-client':other}});
-  assert.equal(jpeg.status,200);assert.equal((await(await fetch(viewer+'/state')).json()).stream.codec,'jpeg','unsupported browser did not get compatible mode');
-  jpegAbort.abort();
-  for(let n=0;n<30;n++){if((await(await fetch(viewer+'/state')).json()).stream.codec==='h264')break;await sleep(20);if(n===29)assert.fail('video mode did not recover after JPEG viewer left');}
+  const guestHeaders={'x-viewer-client':other};
+  for (const query of ['codec=jpeg','codec=h264&mon=1']) {
+    const conflict=await fetch(viewer+'/live?'+query,{headers:guestHeaders});
+    assert.equal(conflict.status,409);
+    assert.equal((await conflict.json()).error,'stream-conflict');
+  }
+  const snapshots=viewer+'/frame?mon=1&prev=';
+  const guestFrame=await fetch(snapshots,{headers:guestHeaders});
+  assert.equal(guestFrame.status,200);
+  assert.equal(guestFrame.headers.get('x-ox'),'960','guest snapshot came from the live viewer monitor');
+  const hash=guestFrame.headers.get('x-frame-hash');
+  assert.equal(hash,'fixture-monitor-one');
+  await guestFrame.arrayBuffer();
+  assert.equal((await fetch(snapshots+hash,{headers:guestHeaders})).status,204);
+  const freshFrame=await fetch(snapshots,{headers:{'x-viewer-client':'b'.repeat(32)}});
+  assert.equal(freshFrame.status,200,'another tab suppressed the first frame');
+  await freshFrame.arrayBuffer();
+  const sharedAbort=new AbortController();
+  const compatible=await fetch(viewer+'/live?codec=h264',{headers:guestHeaders,signal:sharedAbort.signal});
+  assert.equal(compatible.status,200,'compatible viewers cannot share the live feed');
+  await compatible.body.getReader().read();
+  assert.equal((await(await fetch(viewer+'/state')).json()).stream.codec,'h264','guest reconfigured the live codec');
+  assert.ok(commands.filter(c=>c.code===first.code&&c.tool==='stream'&&c.args.on).every(c=>c.args.mon===-1&&c.args.codec==='h264'),'guest reconfigured the live monitor or codec');
+  sharedAbort.abort();
+  for(let n=0;n<30;n++){if((await(await fetch(viewer+'/state')).json()).stream.viewers===1)break;await sleep(20);if(n===29)assert.fail('closed guest stream stayed attached');}
   assert.equal((await post(viewer+'/disconnect',{},CH)).status,200);
   for(let n=0;n<30;n++){if((await reader.read()).done)break;if(n===29)assert.fail('stream remained open');}
   const state=await(await fetch(viewer+'/state')).json();assert.equal(!!state.takeover,false,'disconnect left manual takeover active');
@@ -200,6 +229,11 @@ try {
   assert.equal((await post(viewer+'/network',{kind:'jobs'},CH)).status,409,'disconnected viewer issued network command');
   assert.equal((await fetch(viewer+'/state',{headers:{'x-viewer-client':other}})).status,200,'disconnect affected another tab');
   await sleep(300);assert.ok(commands.some(c=>c.tool==='stream'&&c.args.on===false));
+  const guestLive=await fetch(viewer+'/live?codec=jpeg&mon=1',{headers:guestHeaders});
+  assert.equal(guestLive.status,200,'a guest could not start a new feed after the first viewer left');
+  const guestReader=guestLive.body.getReader();
+  await guestReader.read();await guestReader.cancel();
+  assert.ok(commands.some(c=>c.code===first.code&&c.tool==='stream'&&c.args.on&&c.args.mon===1&&c.args.codec==='jpeg'));
   assert.ok(commands.some(c=>c.tool==='viewer_pointer'&&c.args.op==='release'),'disconnect did not release native pointer');
   first.pausePolling=true;await sleep(100);
   const OH={'x-ctl':ctl,'x-viewer-client':other};

@@ -37,7 +37,9 @@ try {
   await start();
   const reg=await(await post('/a/register',{os:'Windows (synthetic)',host:'Offline-fixture',user:'Test',mode:'auto',persist:true},'')).json();
   assert.equal((await status()).counts.online,1);
+  let admin = await loginAdmin();
   assert.equal((await post('/a/bye',{final:false},reg.token)).status,200);
+  assert.equal((await admin('look',{code:reg.code,note:'Connect after reboot',color:'#28a078',banner:true})).status,200);
   let s=await status();assert.equal(s.counts.online,0,'normal window close remained online');
   assert.ok(s.sessions[0].last_seen_s<3,'normal close erased the last contact timestamp');
   await sleep(10500); // include an actual server maintenance sweep
@@ -46,6 +48,11 @@ try {
   await halt();await start();
   s=await status();assert.equal(s.counts.sessions,1);assert.equal(s.counts.online,0,'restart invented an online PC');
   assert.ok(s.sessions[0].last_seen_s>=age,'restart reset last-seen age');
+  admin = await loginAdmin();
+  const [appearance] = await (await admin('sessions')).json();
+  assert.equal(appearance.note,'Connect after reboot');
+  assert.equal(appearance.color,'#28a078');
+  assert.equal(appearance.banner,true);
   const poll=await fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+reg.token}});
   assert.ok([200,204].includes(poll.status),'saved token stopped working');
   if(poll.status===200){const command=await poll.json();await post('/a/result',{id:command.id,ok:true,data:{text:'ok'}},reg.token);}
@@ -56,7 +63,6 @@ try {
   const fixture = { os:'Windows synthetic', host:'Forgotten fixture', mode:'auto', persist:true, device_id:'forgotten-test-device' };
   const previous = await (await post('/a/register',fixture,'')).json();
   assert.equal((await post('/a/bye',{final:false},previous.token)).status,200);
-  let admin = await loginAdmin();
   assert.equal((await admin('end',{code:previous.code})).status,200);
   assert.equal((await admin('look',{code:previous.code,glow:true})).status,200);
   await halt();await start();

@@ -62,7 +62,7 @@ function writeState() {
   clearTimeout(saveTimer);
   saveTimer = null;
   const out = {
-    sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
+    sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, note: s.note, lookForce: s.lookForce, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
     viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
     devices: [...devices].map(([dh, code]) => ({ dh, code })),
     endedDevices: [...endedDevices.values()],

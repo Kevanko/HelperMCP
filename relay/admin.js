@@ -149,6 +149,7 @@
     top();
     if (tab === 'sessions') {
       function accessButton(s) {
+        if (s.ended) return el('span', { class: 'mut', text: 'Ждём запуска Helper' });
         if (s.access === 'active') return null;
         if (s.access === 'pending') return el('span', { class: 'waiting', role: 'status', text: 'Ждём согласия' });
         return el('button', { class: 'go', disabled: !s.online || s.access === 'pending', onclick: async () => {
@@ -194,12 +195,12 @@
                     try { await call('look', { code: s.code, [key]: !s[key] }); await draw(); }
                     catch (err) { guard(err); }
                   })))),
-              el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
-              el('td', null, el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
+              el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.ended ? 'Сеанс завершён' : s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
+              el('td', null, s.ended ? s.mode : el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
               el('td', { text: s.last_seen_s == null ? 'unknown' : ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
-              el('td', { class: 'ac' }, el('div', { class: 'acts' }, accessButton(s), forgetButton(s), el('button', { class: 'go', disabled: s.access !== 'active', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
+              el('td', { class: 'ac' }, el('div', { class: 'acts' }, accessButton(s), forgetButton(s), s.ended ? null : el('button', { class: 'go', disabled: s.access !== 'active', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
                 el('button', { title: 'glow colour and task text for this device', onclick: () => lookBox(s).then(draw).catch(guard) }, label('eye', 'Look')),
-                el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End'))))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
+                s.ended ? null : el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End'))))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
         } catch (e) { guard(e); }
       };
       refreshDevices = draw; draw(); timer = setInterval(() => { draw(); top(); }, 3000);

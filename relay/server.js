@@ -41,6 +41,7 @@ if (!OPERATOR_KEY) {
 
 const sessions = new Map(); // code -> session
 const devices = new Map(); // sha(device_id) -> code: a permanent identity per install, like an AnyDesk/RustDesk ID
+const endedDevices = new Map(); // device profile after an operator ends its session, without credentials
 const STATE_FILE = process.env.STATE_FILE || '';   // e.g. /data/state.json; empty = keep everything in memory only
 const sha = (x) => crypto.createHash('sha256').update(String(x)).digest('hex');   // agent tokens are stored hashed
 // the state file is encrypted (AES-256-GCM, key derived from OPERATOR_KEY): a copy of data/ alone reveals nothing, and it only holds live sessions
@@ -64,6 +65,7 @@ function writeState() {
     sessions: [...sessions].map(([code, s]) => ({ code, th: s.th, ip: s.ip, mode: s.mode, info: s.info, created: s.created, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown !== false, persist: !!s.persist, keepMs: s.keepMs, paused: !!s.paused, ...Object.fromEntries(lookKeys.map((key) => [key, s[key]])), events: (s.events || []).slice(-30) })),
     viewers: [...viewers].map(([token, v]) => ({ token, code: v.code, exp: v.exp, ctl: v.ctl })),
     devices: [...devices].map(([dh, code]) => ({ dh, code })),
+    endedDevices: [...endedDevices.values()],
     settings,
     ended: [...ended].filter(([, t]) => Date.now() - t < 3600_000).map(([code, t]) => ({ code, t })),
     revoked: [...revokedTokens],
@@ -139,17 +141,22 @@ function lookOf(s) {
 }
 // a person changes the glow colour or the task text from the viewer / the admin panel
 async function humanLook(code, update) {
+  code = String(code).toUpperCase();
   const { color, note } = update;
-  const s = sessions.get(String(code).toUpperCase()); if (!s) throw new Error('No such session');
+  const s = sessions.get(code) || endedDevices.get(code); if (!s) throw new Error('No such device');
   if (color !== undefined && color !== '') { if (!/^#[0-9a-f]{6}$/i.test(color)) throw new Error('bad colour (use #RRGGBB)'); s.lookForce = color.toLowerCase(); }
   if (note !== undefined) { s.note = String(note).replace(/\s+/g, ' ').trim().slice(0, 90); s.lastNoteAt = 0; }
   for (const key of lookKeys) if (typeof update[key] === 'boolean') s[key] = update[key];
+  if (s.ended) { writeState(); return 'saved; applies when the device starts a new session'; }
   evPush(s, { t: Date.now(), type: 'look', data: { note: s.note || '', color: s.lookForce || '', glow: effLook(s).glow, sound: effLook(s).sound, by: 'operator' } }); save();
   if (!isOnline(s)) { s.lookPending = true; return 'saved; applies when the device reconnects'; }
   return pushLook(String(code).toUpperCase(), s);
 }
 function globalLook(update) {
   for (const key of lookKeys) if (typeof update[key] === 'boolean') settings[key] = update[key];
+  for (const s of endedDevices.values()) {
+    for (const key of lookKeys) if (typeof update[key] === 'boolean') s[key] = update[key];
+  }
   for (const [code, s] of sessions) {
     for (const key of lookKeys) if (typeof update[key] === 'boolean') s[key] = update[key];
     s.lookPending = true;
@@ -488,6 +495,14 @@ function endSession(code) {
   if (!s) return Promise.resolve();
   if (s.ending) return s.ending;
   revokedTokens.add(s.th);
+  if ([...devices.values()].includes(code)) {
+    const { user, host, os } = s.info || {};
+    endedDevices.set(code, {
+      code, info: { user, host, os }, mode: s.mode, persist: true, lastSeen: s.lastSeen, lastSeenKnown: s.lastSeenKnown,
+      created: s.created, note: s.note, lookForce: s.lookForce, ended: true,
+      ...Object.fromEntries(lookKeys.map(key => [key, s[key]])),
+    });
+  }
   s.queue.splice(0).forEach(({ id }) => {
     const pending = s.pending.get(id);
     if (!pending) return;
@@ -507,8 +522,11 @@ function endSession(code) {
 }
 
 async function forgetDevice(code) {
+  const existed = endedDevices.delete(code);
   for (const [id, remembered] of devices) if (remembered === code) devices.delete(id);
-  await endSession(code);
+  if (sessions.has(code)) { await endSession(code); return true; }
+  if (existed) writeState();
+  return existed;
 }
 
 setInterval(() => {
@@ -1264,7 +1282,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, globalLook, settings, effLook, isOnline, hasAccess, requestAccess, clearAccess, contactAge, call, save, dir: ADMIN_DIR, here, sessions, makeViewer, endSession, forgetDevice, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, globalLook, settings, effLook, isOnline, hasAccess, requestAccess, clearAccess, contactAge, call, save, dir: ADMIN_DIR, here, sessions, endedDevices, makeViewer, endSession, forgetDevice, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1597,16 +1615,20 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const mine = [...sessions.values()].filter((s) => s.ip === ip).length;
       if (sessions.size >= MAX_SESSIONS || mine >= MAX_PER_IP) return json(res, 429, { error: 'too many sessions' });
       const dh = info.device_id ? sha(String(info.device_id).slice(0, 300)) : null;   // a persistent per-install identity (like an AnyDesk/RustDesk ID): the same device always gets the same code back
-      let code = want && !old ? want : null;   // same code after a server reset
       const remembered = dh && devices.get(dh);
-      if (!code && remembered && !sessions.has(remembered) && !ended.has(remembered)) code = remembered;
-      if (!code) do code = newCode(); while (sessions.has(code) || ended.has(code));
+      if (want && endedDevices.has(want) && want !== remembered) return json(res, 403, { error: 'invalid device identity' });
+      let code = want;   // same code after a server reset
+      if (!code && remembered && !sessions.has(remembered) && (!ended.has(remembered) || endedDevices.has(remembered))) code = remembered;
+      if (!code) do code = newCode(); while (sessions.has(code) || ended.has(code) || endedDevices.has(code));
       if (dh) { devices.set(dh, code); save(); }
+      const profile = endedDevices.get(code);
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
         th: sha(token), ip, mode: normMode(info.mode), created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
         info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0, access_request: info.access_request === 1 },
+        ...(profile && { note: profile.note, lookForce: profile.lookForce, ...Object.fromEntries(lookKeys.map(key => [key, profile[key]])) }),
       });
+      endedDevices.delete(code);
       sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
       return json(res, 200, { code, token, look: effLook(s) });
@@ -1750,6 +1772,7 @@ if (STATE_FILE && fs.existsSync(STATE_FILE)) {
     }
     for (const v of st.viewers || []) if (v.exp > Date.now()) viewers.set(v.token, { code: v.code, exp: v.exp, ctl: v.ctl });
     for (const x of st.devices || []) devices.set(x.dh, x.code);
+    for (const x of st.endedDevices || []) if (!sessions.has(x.code)) endedDevices.set(x.code, { ...x, ended: true });
     for (const x of st.ended || []) if (Date.now() - x.t < 3600_000) ended.set(x.code, x.t);
     if (st.settings) for (const key of lookKeys) if (typeof st.settings[key] === 'boolean') settings[key] = st.settings[key];
     console.log(`restored ${sessions.size} session(s) from ${STATE_FILE}`);

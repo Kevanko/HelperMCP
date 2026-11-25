@@ -78,9 +78,11 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     if (api === 'logout' && req.method === 'POST') { logins.delete(sha(cookieOf(req))); res.setHeader('set-cookie', 'hm_admin=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0'); send(res, 200, {}); return true; }
     if (api === 'status') { send(res, 200, d.status()); return true; }
     if (api === 'sessions') {
-      send(res, 200, [...d.sessions].map(([code, s]) => ({
-        code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, online: d.isOnline(s), access: d.hasAccess(s) ? 'active' : s.accessRequest ? 'pending' : 'required', paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
-        last_seen_s: d.contactAge(s), created: s.created, ip: s.ip, running: s.pending.size, queued: s.queue.length, note: s.note || '', color: s.lookForce || s.lookColor || '', ...d.effLook(s),
+      const rows = new Map([...d.endedDevices, ...d.sessions]);
+      send(res, 200, [...rows].map(([code, s]) => ({
+        code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, ended: !!s.ended,
+        online: !s.ended && d.isOnline(s), access: s.ended ? 'required' : d.hasAccess(s) ? 'active' : s.accessRequest ? 'pending' : 'required', paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
+        last_seen_s: d.contactAge(s), created: s.created, ip: s.ip, running: s.pending?.size || 0, queued: s.queue?.length || 0, note: s.note || '', color: s.lookForce || s.lookColor || '', ...d.effLook(s),
         recent: (s.log || []).slice(-6).map((l) => ({ ago_s: Math.round((now - l.t) / 1000), tool: l.tool, args: l.args })),
       })).sort((a, b) => Number(b.online) - Number(a.online) || (a.last_seen_s ?? Infinity) - (b.last_seen_s ?? Infinity))); return true;
     }
@@ -116,7 +118,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       return true;
     }
     if (api === 'look') {
-      const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code) && !d.endedDevices.has(code)) { send(res, 404, { error: 'no such device' }); return true; }
       try { d.audit('admin_look', { code }); send(res, 200, { text: await d.look(code, b) }); } catch (e) { send(res, 400, { error: e.message }); } return true;
     }
     if (api === 'settings') {   // global actions apply to existing devices AND defaults for new ones
@@ -148,8 +150,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     }
     if (api === 'forget') {
       const code = String(b.code || '').toUpperCase();
-      if (!d.sessions.has(code)) { send(res, 404, { error: 'no such device' }); return true; }
-      await d.forgetDevice(code);
+      if (!await d.forgetDevice(code)) { send(res, 404, { error: 'no such device' }); return true; }
       previews.delete(code);
       d.audit('admin_forget', { code });
       send(res, 200, {});

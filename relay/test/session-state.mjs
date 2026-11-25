@@ -24,6 +24,15 @@ async function start() {
 async function halt(){if(!child||child.exitCode!==null)return;const done=once(child,'exit');child.kill();await done;}
 const post=(url,b,token)=>fetch(base+url,{method:'POST',headers:{'content-type':'application/json',Authorization:'Bearer '+token},body:JSON.stringify(b)});
 const status=async()=>{const r=await fetch(base+'/admin/status',{headers:{Authorization:'Bearer '+key}});assert.equal(r.status,200);return r.json();};
+async function loginAdmin() {
+  const login = await post('/admin/api/login',{user:credentials.user,pass:credentials.password},'');
+  assert.equal(login.status,200);
+  const cookie = login.headers.get('set-cookie').split(';')[0];
+  const {csrf} = await login.json();
+  return (route, body) => fetch(base+'/admin/api/'+route, body === undefined
+    ? {headers:{cookie}}
+    : {method:'POST',headers:{cookie,'x-csrf':csrf,'content-type':'application/json'},body:JSON.stringify(body)});
+}
 try {
   await start();
   const reg=await(await post('/a/register',{os:'Windows (synthetic)',host:'Offline-fixture',user:'Test',mode:'auto',persist:true},'')).json();
@@ -45,15 +54,23 @@ try {
   assert.equal((await status()).counts.sessions,0,'confirmed end retained the session');
 
   const fixture = { os:'Windows synthetic', host:'Forgotten fixture', mode:'auto', persist:true, device_id:'forgotten-test-device' };
+  const previous = await (await post('/a/register',fixture,'')).json();
+  assert.equal((await post('/a/bye',{final:false},previous.token)).status,200);
+  let admin = await loginAdmin();
+  assert.equal((await admin('end',{code:previous.code})).status,200);
+  assert.equal((await admin('look',{code:previous.code,glow:true})).status,200);
+  await halt();await start();
+  admin = await loginAdmin();
+  const remembered = (await (await admin('sessions')).json()).find(row=>row.code===previous.code);
+  assert.ok(remembered?.ended && remembered.glow && !remembered.online,'End or relay restart lost the device record or its appearance');
+  assert.equal((await admin('open',{code:previous.code})).status,404,'ended device offered a control link');
+  assert.equal((await post('/a/register',{...fixture,resume:previous.code,resume_token:previous.token},'')).status,410);
   const forgotten = await (await post('/a/register',fixture,'')).json();
+  assert.equal(forgotten.code,previous.code,'an intentional fresh run lost its remembered device');
+  assert.notEqual(forgotten.token,previous.token);
+  assert.equal(forgotten.look.glow,true,'a new session lost its remembered appearance');
   assert.equal((await post('/a/bye',{final:false},forgotten.token)).status,200);
-  const login = await post('/admin/api/login',{user:credentials.user,pass:credentials.password},'');
-  assert.equal(login.status,200);
-  const cookie = login.headers.get('set-cookie').split(';')[0];
-  const {csrf} = await login.json();
-  const forget = await fetch(base+'/admin/api/forget',{
-    method:'POST',headers:{cookie,'x-csrf':csrf,'content-type':'application/json'},body:JSON.stringify({code:forgotten.code}),
-  });
+  const forget = await admin('forget',{code:forgotten.code});
   assert.equal(forget.status,200);
   await halt();await start();
   const resume = { ...fixture, resume:forgotten.code, resume_token:forgotten.token };
@@ -68,9 +85,14 @@ try {
   fs.writeFileSync(path.join(dir,'state.json'),JSON.stringify({
     sessions:[{code:'LEGA-CY23',th:createHash('sha256').update(legacyToken).digest('hex'),created,persist:true,info:{os:'Windows synthetic legacy'},events:[]}],
     revoked:[createHash('sha256').update(forgotten.token).digest('hex')],
+    devices:[{dh:'remembered-fixture',code:'SAVE-TEST'}],
+    endedDevices:[{code:'SAVE-TEST',info:{host:'Stopped fixture'},mode:'auto',lastSeen:created,ended:true}],
   }));
   await start();
   assert.equal((await post('/a/register',resume,'')).status,410,'token worked after the temporary code cooldown was absent');
+  admin = await loginAdmin();
+  assert.equal((await admin('forget',{code:'SAVE-TEST'})).status,200,'an ended device cannot be forgotten without a live session');
+  assert.ok(!(await (await admin('sessions')).json()).some(row=>row.code==='SAVE-TEST'));
   s=await status();assert.equal(s.counts.online,0);
   assert.equal(s.sessions[0].last_seen_s,null,'legacy creation time was presented as last contact');
   const legacyPoll=await fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+legacyToken}});

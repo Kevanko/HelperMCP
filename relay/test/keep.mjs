@@ -26,9 +26,8 @@ const file = path.join(SDIR, 'a.py'); fs.writeFileSync(file, src);
 const TOKEN_FILE = path.join(SDIR, 'token.txt');
 const killAgent = (a) => { if (PS) spawnSync('taskkill', ['/PID', String(a.pid), '/T', '/F']); else a.kill('SIGKILL'); };
 let agentOut = '';
-const startAgent = (again = false, mode = 'unattended', logon = false) => { const env = { ...process.env, ...(again ? {} : { HELPER_MODE: mode, HELPER_PERSIST: '1' }),
-    ...(logon ? { HELPER_LOGON: '1' } : {}),
-    HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_LANG: 'en', HELPER_TOKEN_FILE: TOKEN_FILE };
+const startAgent = (again = false, mode = 'unattended', enableStartup = false) => { const env = { ...process.env, ...(again ? {} : { HELPER_MODE: mode, HELPER_PERSIST: '1' }),
+    HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: enableStartup ? '' : '1', HELPER_NO_OVERLAY: '1', HELPER_LANG: 'en', HELPER_TOKEN_FILE: TOKEN_FILE };
   const a = PS ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env }) : spawn('python3', [file], { env }); kids.push(a); a.stdout.on('data', (d) => (agentOut += d)); a.stderr.on('data', (d) => (agentOut += d)); return a; };
 
 let client = new Client({ name: 'keep', version: '0' });
@@ -115,6 +114,19 @@ console.log('Ended saved session is cleared after HTTP 410 PASS');
 
 // Exercise the actual consent window and cached-mode launch on the isolated Windows runner.
 if (PS && process.env.GITHUB_ACTIONS === 'true') {
+  function scheduler(script) {
+    const result=spawnSync('powershell',['-NoProfile','-NonInteractive','-Command',"$ErrorActionPreference='Stop'; " + script],
+      { encoding:'utf8',timeout:25000,env:{...process.env,HELPER_FIXTURE_DIR:SDIR} });
+    if(result.error) throw result.error;
+    assert.equal(result.status,0,result.stderr);
+    return result.stdout.trim();
+  }
+  const ownedTask = '$task=Get-ScheduledTask -TaskName HelperMCP -ErrorAction SilentlyContinue; ' +
+    'if ($task -and $task.Actions[0].Arguments -match "-EncodedCommand ([A-Za-z0-9+/=]+)$") { ' +
+    '$command=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])); ' +
+    'if (-not $command.Contains((Join-Path $env:HELPER_FIXTURE_DIR "agent.ps1"))) { throw "Unexpected HelperMCP task" } } else { $task=$null }; ';
+  assert.equal(scheduler('if (Get-ScheduledTask -TaskName HelperMCP -ErrorAction SilentlyContinue) { "existing" }'),'',
+    'a task already exists on the disposable runner');
   const responder = path.join(SDIR, 'accept-fixture-dialog.ps1');
   fs.writeFileSync(responder, [
     'param([int]$AgentPid)',
@@ -173,36 +185,47 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     assert.equal(exit,0,details + '\n' + result.text + '\n' + agentOut.slice(-2600));
     assert.ok(!result.err && /Access approved/.test(result.text),result.text);
   }
-  agent=startAgent(false,'auto');
-  const mode2=await waitFor(async()=>(await sessions()).find(s=>s.online && s.mode==='auto'),'mode 2 registration');
-  const args={session:mode2.code};
-  assert.match((await call('open_viewer',args)).text,/ACCESS_REQUIRED|request access/i);
-  const askedAt=Date.now();
-  await approve(agent,mode2.code);
-  const view=await call('open_viewer',args);
-  assert.ok(!view.err,view.text);
-  const watch=view.text.match(/https?:\/\/\S+?\/v\/[0-9a-f]+(?=\s|$|#)/)[0];
-  await waitFor(()=>fs.existsSync(sfile),'mode 2 saved before process exit');
-  const endedMode2=new Promise(resolve=>agent.once('exit',resolve));
-  killAgent(agent);
-  await endedMode2;
-  agent=startAgent(true,'auto',true);
-  await waitFor(async()=>{
-    const log=JSON.parse((await call('session_log',args)).text);
-    return log.events.some(e=>e.type==='resumed');
-  },'mode 2 saved credential resumed at logon',25000);
-  const resumed=(await sessions()).find(s=>s.code===mode2.code);
-  assert.ok(resumed.online && resumed.mode==='auto' && resumed.kept,'logon lost mode 2 or its code');
-  const blocked=await call('run',{...args,command:'echo should-not-run'});
-  assert.ok(blocked.err && /ACCESS_REQUIRED/.test(blocked.text),blocked.text);
-  assert.equal((await fetch(watch)).status,404,'old viewer remained valid across restart');
-  const resumedToken=fs.readFileSync(TOKEN_FILE,'utf8').trim();
-  assert.equal((await fetch(BASE+'/a/input',{headers:{Authorization:'Bearer '+resumedToken}})).status,409,'native input was available without consent');
-  await sleep(Math.max(0,10_100-(Date.now()-askedAt)));
-  await approve(agent,mode2.code);
-  assert.match((await call('run',{...args,command:'echo approved-again'})).text,/approved-again/);
-  assert.ok(!(await call('end_session',args)).err);
-  console.log('Windows mode 2 logon keeps its code, revokes the old viewer and requires fresh local consent PASS');
+  try {
+    agent=startAgent(false,'auto',true);
+    const mode2=await waitFor(async()=>(await sessions()).find(s=>s.online && s.mode==='auto'),'mode 2 registration');
+    const args={session:mode2.code};
+    assert.match((await call('open_viewer',args)).text,/ACCESS_REQUIRED|request access/i);
+    const askedAt=Date.now();
+    await approve(agent,mode2.code);
+    const view=await call('open_viewer',args);
+    assert.ok(!view.err,view.text);
+    const watch=view.text.match(/https?:\/\/\S+?\/v\/[0-9a-f]+(?=\s|$|#)/)[0];
+    await waitFor(()=>fs.existsSync(sfile),'mode 2 saved before process exit');
+    await waitFor(()=>scheduler(ownedTask+'if ($task) { $task.Triggers[0].CimClass.CimClassName }')==='MSFT_TaskLogonTrigger',
+      'Helper installed its logon task',20000);
+    const endedMode2=new Promise(resolve=>agent.once('exit',resolve));
+    killAgent(agent);
+    await endedMode2;
+    scheduler(ownedTask+'if (-not $task) { throw "Helper logon task missing" }; Start-ScheduledTask -InputObject $task');
+    await waitFor(async()=>{
+      const log=JSON.parse((await call('session_log',args)).text);
+      return log.events.some(e=>e.type==='resumed');
+    },'mode 2 saved credential resumed at logon',25000);
+    const resumed=(await sessions()).find(s=>s.code===mode2.code);
+    assert.ok(resumed.online && resumed.mode==='auto' && resumed.kept,'logon lost mode 2 or its code');
+    const blocked=await call('run',{...args,command:'echo should-not-run'});
+    assert.ok(blocked.err && /ACCESS_REQUIRED/.test(blocked.text),blocked.text);
+    assert.equal((await fetch(watch)).status,404,'old viewer remained valid across restart');
+    const resumedToken=fs.readFileSync(TOKEN_FILE,'utf8').trim();
+    assert.equal((await fetch(BASE+'/a/input',{headers:{Authorization:'Bearer '+resumedToken}})).status,409,'native input was available without consent');
+    await sleep(Math.max(0,10_100-(Date.now()-askedAt)));
+    const scheduledPid=Number(scheduler(ownedTask+'if (-not $task) { throw "Helper logon task missing" }; ' +
+      '$action=$task.Actions[0].Arguments; $found=@(Get-CimInstance Win32_Process -Filter "Name = \'powershell.exe\'" | ' +
+      'Where-Object { $_.CommandLine -and $_.CommandLine.EndsWith($action) }); ' +
+      'if ($found.Count -ne 1) { throw "The scheduled Helper process is ambiguous or missing" }; $found[0].ProcessId'));
+    assert.ok(Number.isInteger(scheduledPid) && scheduledPid>0);
+    await approve({pid:scheduledPid},mode2.code);
+    assert.match((await call('run',{...args,command:'echo approved-again'})).text,/approved-again/);
+    assert.ok(!(await call('end_session',args)).err);
+    console.log('Windows Task Scheduler launches mode 2 with the same code, revokes the old viewer and requires fresh local consent PASS');
+  } finally {
+    scheduler(ownedTask+'if ($task) { Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue; Unregister-ScheduledTask -InputObject $task -Confirm:$false }');
+  }
 }
 console.log('ALL PASSED');
 stop(); fs.rmSync(STATE, { force: true }); process.exit(0);

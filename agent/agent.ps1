@@ -3656,7 +3656,7 @@ function Play-Sound($kind) {
 function Enable-VT { try { $h = [H.U__BUILD__]::GetStdHandle(-11); $m = 0; if ([H.U__BUILD__]::GetConsoleMode($h, [ref]$m) -and [H.U__BUILD__]::SetConsoleMode($h, $m -bor 4)) { $script:VT = $true } } catch { } }
 $script:OperatorSeen = $false; $script:HdrDrawn = $false
 # ---- keeping the session: local state, autostart, a log, network diagnosis and one repair attempt
-$StateDir = if ($env:HELPER_STATE_DIR) { $env:HELPER_STATE_DIR } else { Join-Path $env:APPDATA 'HelperMCP' }
+$StateDir = if ($env:HELPER_STATE_DIR) { [IO.Path]::GetFullPath($env:HELPER_STATE_DIR) } else { Join-Path $env:APPDATA 'HelperMCP' }
 $SessionFile = Join-Path $StateDir 'session.json'; $LogFile = Join-Path $StateDir 'agent.log'; $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $PreferencesFile = Join-Path $StateDir 'preferences.json'
 $script:Preferences = @{ startup = $true; quiet = $false }
@@ -3744,6 +3744,9 @@ function Install-Autostart([switch]$Enable) {   # resume the same session in a v
         $scriptPath = "'" + $f.Replace("'", "''") + "'"
         $savedPath = "'" + $SessionFile.Replace("'", "''") + "'"
         $launch = 'if (Test-Path -LiteralPath ' + $savedPath + ') { $env:HELPER_LOGON = ''1''; & ' + $scriptPath + ' }'
+        if ($env:HELPER_STATE_DIR) {
+            $launch = '$env:HELPER_STATE_DIR = ''' + $StateDir.Replace("'", "''") + '''; ' + $launch
+        }
         $cmd = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch))
         $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         if (Test-Admin) {   # started as administrator: from now on it also starts as administrator at logon (a task with the highest rights; the Run entry would start it twice, so it goes)

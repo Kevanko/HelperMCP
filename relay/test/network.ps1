@@ -334,3 +334,91 @@ if (Start-HelperTray) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'releas
     Assert (@($short | Where-Object { $_.Length -ge 34 }).Count -eq 0) 'narrow menu line wraps'
     Write-Output 'Console menu lists all choices and keeps the selection visible at narrow sizes PASS'
 }
+
+# Private console only, on hosted Windows. Input goes to its buffer, never to the desktop queue.
+if ($env:GITHUB_ACTIONS -eq 'true') {
+    $fixture = @'
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+public static class ConsoleFixtureInput {
+    [StructLayout(LayoutKind.Explicit, Size = 20)]
+    struct Key {
+        [FieldOffset(0)] public short Type;
+        [FieldOffset(4)] public int Down;
+        [FieldOffset(8)] public short Repeat;
+        [FieldOffset(10)] public short Code;
+    }
+    [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int id);
+    [DllImport("kernel32.dll")] static extern bool GetConsoleMode(IntPtr handle, out int mode);
+    [DllImport("kernel32.dll")] static extern bool SetConsoleMode(IntPtr handle, int mode);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool ReadConsoleOutputCharacter(
+        IntPtr handle, StringBuilder text, int length, int origin, out int read);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool WriteConsoleInput(
+        IntPtr handle, Key[] input, int length, out int written);
+    public static bool EnableVT() {
+        IntPtr handle = GetStdHandle(-11);
+        int mode;
+        return GetConsoleMode(handle, out mode) && SetConsoleMode(handle, mode | 4);
+    }
+    public static bool SawFrame;
+    public static void Navigate() {
+        var thread = new Thread(() => {
+            var text = new StringBuilder(8192);
+            for (int attempt = 0; attempt < 160; attempt++) {
+                int read;
+                text.Clear();
+                if (ReadConsoleOutputCharacter(GetStdHandle(-11), text, text.Capacity - 1, 0, out read)
+                    && text.ToString().Contains("Ask once per session") && text.ToString().Contains("Unattended access")) {
+                    SawFrame = true;
+                    break;
+                }
+                Thread.Sleep(25);
+            }
+            int written;
+            var down = new Key { Type = 1, Down = 1, Repeat = 1, Code = 40 };
+            var space = new Key { Type = 1, Down = 1, Repeat = 1, Code = 32 };
+            WriteConsoleInput(GetStdHandle(-10), new[] { down, space }, 2, out written);
+        });
+        thread.IsBackground = true;
+        thread.Start();
+    }
+}
+"@
+try {
+    if (-not [ConsoleFixtureInput]::EnableVT()) { throw 'No VT in the fixture console' }
+    [KNativeMenuFixture.Keys]::VT = $true
+    [ConsoleFixtureInput]::Navigate()
+    $selected = [KNativeMenuFixture.Keys]::Choose(@('Confirm each action','Ask once per session','Unattended access'), 'Access mode', 'Select with arrows')
+    if (-not [ConsoleFixtureInput]::SawFrame -or $selected -ne 1) { throw "Missing menu frame or wrong selection: $selected" }
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'result.txt'), 'PASS')
+} catch {
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'result.txt'), $_.ToString())
+}
+'@
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ('helper-console-' + [Guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dir)
+    $file = Join-Path $dir 'console.ps1'
+    $receipt = Join-Path $dir 'result.txt'
+    $child = $null
+    try {
+        $source = [regex]::Match($agentSource, '(?s)Add-Type -TypeDefinition @"\r?\nusing System; using System.Collections.Concurrent;.*?\r?\n"@')
+        Assert $source.Success 'missing native console renderer'
+        Set-Content -LiteralPath $file -Encoding UTF8 -Value ($source.Value.Replace('__BUILD__', 'NativeMenuFixture') + "`r`n" + $fixture)
+        $child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $file + '"')) -WindowStyle Hidden -PassThru
+        Assert ($child.WaitForExit(20000)) 'private console timed out'
+        $result = if (Test-Path -LiteralPath $receipt) { Get-Content -LiteralPath $receipt -Raw } else { "no result (exit $($child.ExitCode))" }
+        Assert ($result -eq 'PASS') $result
+        Write-Output 'Native Windows console displayed all access modes and Down/Space selected mode 2 PASS'
+    } finally {
+        if ($child) {
+            if (-not $child.HasExited) { $child.Kill(); [void]$child.WaitForExit(5000) }
+            $child.Dispose()
+        }
+        Remove-Item -LiteralPath $file, $receipt -ErrorAction SilentlyContinue
+        [IO.Directory]::Delete($dir)
+    }
+}

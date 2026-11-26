@@ -124,10 +124,16 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     '$pidMatch = [Windows.Automation.PropertyCondition]::new($element::ProcessIdProperty, $AgentPid)',
     '$titleMatch = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "HelperMCP")',
     '$match = [Windows.Automation.AndCondition]::new([Windows.Automation.Condition[]]@($pidMatch, $titleMatch))',
-    '$buttonName = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "Allow")',
-    '$buttonType = [Windows.Automation.PropertyCondition]::new($element::ControlTypeProperty, [Windows.Automation.ControlType]::Button)',
-    '$button = [Windows.Automation.AndCondition]::new([Windows.Automation.Condition[]]@($buttonName, $buttonType))',
-    'Add-Type -Namespace Fixture -Name Window -MemberDefinition \'[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);\'',
+    '$button = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "Allow")',
+    'Add-Type -Namespace Fixture -Name Window -MemberDefinition @\'',
+    '[StructLayout(LayoutKind.Sequential)] public struct Point { public int X; public int Y; }',
+    '[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);',
+    '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);',
+    '[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);',
+    '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();',
+    '[DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra);',
+    '\'@',
+    '[void][Fixture.Window]::SetProcessDPIAware()',
     '$until = [DateTime]::UtcNow.AddSeconds(25)',
     'do {',
     '  $window = $element::RootElement.FindFirst("Children", $match)',
@@ -136,8 +142,18 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     '    if ($accept) {',
     '      $invoke = $null',
     '      if ($accept.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) { $invoke.Invoke(); exit 0 }',
-    '      $handle = [IntPtr]$accept.Current.NativeWindowHandle',
-    '      if ($handle -ne [IntPtr]::Zero -and [Fixture.Window]::PostMessage($handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)) { exit 0 }',
+    '      $rect = $accept.Current.BoundingRectangle',
+    '      if (-not $rect.IsEmpty) {',
+    '        $point = New-Object "Fixture.Window+Point"',
+    '        $point.X = [int]($rect.X + $rect.Width / 2); $point.Y = [int]($rect.Y + $rect.Height / 2)',
+    '        $hwnd = [Fixture.Window]::WindowFromPoint($point); [uint32]$owner = 0',
+    '        [void][Fixture.Window]::GetWindowThreadProcessId($hwnd, [ref]$owner)',
+    '        if ($owner -eq $AgentPid -and [Fixture.Window]::SetCursorPos($point.X, $point.Y)) {',
+    '          [Fixture.Window]::mouse_event(2, 0, 0, 0, [UIntPtr]::Zero)',
+    '          [Fixture.Window]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)',
+    '          exit 0',
+    '        }',
+    '      }',
     '    }',
     '  }',
     '  Start-Sleep -Milliseconds 100',
@@ -154,7 +170,7 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
       responderProc.once('close',resolve);
     });
     const [result,exit] = await Promise.all([call('request_access',{session}),closed]);
-    assert.equal(exit,0,details);
+    assert.equal(exit,0,details + '\n' + result.text + '\n' + agentOut.slice(-2600));
     assert.ok(!result.err && /Access approved/.test(result.text),result.text);
   }
   agent=startAgent(false,'auto');

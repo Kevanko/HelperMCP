@@ -21,22 +21,29 @@ namespace HelperPointer {
     public void Key(int vk,bool extended,bool up) { keybd_event((byte)vk,(byte)MapVirtualKey((uint)vk,0),(extended?1u:0u)|(up?2u:0u),UIntPtr.Zero); }
   }
   public sealed class KeyboardLease : IDisposable {
-    readonly object gate=new object();readonly IKeyboardSink sink;readonly Timer timer;readonly Stopwatch clock=Stopwatch.StartNew();readonly int ttl;
+    readonly object gate=new object();readonly IKeyboardSink sink;readonly Timer timer;readonly Func<long> now;readonly int ttl;
     readonly Dictionary<int,bool> held=new Dictionary<int,bool>();readonly Dictionary<string,long> sequences=new Dictionary<string,long>();string owner="";long deadline;bool disposed;
-    public KeyboardLease(IKeyboardSink sink,int ttlMs){this.sink=sink;if(ttlMs<200||ttlMs>5000)throw new ArgumentOutOfRangeException("ttlMs");ttl=ttlMs;timer=new Timer(delegate{lock(gate){try{if(held.Count>0&&clock.ElapsedMilliseconds>=deadline)Release();}catch{}}},null,50,50);}
+    public KeyboardLease(IKeyboardSink sink,int ttlMs) : this(sink,ttlMs,MonotonicClock()) { }
+    internal KeyboardLease(IKeyboardSink sink,int ttlMs,Func<long> now) {
+      if(ttlMs<200||ttlMs>5000)throw new ArgumentOutOfRangeException("ttlMs");
+      this.sink=sink; ttl=ttlMs; this.now=now;
+      timer=new Timer(delegate{lock(gate){try{Expire();}catch{}}},null,50,50);
+    }
+    static Func<long> MonotonicClock(){var clock=Stopwatch.StartNew();return ()=>clock.ElapsedMilliseconds;}
+    void Expire(){if(held.Count>0&&now()>=deadline)Release();}
     void Release(){foreach(var pair in new List<KeyValuePair<int,bool>>(held)){sink.Key(pair.Key,pair.Value,true);held.Remove(pair.Key);}owner="";}
     public string Handle(string who,long seq,string op,int vk,bool extended){lock(gate){
       if(disposed)throw new ObjectDisposedException("KeyboardLease");if(sink==null)throw new InvalidOperationException("Keyboard worker unavailable");
-      if(held.Count>0&&clock.ElapsedMilliseconds>=deadline)Release();
+      Expire();
       if(op=="release"){if(owner==who)Release();return "released";}
       long previous;if(sequences.TryGetValue(who,out previous)&&seq<=previous)return "duplicate";
       if(sequences.Count>=256&&!sequences.ContainsKey(who)){string remove=null;foreach(string key in sequences.Keys)if(key!=owner){remove=key;break;}if(remove!=null)sequences.Remove(remove);}
       sequences[who]=seq;
       if(op=="kcancel"){if(owner==who)Release();return "released";}
       if(owner!=""&&owner!=who)throw new InvalidOperationException("Another keyboard owner is active");
-      if(op=="kkeep"){if(owner==who)deadline=clock.ElapsedMilliseconds+ttl;return "held";}
+      if(op=="kkeep"){if(owner==who)deadline=now()+ttl;return "held";}
       if(vk<8||vk>254)throw new InvalidOperationException("Invalid keyboard code");
-      deadline=clock.ElapsedMilliseconds+ttl;
+      deadline=now()+ttl;
       if(op=="kdown"){if(!held.ContainsKey(vk)&&held.Count>=32)throw new InvalidOperationException("Too many held keys");owner=who;held[vk]=extended;try{sink.Key(vk,extended,false);}catch{Release();throw;}return "held";}
       if(op=="kup"){bool was;if(held.TryGetValue(vk,out was)){sink.Key(vk,was,true);held.Remove(vk);}if(held.Count==0)owner="";return "released";}
       throw new InvalidOperationException("Unknown keyboard operation");

@@ -329,7 +329,7 @@ try {
     function Load-Session { @{ token = $script:Token; code = $script:Code } }
     function T($ru,$en) { $en }
     function Check-Esc { }
-    $names = 'Save-AgentCopy','Start-DetachedHelper','Start-HelperTray'
+    $names = 'Save-AgentCopy','Start-HelperHandoff','Start-HelperTray','Wait-HelperHandoff'
     $definitions = @{}
     foreach ($name in $names) {
         $fn = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
@@ -338,12 +338,35 @@ try {
     }
     $fixture = @'
 $ErrorActionPreference = 'Stop'
+Add-Type 'namespace KDetachFixture { public static class Keys { public static readonly System.Action Wake = () => {}; } }'
 function T($ru,$en) { $en }
-if (Start-HelperTray) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'released'), 'ready') }
+$StateDir = $PSScriptRoot
+function Check-Esc { }
+function Load-Session { @{ token = 'fixture-token'; code = 'TEST-CODE' } }
+if ($env:HELPER_CONSOLE_HANDOFF) {
+    if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { exit 5 }
+    if (Wait-HelperHandoff $env:HELPER_CONSOLE_HANDOFF) {
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'console-released'), 'ready')
+    }
+} elseif (Start-HelperTray) {
+    [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'released'), 'ready')
+    if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'test-restore-console')) {
+        Start-HelperHandoff -ShowConsole
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'console-waiting'), 'ready')
+        $until = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-console')) -and [DateTime]::UtcNow -lt $until) {
+            Start-Sleep -Milliseconds 50
+        }
+        if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'release-console')) { [void]$script:DetachGo.Set() }
+        $script:DetachGo.Dispose()
+    }
+}
 '@
-    function Invoke-WebRequest { @{ Content = $definitions['Start-HelperTray'] + "`r`n" + $fixture } }
+    $fixtureSource = (($names | ForEach-Object { $definitions[$_] }) -join "`r`n") + "`r`n" + $fixture
+    function Invoke-WebRequest { @{ Content = $fixtureSource } }
     try {
-        Start-DetachedHelper
+        if ($env:GITHUB_ACTIONS -eq 'true') { [IO.File]::WriteAllText((Join-Path $StateDir 'test-restore-console'), '') }
+        Start-HelperHandoff
         Assert ($null -ne $script:DetachGo) 'console did not receive tray readiness'
         $releaseFile = Join-Path $StateDir 'released'
         Assert (-not [IO.File]::Exists($releaseFile)) 'child started before console handoff'
@@ -352,6 +375,19 @@ if (Start-HelperTray) { [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'releas
         while (-not [IO.File]::Exists($releaseFile) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
         Assert ([IO.File]::Exists($releaseFile)) 'child did not continue after console handoff'
         Write-Output 'Detach starts the tray before releasing the console and waits for handoff PASS'
+        if ($env:GITHUB_ACTIONS -eq 'true') {
+            $waiting = Join-Path $StateDir 'console-waiting'
+            $restored = Join-Path $StateDir 'console-released'
+            $until = [DateTime]::UtcNow.AddSeconds(35)
+            while (-not [IO.File]::Exists($waiting) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+            Assert ([IO.File]::Exists($waiting)) 'tray could not start a native console'
+            Assert (-not [IO.File]::Exists($restored)) 'console continued before tray released ownership'
+            [IO.File]::WriteAllText((Join-Path $StateDir 'release-console'), '')
+            $until = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not [IO.File]::Exists($restored) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+            Assert ([IO.File]::Exists($restored)) 'console did not continue after tray released the session'
+            Write-Output 'Tray restores a native console without another download and waits for ownership handoff PASS'
+        }
     } finally {
         if ($script:DetachGo) { $script:DetachGo.Dispose(); $script:DetachGo = $null }
         Remove-Item -LiteralPath $StateDir -Recurse -Force

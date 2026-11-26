@@ -2913,11 +2913,13 @@ function Do-Util($a) {
         'elevate' {
             if (Test-Admin) { return @{ text = 'already running as administrator' } }
             if (-not $script:Persist) { throw 'this session is not kept, so it cannot continue after the restart' }
-            $f = Join-Path $StateDir 'agent.ps1'; [void](New-Item $StateDir -ItemType Directory -Force)
-            [IO.File]::WriteAllText($f, (Invoke-WebRequest "$RELAY/h" -UseBasicParsing -TimeoutSec 20).Content, (New-Object Text.UTF8Encoding $true))
-            Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "' + $f + '"')   # throws when the friend declines the Windows prompt
+            $f = Join-Path $StateDir 'agent.ps1'
+            Save-AgentCopy $f
+            $launch = '$env:HELPER_ELEVATION_HANDOFF = ''1''; & ''' + $f.Replace("'", "''") + ''''
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch))
+            Start-Process powershell.exe -Verb RunAs -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + $encoded)
             Write-AgentLog 'restarting as administrator'
-            Start-Process cmd.exe -WindowStyle Hidden -ArgumentList ('/c ping -n 6 127.0.0.1 >nul & taskkill /PID ' + $PID + ' /F')   # this helper steps aside once the elevated one has taken the session over
+            $script:EndRequested = $true
             return @{ text = 'the helper restarts as administrator and continues this session (about 5-10 s: wait_online, then sysinfo). If the admin account is another user, a new code is shown on the friend screen instead. After a reboot it starts normally again (not elevated).' }
         }
         'browser' { return @{ text = (Browser-Report $(if ($a.max) { [int]$a.max } else { 25 })) } }
@@ -4474,12 +4476,19 @@ function Invoke-HelperSession {
     if ($script:Detached -and -not (Start-HelperTray)) { return }
     [void][IO.Directory]::CreateDirectory($StateDir)
     $lockPath = Join-Path $StateDir 'session.lock'
-    try {
-        $sessionLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
-    } catch [IO.IOException] {
-        if (($_.Exception.GetBaseException().HResult -band 0xffff) -notin 32,33) { throw }
-        Write-Host (T 'Helper уже работает. Откройте существующую консоль или значок в области уведомлений.' 'Helper is already running. Open its existing console or notification icon.') -ForegroundColor Yellow
-        return
+    $handoff = $env:HELPER_ELEVATION_HANDOFF -eq '1'
+    if ($handoff) { Remove-Item Env:HELPER_ELEVATION_HANDOFF }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($true) {
+        try {
+            $sessionLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+            break
+        } catch [IO.IOException] {
+            if (($_.Exception.GetBaseException().HResult -band 0xffff) -notin 32,33) { throw }
+            if ($handoff -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 150; continue }
+            Write-Host (T 'Helper уже работает. Откройте существующую консоль или значок в области уведомлений.' 'Helper is already running. Open its existing console or notification icon.') -ForegroundColor Yellow
+            return
+        }
     }
     $script:DetachGo = $null
     $script:DetachMayResume = $false

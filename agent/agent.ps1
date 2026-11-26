@@ -849,6 +849,8 @@ namespace F__BUILD__ {
     [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
     class Vol { public Dictionary<ulong, ulong> Par = new Dictionary<ulong, ulong>(); public Dictionary<ulong, string> Name = new Dictionary<ulong, string>(); public DateTime At = DateTime.UtcNow; public double Secs; }
     static readonly Dictionary<string, Vol> cache = new Dictionary<string, Vol>();
+    static readonly object searchLock = new object();
+    static System.Threading.Tasks.Task<string> activeSearch;
     const ulong M = 0xFFFFFFFFFFFFUL;
     static Vol Load(string drive) {
       Vol v; lock (cache) { if (cache.TryGetValue(drive, out v) && (DateTime.UtcNow - v.At).TotalSeconds < 120) return v; }
@@ -885,12 +887,26 @@ namespace F__BUILD__ {
       ulong par; v.Par.TryGetValue(f, out par);
       p = PathOf(v, par, root, memo, depth + 1) + "\\" + n; memo[f] = p; return p;
     }
-    public static string Find(string[] drives, string glob, string under, int max, bool newest) {
+    public static System.Threading.Tasks.Task<string> BeginFind(string[] drives, string glob, string under, int max, bool newest) {
+      lock (searchLock) {
+        if (activeSearch != null && !activeSearch.IsCompleted)
+          throw new InvalidOperationException("A previous NTFS search is still waiting for a volume. Use find with a specific folder.");
+        activeSearch = System.Threading.Tasks.Task.Run(() => Find(drives, glob, under, max, newest));
+        return activeSearch;
+      }
+    }
+    static string Find(string[] drives, string glob, string under, int max, bool newest) {
       bool wild = glob.IndexOfAny(new[] { '*', '?' }) >= 0;
       var rx = new Regex("^" + (wild ? "" : ".*") + Regex.Escape(glob).Replace("\\*", ".*").Replace("\\?", ".") + (wild ? "" : ".*") + "$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
       if (drives == null || drives.Length == 0) { var l = new List<string>(); foreach (var d in DriveInfo.GetDrives()) { try { if (d.DriveType == DriveType.Fixed && d.IsReady && d.DriveFormat == "NTFS") l.Add(d.Name); } catch { } } drives = l.ToArray(); }
       var hits = new List<string>(); var notes = new List<string>(); int cap = newest ? 5000 : max; double idx = 0;
-      var th = new List<Thread>(); foreach (var d0 in drives) { var dd = d0; var t = new Thread(() => { try { Load(dd); } catch { } }); t.Start(); th.Add(t); } foreach (var t in th) t.Join();   // all disks at once
+      var th = new List<Thread>();
+      foreach (var drive in drives) {
+        var t = new Thread(() => { try { Load(drive); } catch { } }) { IsBackground = true };
+        t.Start();
+        th.Add(t);
+      }
+      foreach (var t in th) t.Join();
       foreach (var d in drives) {
         Vol v; try { v = Load(d); } catch (Exception e) { notes.Add(d.Substring(0, 2) + " skipped: " + e.Message); continue; }
         idx += v.Secs; var memo = new Dictionary<ulong, string>(); string root = d.Substring(0, 2);
@@ -2931,7 +2947,16 @@ function Do-Util($a) {
         'ffind' {
             if (-not (Test-Admin)) { throw "ffind reads the NTFS file table of every disk and needs administrator rights: util elevate restarts the helper as administrator (the friend accepts one Windows prompt); find works without them, only slower" }
             $dr = if ($p -match '^([A-Za-z]):') { @($Matches[1].ToUpper() + ':\') } else { @() }
-            return @{ text = [F__BUILD__.Mft]::Find([string[]]$dr, $name, $p, $(if ($a.max) { [int]$a.max } else { 100 }), ($val -eq 'new')) }
+            $search = [F__BUILD__.Mft]::BeginFind([string[]]$dr, $name, $p, $(if ($a.max) { [int]$a.max } else { 100 }), ($val -eq 'new'))
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            while (-not $search.IsCompleted) {
+                if ($clock.Elapsed.TotalSeconds -ge 25) {
+                    throw 'The NTFS search did not finish in time. The Helper can still accept commands. Use find with a specific folder.'
+                }
+                Start-Sleep -Milliseconds 75
+                Pump-Light
+            }
+            return @{ text = $search.GetAwaiter().GetResult() }
         }
         'elevate' {
             if (Test-Admin) { return @{ text = 'already running as administrator' } }

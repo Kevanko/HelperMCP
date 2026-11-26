@@ -4,6 +4,43 @@ $source = [IO.File]::ReadAllText((Join-Path $root 'agent/network.cs')).Replace('
 Add-Type -TypeDefinition $source
 function Assert($condition, $message) { if (-not $condition) { throw $message } }
 
+# A stuck volume reader must not block the caller or spawn another search on retry.
+& {
+    $agent = [IO.File]::ReadAllText((Join-Path $root 'agent/agent.ps1'))
+    $mft = [regex]::Match($agent, '(?ms)^  public static class Mft \{.*?^  \}').Value
+    Assert ($mft.Length -gt 0) 'missing NTFS search'
+    $mft = $mft.Replace('static Vol Load(string drive) {', @'
+public static readonly ManualResetEvent VolumeEntered = new ManualResetEvent(false);
+    public static readonly ManualResetEvent ReleaseVolume = new ManualResetEvent(false);
+    static Vol Load(string drive) {
+      if (drive == "X:\\") {
+        VolumeEntered.Set();
+        ReleaseVolume.WaitOne();
+        return new Vol();
+      }
+'@)
+    Add-Type -TypeDefinition (@'
+using System; using System.Collections.Generic; using System.Diagnostics; using System.IO;
+using System.Runtime.InteropServices; using System.Text; using System.Text.RegularExpressions; using System.Threading;
+public static class Fs { public static string Human(long bytes) { return bytes.ToString(); } }
+'@ + "`n" + $mft)
+    $search = [Mft]::BeginFind(@('X:\'), 'fixture', '', 10, $false)
+    try {
+        Assert ([Mft]::VolumeEntered.WaitOne(3000)) 'background search never reached the fixture volume'
+        Assert (-not $search.IsCompleted) 'fixture volume did not block'
+        $rejected = $false
+        try { $null = [Mft]::BeginFind(@('X:\'), 'duplicate', '', 10, $false) }
+        catch { $rejected = $_.Exception.InnerException -is [InvalidOperationException] }
+        Assert $rejected 'a second NTFS search started while a volume was still blocked'
+    } finally {
+        [void][Mft]::ReleaseVolume.Set()
+    }
+    Assert ($search.Wait(3000)) 'search did not complete when the volume answered'
+    $next = [Mft]::BeginFind(@('X:\'), 'after-release', '', 10, $false)
+    Assert ($next.Wait(3000) -and $next.Result.Contains('0 match(es)')) 'NTFS search did not recover after volume release'
+    Write-Output 'A stalled NTFS volume stays off the command thread, limits retry to one search and recovers after release PASS'
+}
+
 # Loopback fixtures exercise actual sockets without depending on public websites.
 Add-Type -TypeDefinition @'
 using System; using System.Net; using System.Net.Sockets; using System.Net.Security;

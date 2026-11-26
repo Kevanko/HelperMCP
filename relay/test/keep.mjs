@@ -115,7 +115,7 @@ console.log('Ended saved session is cleared after HTTP 410 PASS');
 // Exercise the actual consent window and cached-mode launch on the isolated Windows runner.
 if (PS && process.env.GITHUB_ACTIONS === 'true') {
   function scheduler(script) {
-    const command=Buffer.from("$ErrorActionPreference='Stop'; " + script,'utf16le').toString('base64');
+    const command=Buffer.from("$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; " + script,'utf16le').toString('base64');
     const result=spawnSync('powershell',['-NoProfile','-NonInteractive','-EncodedCommand',command],
       { encoding:'utf8',timeout:25000,env:{...process.env,HELPER_FIXTURE_DIR:SDIR} });
     if(result.error) throw result.error;
@@ -125,7 +125,8 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
   const ownedTask = '$task=Get-ScheduledTask -TaskName HelperMCP -ErrorAction SilentlyContinue; ' +
     'if ($task -and $task.Actions[0].Arguments -match "-EncodedCommand ([A-Za-z0-9+/=]+)$") { ' +
     '$command=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])); ' +
-    'if ($command.IndexOf((Join-Path $env:HELPER_FIXTURE_DIR "agent.ps1"), [StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "Unexpected HelperMCP task" } } else { $task=$null }; ';
+    '$expected = Join-Path ([IO.Path]::GetFullPath($env:HELPER_FIXTURE_DIR)) "agent.ps1"; ' +
+    'if ($command.IndexOf($expected, [StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "Unexpected HelperMCP task" } } else { $task=$null }; ';
   assert.equal(scheduler('if (Get-ScheduledTask -TaskName HelperMCP -ErrorAction SilentlyContinue) { "existing" }'),'',
     'a task already exists on the disposable runner');
   const responder = path.join(SDIR, 'accept-fixture-dialog.ps1');
@@ -186,6 +187,7 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     assert.equal(exit,0,details + '\n' + result.text + '\n' + agentOut.slice(-2600));
     assert.ok(!result.err && /Access approved/.test(result.text),result.text);
   }
+  let fixtureError;
   try {
     agent=startAgent(false,'auto',true);
     const mode2=await waitFor(async()=>(await sessions()).find(s=>s.online && s.mode==='auto'),'mode 2 registration');
@@ -224,8 +226,16 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     assert.match((await call('run',{...args,command:'echo approved-again'})).text,/approved-again/);
     assert.ok(!(await call('end_session',args)).err);
     console.log('Windows Task Scheduler launches mode 2 with the same code, revokes the old viewer and requires fresh local consent PASS');
+  } catch (error) {
+    fixtureError = error;
+    throw error;
   } finally {
-    scheduler(ownedTask+'if ($task) { Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue; Unregister-ScheduledTask -InputObject $task -Confirm:$false }');
+    try {
+      scheduler(ownedTask+'if ($task) { Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue; Unregister-ScheduledTask -InputObject $task -Confirm:$false }');
+    } catch (error) {
+      if (!fixtureError) throw error;
+      console.error('Fixture cleanup also failed:', error.message);
+    }
   }
 }
 console.log('ALL PASSED');

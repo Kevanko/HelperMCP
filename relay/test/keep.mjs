@@ -225,13 +225,17 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     await approve({pid:scheduledPid},mode2.code);
     assert.match((await call('run',{...args,command:'echo approved-again'})).text,/approved-again/);
     assert.ok(!(await call('end_session',args)).err);
-    console.log('Windows Task Scheduler launches mode 2 with the same code, revokes the old viewer and requires fresh local consent PASS');
+    await waitFor(() => !fs.existsSync(sfile) && scheduler(ownedTask + 'if ($task) { "registered" }') === '',
+      'ending mode 2 removes both the saved session and the logon task', 20000);
+    console.log('Windows Task Scheduler launches mode 2 with the same code, revokes the old viewer, requires fresh local consent and removes autostart when ended PASS');
   } catch (error) {
     fixtureError = error;
     throw error;
   } finally {
     try {
-      scheduler(ownedTask+'if ($task) { Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue; Unregister-ScheduledTask -InputObject $task -Confirm:$false }');
+      scheduler(ownedTask+'if ($task) { Stop-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue; ' +
+        'try { Unregister-ScheduledTask -InputObject $task -Confirm:$false } catch { ' +
+        'if (Get-ScheduledTask -TaskName HelperMCP -ErrorAction SilentlyContinue) { throw } } }');
     } catch (error) {
       if (!fixtureError) throw error;
       console.error('Fixture cleanup also failed:', error.message);

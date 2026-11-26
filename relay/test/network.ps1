@@ -155,6 +155,26 @@ Write-Output 'network payload and validation PASS'
 
 # Compile the original route transport, then fail only our TLS relay fixture.
 $agentSource = [IO.File]::ReadAllText((Join-Path $root 'agent/agent.ps1'))
+& {
+    # Decode a private 32-bit DIB cursor without changing the desktop cursor.
+    $cursorParser = [regex]::Match($agentSource, '(?ms)^function Read-Cur32\(.*?^\}')
+    Assert $cursorParser.Success 'cursor parser not found'
+    Invoke-Expression $cursorParser.Value
+    $bytes = New-Object byte[] 70
+    $bytes[2] = 2; $bytes[4] = 1
+    $bytes[6] = 1; $bytes[7] = 2
+    $bytes[12] = 1; $bytes[14] = 48; $bytes[18] = 22
+    $bytes[22] = 40; $bytes[26] = 1; $bytes[30] = 4
+    $bytes[34] = 1; $bytes[36] = 32
+    $bytes[62] = 17; $bytes[65] = 255
+    $bytes[66] = 68; $bytes[69] = 255
+    $decoded = Read-Cur32 $bytes
+    Assert ($decoded.w -eq 1 -and $decoded.h -eq 2 -and $decoded.hy -eq 1) 'cursor hotspot or dimensions changed'
+    Assert ($decoded.raw[0] -eq 68 -and $decoded.raw[4] -eq 17) 'cursor pixel order changed'
+    $bytes[18] = 100
+    Assert ($null -eq (Read-Cur32 $bytes)) 'out-of-bounds cursor accepted'
+    Write-Output 'Operator cursor decoder preserves hotspot and pixels and rejects a malformed offset PASS'
+}
 $match = [regex]::Match($agentSource, '(?s)Add-Type -ReferencedAssemblies System.Drawing, System.Windows.Forms -TypeDefinition @"\r?\n.*?\r?\n"@')
 Assert $match.Success 'route C# source not found'
 $module = [IO.File]::ReadAllText((Join-Path $root 'agent/network.cs'))

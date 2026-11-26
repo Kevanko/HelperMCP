@@ -54,7 +54,7 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
     if(a.pausePolling){await sleep(20);continue;}
     const r=await fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+a.token},signal:a.abort.signal});
     if(r.status===204){await sleep(50);continue;}if(!r.ok)break;
-    const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args});
+    const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args,artwork:c.cursor_artwork});
     if(c.tool==='press_key'&&a.holdPress)await a.holdPress;
     if(c.tool==='stream'){if(c.args.on){a.liveMon=c.args.mon;startStream(a);}else{a.upload?.end();a.upload=null;}}
     let data={text:'ok'};
@@ -72,12 +72,16 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
   return a;
 }
 try {
+  const operatorPointer = Buffer.alloc(32, 7);
+  fs.writeFileSync(path.join(temp,'operator-pointer.cur'),operatorPointer);
   server=spawn('node',[path.join(root,'relay/server.js')],{env:{...process.env,PORT:String(port),OPERATOR_KEY:'control-fixture-only',STATE_FILE:path.join(temp,'relay-state.json'),ADMIN_DIR:temp},stdio:'pipe'});
   for(let n=0;n<80;n++){try{if((await fetch(base+'/health')).ok)break;}catch{}await sleep(100);}
   const bootstrap=await fetch(base+'/h'),bytes=new Uint8Array(await bootstrap.arrayBuffer());
   assert.equal(bootstrap.headers.get('cache-control'),'no-store','bootstrap can cache an old agent');
   assert.equal(bytes[0],35,'raw PS bootstrap starts with BOM instead of a comment');
-  const first=await fakeAgent('Desk-A',1),second=await fakeAgent('Desk-B');
+  const first=await fakeAgent('Desk-A',1,0,{cursor_artwork:1}),second=await fakeAgent('Desk-B',0,0,{cursor_artwork:1});
+  assert.equal((await fetch(base+'/cursor/operator-pointer.cur')).status,404,'private cursor is accessible without a session');
+  assert.equal(first.cursor_artwork,undefined,'registration disclosed the operator cursor');
   const login=await post(base+'/admin/api/login',{user:creds.user,pass:creds.password});assert.equal(login.status,200);
   const cookie=/hm_admin=[0-9a-f]+/.exec(login.headers.get('set-cookie'))[0],csrf=(await login.json()).csrf;
   const H={cookie,'x-csrf':csrf};
@@ -140,6 +144,8 @@ try {
     assert.equal((await post(viewer+'/takeover',{on:true,shared:true},CH)).status,200);
     const sharedKey = () => observers[0].callTool({ name: 'press_key', arguments: { session: first.code, keys: 'enter' } });
     assert.ok(!(await sharedKey()).isError, 'shared input blocked the bot on an idle desktop');
+    assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).artwork,operatorPointer.toString('base64'),
+      'authorized bot input did not carry the configured cursor');
     const gesture = '2'.repeat(32);
     const mouse = (phase,seq) => post(viewer+'/input',{a:'pointer',phase,gesture,seq,x:20,y:40},CH);
     assert.equal((await mouse('down',1)).status,200);
@@ -152,6 +158,13 @@ try {
     assert.equal((await mouse('up',2)).status,200);
     assert.ok(!(await queuedKey).isError,'queued bot input did not resume after the manual gesture');
     assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).args.after_viewer_input,true,'bot kept its pre-gesture focus bookmark');
+    assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).artwork,undefined,'acknowledged artwork was resent');
+    assert.ok(commands.filter(c=>c.code===first.code&&c.tool==='viewer_pointer').every(c=>c.artwork===undefined),
+      'manual input received the operator cursor');
+    const disabled = await observers[0].callTool({ name: 'press_key', arguments: { session: second.code, keys: 'enter' } });
+    assert.ok(!disabled.isError);
+    assert.equal(commands.filter(c=>c.code===second.code&&c.tool==='press_key').at(-1).artwork,undefined,'cursor toggle was ignored');
+    console.log('Private cursor artwork is delivered once to authorized bot actions and withheld from manual input and disabled devices PASS');
     let finishBotKey;
     first.holdPress = new Promise(resolve => { finishBotKey = resolve; });
     const runningKey = sharedKey();

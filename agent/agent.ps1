@@ -3407,14 +3407,17 @@ $rings = @(); 0..1 | ForEach-Object { $e = New-Object Windows.Shapes.Ellipse; $e
 $rdot = New-Object Windows.Shapes.Ellipse; $rdot.Fill = [Windows.Media.Brushes]::White; $rdot.Visibility = 'Collapsed'; [void]$rc.Children.Add($rdot)
 function Place($e, $cx, $cy, $r) { $e.Width = 2 * $r; $e.Height = 2 * $r; [Windows.Controls.Canvas]::SetLeft($e, $cx - $r); [Windows.Controls.Canvas]::SetTop($e, $cy - $r) }
 
-# The REAL pointer is replaced for the whole session: the operator's cursor pack (CURSOR_DIR on the relay) or a soft rounded arrow. Restored when the overlay ends
-# (the agent restores it too, and Windows restores it at the next sign-in whatever happens).
-function Read-Cur32($file) {   # 32-bit .cur -> @{ w; h; hx; hy; raw = BGRA top-down }, else $null
+# Read a 32-bit DIB cursor into pixels and preserve its hotspot.
+function Read-Cur32([byte[]]$b) {
     try {
-        $b = [IO.File]::ReadAllBytes($file); $n = [BitConverter]::ToUInt16($b, 4); $best = $null
+        if ($b.Length -lt 22 -or [BitConverter]::ToUInt16($b, 0) -ne 0 -or [BitConverter]::ToUInt16($b, 2) -ne 2) { return $null }
+        $n = [BitConverter]::ToUInt16($b, 4); $best = $null
+        if ($n -eq 0 -or 6 + 16 * $n -gt $b.Length) { return $null }
         for ($i = 0; $i -lt $n; $i++) { $o = 6 + 16 * $i; $w = [int]$b[$o]; if ($w -eq 0) { $w = 256 }; if (-not $best -or ($w -le 48 -and $w -gt $best.w)) { $best = @{ w = $w; h = [int]$b[$o + 1]; hx = [BitConverter]::ToUInt16($b, $o + 4); hy = [BitConverter]::ToUInt16($b, $o + 6); off = [BitConverter]::ToUInt32($b, $o + 12) } } }
-        $o = $best.off; if ($b[$o] -eq 0x89 -or [BitConverter]::ToUInt16($b, $o + 14) -ne 32) { return $null }
-        $w = $best.w; $h = $best.h; $hs = [BitConverter]::ToUInt32($b, $o); $raw = New-Object byte[] ($w * $h * 4)
+        $o = $best.off; if ($o -lt 6 + 16 * $n -or $o + 40 -gt $b.Length -or $b[$o] -eq 0x89 -or [BitConverter]::ToUInt16($b, $o + 14) -ne 32) { return $null }
+        $w = $best.w; $h = if ($best.h -eq 0) { 256 } else { $best.h }; $hs = [BitConverter]::ToUInt32($b, $o)
+        if ($hs -lt 40 -or $o + $hs + $w * $h * 4 -gt $b.Length -or $best.hx -ge $w -or $best.hy -ge $h) { return $null }
+        $raw = New-Object byte[] ($w * $h * 4)
         for ($y = 0; $y -lt $h; $y++) { [Array]::Copy($b, $o + $hs + ($h - 1 - $y) * $w * 4, $raw, $y * $w * 4, $w * 4) }
         @{ w = $w; h = $h; hx = $best.hx; hy = $best.hy; raw = $raw }
     } catch { $null }
@@ -3437,16 +3440,26 @@ function Set-Pointers($blank) {
         $script:Blanked = $false
     }
 }
-function Apply-Cursor {
-    if ($script:CurDir) { return }
+function Apply-Cursor([AllowEmptyString()][string]$artwork) {
+    if ($script:CurDir -and -not $PSBoundParameters.ContainsKey('artwork')) { return }
     try {
-        $dir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N'))
-        $script:CurDir = $dir
-        [void](New-Item -ItemType Directory -Path $dir)
-        $pointer = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Cursors' -Name Arrow -ErrorAction SilentlyContinue).Arrow)
-        $info = if ($pointer -and [IO.File]::Exists($pointer)) { Read-Cur32 $pointer }
+        if (-not $script:CurDir) {
+            $script:CurDir = Join-Path $env:TEMP ('helpermcp-cursors-' + [guid]::NewGuid().ToString('N'))
+            [void](New-Item -ItemType Directory -Path $script:CurDir)
+            $script:BlankFile = Join-Path $script:CurDir 'blank.cur'
+            Make-BlankCur $script:BlankFile
+        }
+        $info = $null
+        if ($artwork) {
+            if ($artwork.Length -gt 21848) { return }
+            $info = Read-Cur32 ([Convert]::FromBase64String($artwork))
+            if (-not $info) { return }
+        } else {
+            $pointer = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Cursors' -Name Arrow -ErrorAction SilentlyContinue).Arrow)
+            if ($pointer -and [IO.File]::Exists($pointer)) { $info = Read-Cur32 ([IO.File]::ReadAllBytes($pointer)) }
+        }
         if (-not $info -and $env:HM_RELAY) {
-            $file = Join-Path $dir 'pointer.cur'
+            $file = Join-Path $script:CurDir 'pointer.cur'
             try {
                 $rq = [Net.WebRequest]::Create("$($env:HM_RELAY)/cursor/pointer.cur")
                 $rq.Timeout = 1500; $rq.ReadWriteTimeout = 1500
@@ -3455,7 +3468,7 @@ function Apply-Cursor {
                     if ($rs.ContentLength -gt 0 -and $rs.ContentLength -le 128KB) {
                         $out = [IO.File]::Create($file)
                         try { $rs.GetResponseStream().CopyTo($out) } finally { $out.Dispose() }
-                        $info = Read-Cur32 $file
+                        $info = Read-Cur32 ([IO.File]::ReadAllBytes($file))
                     }
                 } finally { $rs.Dispose() }
             } catch { }
@@ -3475,9 +3488,9 @@ function Apply-Cursor {
             [Windows.Controls.Canvas]::SetTop($arrowImg, $HY - $info.hy * $scale)
             $arrowImg.RenderTransformOrigin = New-Object Windows.Point ($info.hx / $info.w), ($info.hy / $info.h)
             $arrow.Visibility = 'Collapsed'; $arrowImg.Visibility = 'Visible'
+        } else {
+            $arrowImg.Source = $null; $arrowImg.Visibility = 'Collapsed'; $arrow.Visibility = 'Visible'
         }
-        $script:BlankFile = Join-Path $dir 'blank.cur'
-        Make-BlankCur $script:BlankFile
     } catch { [Console]::Error.WriteLine('cursor: ' + $_.Exception.GetType().Name) }
 }
 $clock = [Diagnostics.Stopwatch]::StartNew()
@@ -3506,6 +3519,7 @@ function On-Line($line) {
         if ($script:CursorOn) { Apply-Cursor } else { Set-Pointers $false }
         return
     }
+    if ($f[0] -eq 'pointer64') { Apply-Cursor ([string]$f[1]); return }
     if ($f[0] -eq 'animations' -and $f.Count -gt 1) { $script:AnimationsOn = $f[1] -eq '1'; return }
     if ($f[0] -eq 'note64') { $script:note = $(if ($f.Count -gt 1) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($f[1])) } else { '' }); Apply-State; return }   # base64: stdin is read in the console code page (cp866), so Russian text came out as hieroglyphs
     if ($f[0] -eq 'pin' -and $f.Count -ge 3) { $script:pin = @{ x = [int]$f[1]; y = [int]$f[2]; t = $now }; $script:lastActive = $now; return }
@@ -4374,6 +4388,9 @@ function Process-Command($cmd) {
         if ([K__BUILD__.Keys]::Paused -and -not $Quiet.ContainsKey($name) -and -not $meta -and -not $pointerRelease) { throw 'PAUSED by the user (Esc menu). The session is kept. Do not retry now: use wait_online, then continue.' }
         $needsConsent = $AskTools -contains $name -or ($name -eq 'net_check' -and $a.mode -eq 'profile')
         if ($script:Mode -eq 'confirm' -and $needsConsent -and -not ($name -eq 'net_recover' -and $a.op -in 'list', 'templates', 'status', 'rollback') -and -not ($name -eq 'util' -and $ReadOnlyUtil -contains $a.op) -and -not ($name -eq 'fsop' -and $a.op -in 'preview', 'stat')) { Ask-Permission $name $a }
+        if (-not $manualInput -and $script:CursorOn -and $cmd.PSObject.Properties['cursor_artwork']) {
+            Overlay-Send ('pointer64 ' + [string]$cmd.cursor_artwork)
+        }
         if (-not $manualInput) { Resume-State $name $a }
         $fn = @{ screenshot = 'Do-Screenshot'; click = 'Do-Click'; move = 'Do-Move'; drag = 'Do-Drag'; scroll = 'Do-Scroll'; type_text = 'Do-TypeText'; press_key = 'Do-PressKey'
             run = 'Do-Run'; read_file = 'Do-ReadFile'; write_file = 'Do-WriteFile'; list_dir = 'Do-ListDir'; sysinfo = 'Do-SysInfo'
@@ -4419,7 +4436,7 @@ function Net-State($st) {
 
 function Register-Agent($mode, $resume, $resumeToken, $note) {
     $os = try { (Static-Sys).os } catch { [Environment]::OSVersion.VersionString }
-    $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1; viewer_realtime = 1; access_request = 1 }
+    $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1; viewer_realtime = 1; access_request = 1; cursor_artwork = 1 }
     if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json

@@ -309,6 +309,15 @@ let lastBase = PUBLIC_URL;  // public URL as seen by the last MCP request (used 
 const VIEWER_TTL_MS = 12 * 3600_000;
 // files copied from a remote PC to the operator: unguessable link, kept 24 h
 const CURSOR_DIR = process.env.CURSOR_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'cursor') : path.join(here, 'cursor'));
+const OPERATOR_CURSOR = STATE_FILE ? path.join(path.dirname(STATE_FILE), 'operator-pointer.cur') : null;
+function operatorCursor() {
+  if (!OPERATOR_CURSOR) return '';
+  try {
+    const info = fs.statSync(OPERATOR_CURSOR);
+    if (!info.isFile() || info.size < 22 || info.size > 16_384) return '';
+    return fs.readFileSync(OPERATOR_CURSOR).toString('base64');
+  } catch { return ''; }
+}
 const APK_FILE = process.env.APK_FILE || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'apk', 'helpermcp.apk') : path.join(here, '..', 'android', 'helpermcp.apk'));   // the Android app, built from android/ (see README)
 const FILES_DIR = process.env.FILES_DIR || (STATE_FILE ? path.join(path.dirname(STATE_FILE), 'files') : path.join(os.tmpdir(), 'helpermcp-files'));
 const MAX_FILE = Number(process.env.MAX_FILE_MB || 1024) * 1024 * 1024;
@@ -435,6 +444,10 @@ function flush(s) {
         cmd.args = { ...cmd.args, after_viewer_input: true };
         s.automatedInputRevision = s.userInputRevision;
       }
+      if (s.info?.cursor_artwork && hasAccess(s) && effLook(s).cursor) {
+        const artwork = operatorCursor();
+        if (artwork !== (s.cursorArtwork || '')) cmd.cursor_artwork = pending.cursorArtwork = artwork;
+      }
     }
     if (!pending?.view) s.took = { id: cmd.id, tool: cmd.tool, t: Date.now() };   // what the agent is doing now: a time-out can then say "stuck in X" instead of guessing
     json(res, 200, cmd);
@@ -458,6 +471,7 @@ function clearAccess(code, s, reason, keepViewers = false) {
   s.sharedControl = false;
   s.automatedDesktop = null;
   s.manualUntil = 0;
+  s.cursorArtwork = null;
   s.manualHeld?.clear();
   clearTimeout(s.manualTimer);
   liveEnd(s);
@@ -1699,6 +1713,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = nextMode; old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
         old.info.viewer_keyboard = info.viewer_keyboard === 1 ? 1 : 0;
+        old.info.cursor_artwork = info.cursor_artwork === 1;
         old.info.access_request = old.info.access_request || info.access_request === 1;
         old.fastInput?.end();old.info.viewer_realtime=info.viewer_realtime===1?1:0;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
@@ -1719,7 +1734,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       const token = crypto.randomBytes(32).toString('hex');
       const s = newSession({
         th: sha(token), ip, mode: normMode(info.mode), created: Date.now(), persist: !!info.persist, keepMs: /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined,   // a phone that vanished is forgotten after 6 h
-        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0, access_request: info.access_request === 1 },
+        info: { os: String(info.os || '?').slice(0, 100), host: String(info.host || '?').slice(0, 100), user: String(info.user || '?').slice(0, 100), viewer_pointer: info.viewer_pointer === 1 ? 1 : 0, viewer_keyboard: info.viewer_keyboard === 1 ? 1 : 0,viewer_realtime:info.viewer_realtime===1?1:0, access_request: info.access_request === 1, cursor_artwork: info.cursor_artwork === 1 },
         ...(profile && { note: profile.note, lookForce: profile.lookForce, ...Object.fromEntries(lookKeys.map(key => [key, profile[key]])) }),
       });
       endedDevices.delete(code);
@@ -1813,6 +1828,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         if (s.automatedDesktop === r.id) s.automatedDesktop = null;
         const pend = s.pending.get(r.id);
         if (pend) {
+          if (r.ok && pend.cursorArtwork !== undefined) s.cursorArtwork = pend.cursorArtwork;
           s.pending.delete(r.id); clearTimeout(pend.timer); if (s.took?.id === r.id) s.took = null;
           adapt(s, pend, r.data?.jpeg?.length || 0);
           if (r.ok && r.data?.miss) recordMiss(s, code, 'auto', { tool: pend.tool, args: pend.argStr, note: String(r.data.text || '').slice(0, 400) });

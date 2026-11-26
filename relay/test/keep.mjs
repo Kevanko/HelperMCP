@@ -189,6 +189,9 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
   }
   let fixtureError;
   try {
+    // Keep the ordinary logon path on Node 18 and exercise the local tray
+    // preference through the same real Task Scheduler workflow on Node 22.
+    const startInTray = process.versions.node.startsWith('22.');
     agent=startAgent(false,'auto',true);
     const mode2=await waitFor(async()=>(await sessions()).find(s=>s.online && s.mode==='auto'),'mode 2 registration');
     const args={session:mode2.code};
@@ -201,6 +204,7 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     await waitFor(()=>fs.existsSync(sfile),'mode 2 saved before process exit');
     await waitFor(()=>scheduler(ownedTask+'if ($task) { $task.Triggers[0].CimClass.CimClassName }')==='MSFT_TaskLogonTrigger',
       'Helper installed its logon task',20000);
+    if(startInTray) fs.writeFileSync(path.join(SDIR,'preferences.json'),JSON.stringify({startup:true,quiet:false,start_in_tray:true}));
     const endedMode2=new Promise(resolve=>agent.once('exit',resolve));
     killAgent(agent);
     await endedMode2;
@@ -217,9 +221,12 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     const resumedToken=fs.readFileSync(TOKEN_FILE,'utf8').trim();
     assert.equal((await fetch(BASE+'/a/input',{headers:{Authorization:'Bearer '+resumedToken}})).status,409,'native input was available without consent');
     await sleep(Math.max(0,10_100-(Date.now()-askedAt)));
-    const scheduledPid=Number(scheduler(ownedTask+'if (-not $task) { throw "Helper logon task missing" }; ' +
-      '$action=$task.Actions[0].Arguments; $found=@(Get-CimInstance Win32_Process -Filter "Name = \'powershell.exe\'" | ' +
-      'Where-Object { $_.CommandLine -and $_.CommandLine.EndsWith($action) }); ' +
+    const processFilter = startInTray
+      ? '$filePattern=[regex]::Escape([IO.Path]::GetFullPath($env:HELPER_FIXTURE_DIR))+"\\\\detach-[0-9a-f]{32}\\.ps1"; ' +
+        '$found=@(Get-CimInstance Win32_Process -Filter "Name = \'powershell.exe\'" | Where-Object { $_.CommandLine -match $filePattern }); '
+      : '$action=$task.Actions[0].Arguments; $found=@(Get-CimInstance Win32_Process -Filter "Name = \'powershell.exe\'" | ' +
+        'Where-Object { $_.CommandLine -and $_.CommandLine.EndsWith($action) }); ';
+    const scheduledPid=Number(scheduler(ownedTask+'if (-not $task) { throw "Helper logon task missing" }; ' + processFilter +
       'if ($found.Count -ne 1) { throw "The scheduled Helper process is ambiguous or missing" }; $found[0].ProcessId'));
     assert.ok(Number.isInteger(scheduledPid) && scheduledPid>0);
     await approve({pid:scheduledPid},mode2.code);
@@ -228,6 +235,7 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     await waitFor(() => !fs.existsSync(sfile) && scheduler(ownedTask + 'if ($task) { "registered" }') === '',
       'ending mode 2 removes both the saved session and the logon task', 20000);
     console.log('Windows Task Scheduler launches mode 2 with the same code, revokes the old viewer, requires fresh local consent and removes autostart when ended PASS');
+    if(startInTray) console.log('Saved local preference starts the scheduled Helper in the notification area PASS');
   } catch (error) {
     fixtureError = error;
     throw error;

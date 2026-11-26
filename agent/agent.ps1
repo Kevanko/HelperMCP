@@ -1391,11 +1391,12 @@ namespace K__BUILD__ {
           choice = actions[item];
         } else choice = -1;
         if (choice == -1) {
-          string[] options = new string[8];
-          Array.Copy(labels, 2, options, 0, options.Length);
+          string[] options = new string[9];
+          Array.Copy(labels, 2, options, 0, 8);
+          options[8] = labels[14];
           int item = Choose(options, MenuTitle + " / " + MenuSettings, MenuHelp, Math.Max(0, settings));
           if (item < 0) { OpenMenu = true; return; }
-          choice = item + 2;
+          choice = item == 8 ? 14 : item + 2;
         }
         if (choice == 12 && Choose(new[] { MenuBack, labels[12] }, MenuEndTitle, MenuHelp) != 1) {
           OpenMenu = true;
@@ -3728,13 +3729,23 @@ $script:OperatorSeen = $false; $script:HdrDrawn = $false
 $StateDir = if ($env:HELPER_STATE_DIR) { [IO.Path]::GetFullPath($env:HELPER_STATE_DIR) } else { Join-Path $env:APPDATA 'HelperMCP' }
 $SessionFile = Join-Path $StateDir 'session.json'; $LogFile = Join-Path $StateDir 'agent.log'; $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $PreferencesFile = Join-Path $StateDir 'preferences.json'
-$script:Preferences = @{ startup = $true; quiet = $false }
+$script:Preferences = @{ startup = $true; quiet = $false; start_in_tray = $false }
 try {
     $stored = [IO.File]::ReadAllText($PreferencesFile) | ConvertFrom-Json
-    foreach ($key in 'startup','quiet') {
+    foreach ($key in 'startup','quiet','start_in_tray') {
         if ($stored.$key -is [bool]) { $script:Preferences[$key] = $stored.$key }
     }
 } catch { }
+function Save-HelperPreferences($settings) {
+    [void][IO.Directory]::CreateDirectory($StateDir)
+    $pending = $PreferencesFile + '.' + [guid]::NewGuid().ToString('N') + '.pending'
+    try {
+        [IO.File]::WriteAllText($pending, ($settings | ConvertTo-Json), (New-Object Text.UTF8Encoding $true))
+        if ([IO.File]::Exists($PreferencesFile)) { [IO.File]::Replace($pending, $PreferencesFile, [NullString]::Value) }
+        else { [IO.File]::Move($pending, $PreferencesFile) }
+    } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
+    $script:Preferences = $settings
+}
 $script:Persist = $false; $script:FinalEnd = $false
 function Write-AgentLog($m) {
     try {
@@ -3799,7 +3810,7 @@ function Save-AgentCopy($f, [switch]$ForDetach) {
         if ([IO.File]::Exists($f)) { [IO.File]::Replace($pending, $f, [NullString]::Value) } else { [IO.File]::Move($pending, $f) }
     } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
 }
-function Install-Autostart([switch]$Enable) {   # resume the same session in a visible window after logon
+function Install-Autostart([switch]$Enable) {   # resume the same session after logon using the locally selected presentation
     if ($env:HELPER_NO_AUTOSTART) { return }
     if (-not $Enable -and $script:Preferences -and -not $script:Preferences.startup) { return }
     try {
@@ -3841,12 +3852,12 @@ function Forget-Session {
     try { if (Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction Stop } } catch { Write-AgentLog "cannot remove the logon task (needs administrator): $_" }
     Write-AgentLog 'session ended by the user: saved session and autostart removed'
 }
-function Start-HelperHandoff([switch]$ShowConsole) {
+function Start-HelperHandoff([switch]$ShowConsole, [switch]$AtLogon) {
     $saved = Load-Session
     if (-not $saved -or ($script:Token -and ($saved.token -ne $script:Token -or $saved.code -ne $script:Code))) {
         throw 'The current Helper session could not be loaded.'
     }
-    if (-not $ShowConsole -and -not $script:Persist) {
+    if (-not $ShowConsole -and -not $AtLogon -and -not $script:Persist) {
         throw 'Detach needs a saved copy of the current session.'
     }
     $name = 'Local\HelperMCP-' + [guid]::NewGuid().ToString('N')
@@ -3857,7 +3868,7 @@ function Start-HelperHandoff([switch]$ShowConsole) {
     $file = Join-Path $StateDir ($prefix + $name.Substring($name.Length - 32) + '.ps1')
     try {
         $go = New-Object Threading.EventWaitHandle($false, 'ManualReset', ($name + '-go'))
-        if ($ShowConsole) { Copy-Item -LiteralPath $PSCommandPath -Destination $file -ErrorAction Stop }
+        if ($ShowConsole -or $AtLogon) { Copy-Item -LiteralPath $PSCommandPath -Destination $file -ErrorAction Stop }
         else { Save-AgentCopy $file -ForDetach }
         $psi = New-Object Diagnostics.ProcessStartInfo (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
         $psi.UseShellExecute = $false
@@ -3959,6 +3970,7 @@ function Open-HelperConsole {
 function Set-ConsoleMenu {
     $startup = if ($script:Preferences.startup) { T 'Автозапуск включён' 'Autostart on' } else { T 'Автозапуск выключен' 'Autostart off' }
     $quiet = if ($script:Preferences.quiet) { T 'Тихий режим включён' 'Quiet mode on' } else { T 'Тихий режим выключен' 'Quiet mode off' }
+    $launch = if ($script:Preferences.start_in_tray) { T 'При входе в Windows: трей' 'At Windows sign-in: notification area' } else { T 'При входе в Windows: окно' 'At Windows sign-in: window' }
     $look = @(
         (T 'Подсветка' 'Glow'), (T 'Звук' 'Sound'), (T 'Плашка' 'Banner'),
         (T 'Таймер' 'Timer'), (T 'Курсор' 'Cursor'), (T 'Анимации' 'Animations')
@@ -3967,7 +3979,7 @@ function Set-ConsoleMenu {
     $items = for ($i = 0; $i -lt $look.Count; $i++) {
         $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
     }
-    [K__BUILD__.Keys]::MenuLabels = @((T 'Статус подключения' 'Connection status'), (T 'Открыть журнал' 'Open recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Свернуть Helper в трей' 'Keep Helper in the notification area'), (T 'Завершить сеанс' 'End session'), (T 'Скопировать код сеанса' 'Copy session code'))
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Статус подключения' 'Connection status'), (T 'Открыть журнал' 'Open recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Свернуть Helper в трей' 'Keep Helper in the notification area'), (T 'Завершить сеанс' 'End session'), (T 'Скопировать код сеанса' 'Copy session code'), $launch)
     [K__BUILD__.Keys]::MenuDescriptions = @(
         (T 'Показать код, режим доступа и состояние связи.' 'Show the code, access mode and connection status.'),
         (T 'Скопировать код для оператора поддержки.' 'Copy the code for your support operator.'),
@@ -4023,7 +4035,7 @@ function Read-ConsoleMenu {
         }
         return
     }
-    if ($choice -ge 4) {
+    if ($choice -in 4..9) {
         $keys = 'glow','sound','banner','timer','cursor','animations'
         $enabled = @($script:GlowOn, $script:SoundOn, $script:BannerOn, $script:TimerOn, $script:CursorOn, $script:AnimationsOn)
         $n = $choice - 4
@@ -4037,14 +4049,13 @@ function Read-ConsoleMenu {
         [K__BUILD__.Keys]::OpenMenu = $true
         return
     }
-    $key = if ($choice -eq 2) { 'startup' } else { 'quiet' }
+    $key = switch ($choice) { 2 { 'startup' } 3 { 'quiet' } 14 { 'start_in_tray' } }
+    if (-not $key) { return }
     $settings = $script:Preferences.Clone()
     $settings[$key] = -not $settings[$key]
     try {
         if ($key -eq 'startup' -and $settings.startup) { Install-Autostart -Enable }
-        [void](New-Item -ItemType Directory -Path $StateDir -Force)
-        $settings | ConvertTo-Json | Set-Content -LiteralPath $PreferencesFile -Encoding UTF8
-        $script:Preferences = $settings
+        Save-HelperPreferences $settings
         if ($key -eq 'startup' -and -not $settings.startup) {
             Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
             if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
@@ -4055,7 +4066,7 @@ function Read-ConsoleMenu {
         Write-AgentLog ('could not save console preferences: ' + $_.Exception.GetType().Name)
         Write-Orange (T 'Не удалось сохранить настройку.' 'Could not save the setting.')
     }
-    [K__BUILD__.Keys]::SettingsSelection = $choice - 2
+    [K__BUILD__.Keys]::SettingsSelection = $(if ($choice -eq 14) { 8 } else { $choice - 2 })
     [K__BUILD__.Keys]::OpenMenu = $true
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
@@ -4627,7 +4638,14 @@ function Invoke-HelperSession {
     }
     $script:DetachGo = $null
     $script:DetachMayResume = $false
-    try { Start-Helper }
+    try {
+        if (-not $script:Detached -and $env:HELPER_LOGON -eq '1' -and $script:Preferences.startup -and $script:Preferences.start_in_tray -and
+            $PSCommandPath -eq (Join-Path $StateDir 'agent.ps1') -and (Test-Path -LiteralPath $SessionFile)) {
+            try { Start-HelperHandoff -AtLogon; $script:DetachMayResume = $true; return }
+            catch { Write-AgentLog ('could not start in notification area: ' + $_.Exception.GetType().Name) }
+        }
+        Start-Helper
+    }
     finally {
         $sessionLock.Dispose()
         if ($script:DetachGo) {

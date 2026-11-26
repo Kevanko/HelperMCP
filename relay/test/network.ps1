@@ -409,7 +409,8 @@ public static class ConsoleFixtureInput {
                 int read;
                 text.Clear();
                 if (ReadConsoleOutputCharacter(GetStdHandle(-11), text, text.Capacity - 1, 0, out read)
-                    && text.ToString().Contains("Ask once per session") && text.ToString().Contains("Unattended access")) {
+                    && text.ToString().Contains("Ask once per session") && text.ToString().Contains("Unattended access")
+                    && text.ToString().Contains("Ask before every action")) {
                     SawFrame = true;
                     break;
                 }
@@ -429,7 +430,7 @@ try {
     if (-not [ConsoleFixtureInput]::EnableVT()) { throw 'No VT in the fixture console' }
     [KNativeMenuFixture.Keys]::VT = $true
     [ConsoleFixtureInput]::Navigate()
-    $selected = [KNativeMenuFixture.Keys]::Choose(@('Confirm each action','Ask once per session','Unattended access'), 'Access mode', 'Select with arrows')
+    $selected = [KNativeMenuFixture.Keys]::Choose(@('Confirm each action','Ask once per session','Unattended access'), 'Access mode', 'Select with arrows', 0, @('Ask before every action','Ask before control','Allow without a prompt'))
     if (-not [ConsoleFixtureInput]::SawFrame -or $selected -ne 1) { throw "Missing menu frame or wrong selection: $selected" }
     [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'result.txt'), 'PASS')
 } catch {

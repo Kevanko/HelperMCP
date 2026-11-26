@@ -1342,14 +1342,14 @@ namespace K__BUILD__ {
       return lines;
     }
     public static int Choose(string[] labels, string title, string help, int initial = 0, string[] descriptions = null) {
-      int selected = initial, width = 0, height = 0, drawn = -1;
+      int selected = initial, width = 0, height = 0, drawn = -1, lastRow = -1;
       string shownStatus = null;
       if (VT) Console.Write("\u001b[?1049h\u001b[r\u001b[?25l");
       try {
         while (true) {
           if (Thread.CurrentThread == reader && !reading) return -1;
           string status = MenuOpen ? MenuStatus ?? "" : "";
-          if (selected != drawn || width != Console.WindowWidth || height != Console.WindowHeight || shownStatus != status) {
+          if (selected != drawn || width != Console.WindowWidth || height != Console.WindowHeight || shownStatus != status || Console.CursorTop != lastRow) {
             width = Console.WindowWidth; height = Console.WindowHeight; drawn = selected; shownStatus = status;
             bool showDescription = descriptions != null && height >= 10;
             var lines = MenuLines(labels, title, status, help, selected, width, height - (showDescription ? 1 : 0));
@@ -1358,6 +1358,7 @@ namespace K__BUILD__ {
             frame.AppendLine().Append(lines[lines.Length - 1]);
             if (VT) Console.Write("\u001b[r\u001b[H\u001b[2J" + frame);
             else { Console.Clear(); Console.Write(frame); }
+            lastRow = Console.CursorTop;
           }
           if (!Console.KeyAvailable) { Thread.Sleep(35); continue; }
           var key = Console.ReadKey(true).Key;

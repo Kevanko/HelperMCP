@@ -63,7 +63,7 @@ let clock=0, timer, seenSignal, reads=0;
 const playback=vm.createContext({
  AbortController,performance:{now:()=>clock},window:{VideoDecoder:Decoder},document:{hidden:false},
  setInterval(fn){timer=fn;return 1},clearInterval(){timer=null},base:'/fixture',mon:'',noVideo:false,paintSerial:0,paintedAt:0,
- dec:null,bytes:0,streamStall:video.streamStall,resetPictures(){},accessEnded(){return false},handle(){},
+ dec:null,bytes:0,renderPending:0,streamStall:video.streamStall,resetPictures(){},accessEnded(){return false},handle(){},
  async fetch(url,{signal}){
   assert.match(url,/codec=h264$/);
   seenSignal=signal;

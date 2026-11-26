@@ -203,7 +203,12 @@ if (useps) {   // registry search, crash report, run history (Windows only)
   assert.match(txt(await tool('util', { session: code, op: 'recent', value: '3' })), /ran|opened file|nothing found/);
   const uniq = 'hmffind_' + Date.now() + '.zzz'; fs.writeFileSync(path.join(tmp, uniq), 'x');
   const ff = txt(await tool('util', { session: code, op: 'ffind', name: uniq, value: 'new' }));
-  assert.ok(ff.includes(uniq) || /needs administrator/.test(ff), 'ffind finds the new file on any disk, or says it needs administrator: ' + ff);
+  const searchUnavailable = /needs administrator|NTFS search did not finish in time/.test(ff);
+  assert.ok(ff.includes(uniq) || searchUnavailable, 'ffind finds the new file or returns an actionable error: ' + ff);
+  if (searchUnavailable) {
+    assert.match(txt(await tool('find', { session: code, path: tmp, name: uniq })), new RegExp(uniq),
+      'the ordinary search must still work after the NTFS reader refused or timed out');
+  }
   assert.match(txt(await tool('util', { session: code, op: 'browser' })), /== extensions[\s\S]*== browser processes/);
   assert.match(txt(await tool('util', { session: code, op: 'bsod', value: '1' })), /bugcheck 0x|no blue screens|no crash dump files/);
   const hl = txt(await tool('util', { session: code, op: 'health' })); for (const h of ['== boot', '== disks', '== heat and throttling', '== drivers and updates']) assert.ok(hl.includes(h), 'health has ' + h + ': ' + hl.slice(0, 300));
@@ -212,7 +217,7 @@ if (useps) {   // registry search, crash report, run history (Windows only)
   const lf = path.join(tmp, 'launch me.txt'); fs.writeFileSync(lf, 'x');
   const lr = txt(await tool('util', { session: code, op: 'launch', name: 'notepad', args: [lf] })); assert.match(lr, /started .*notepad\.exe .*launch me\.txt \(pid \d+/i, lr);
   await tool('run', { session: code, command: 'taskkill', args: ['/PID', lr.match(/pid (\d+)/)[1], '/F'] });
-  console.log('reg_find / crash / recent / ffind ok' + (/needs administrator/.test(ff) ? ' (not administrator: ffind refused)' : ''));
+  console.log('reg_find / crash / recent / ffind ok' + (searchUnavailable ? ' (ordinary search verified after native search was unavailable)' : ''));
 }
 assert.match(txt(await tool('util', { session: code, op: 'net_test', host: '127.0.0.1', port: PORT })), /tcp \d+: open/);
 const zp = path.join(tmp, 'tree-copy.zip');

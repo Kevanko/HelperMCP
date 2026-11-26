@@ -208,6 +208,7 @@ function liveFrame(code, s, fr) {
     } catch { return; }
     s.awaitLiveSource = false;
   }
+  if (type === 'K' || type === 'T' || type === 'V') s.livePictureAt = Date.now();
   if (type === 'C') s.lastC = fr;   // a new viewer needs the decoder settings before the next key frame
   if (type === 'K') s.lastC = null;
   if (type === 'S') { s.lastS = fr; for (const lv of s.live || []) if (lv.res.writableLength < LIVE_BACKLOG) lv.res.write(fr); return; }
@@ -442,9 +443,10 @@ function flush(s) {
 
 const ended = new Map();   // codes the user (or operator) ended: an agent that still tries to come back with one is told to stop (for an hour)
 const revokedTokens = new Set(); // operator-initiated End or Forget outlasts the temporary code cooldown
-function clearAccess(code, s, reason) {
+function clearAccess(code, s, reason, keepViewers = false) {
   s.accessGranted = false;
   s.accessEpoch = (s.accessEpoch || 0) + 1;
+  s.viewerGeneration = null;
   s.accessRequest = null;
   s.viewerShown = false;
   s.log.length = 0;
@@ -464,7 +466,7 @@ function clearAccess(code, s, reason) {
   for (const pending of s.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error(reason)); }
   s.pending.clear();
   for (const [id, f] of files) if (f.code === code) { files.delete(id); fs.rm(f.path, { force: true }, () => {}); }
-  for (const [token, viewer] of viewers) if (viewer.code === code) viewers.delete(token);
+  if (!keepViewers) for (const [token, viewer] of viewers) if (viewer.code === code) viewers.delete(token);
 }
 
 async function requestAccess(code) {
@@ -1131,7 +1133,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 <div id=log></div></aside></div>
 <div id=kb><label for=txt>$</label><input id=txt autocomplete=off><button id=send></button><button data-k=enter>Enter</button><button data-k=backspace>&#9003;</button><button data-k=tab>Tab</button><button data-k=esc>Esc</button><button data-k=left>&larr;</button><button data-k=up>&uarr;</button><button data-k=down>&darr;</button><button data-k=right>&rarr;</button>${android ? '<button data-k=back>Back</button><button data-k=home>Home</button><button data-k=recents>Recents</button>' : ''}</div>
 <script>
-const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'в эфире',wait:'жду кадр…',end:'сеанс завершён',off:'устройство не на связи',paused:'пауза на устройстве',take:'Управлять самому',give:'Вернуть помощнику',tag:'управляете вы, помощник ждёт',send:'Ввести',ph:'текст: Enter — ввести и нажать Enter',note:'Что делает помощник',noNote:'помощник ещё ничего не написал',plan:'План',over:'вы управляете'}:{live:'live',wait:'waiting for a frame…',end:'session ended',off:'device offline',paused:'paused on the device',take:'Take control',give:'Give back to the helper',tag:'you are driving, the helper waits',send:'Type',ph:'text: Enter types it and presses Enter',note:'What the helper is doing',noNote:'nothing from the helper yet',plan:'Plan',over:'you are driving'};
+const ru=(navigator.language||'').startsWith('ru'),L=ru?{live:'в эфире',wait:'жду кадр…',recover:'восстанавливаю трансляцию…',expired:'доступ завершён · откройте новую ссылку просмотра',end:'сеанс завершён',off:'устройство не на связи',paused:'пауза на устройстве',take:'Управлять самому',give:'Вернуть помощнику',tag:'управляете вы, помощник ждёт',send:'Ввести',ph:'текст: Enter — ввести и нажать Enter',note:'Что делает помощник',noNote:'помощник ещё ничего не написал',plan:'План',over:'вы управляете'}:{live:'live',wait:'waiting for a frame…',recover:'reconnecting the stream…',expired:'access ended · open a new viewer link',end:'session ended',off:'device offline',paused:'paused on the device',take:'Take control',give:'Give back to the helper',tag:'you are driving, the helper waits',send:'Type',ph:'text: Enter types it and presses Enter',note:'What the helper is doing',noNote:'nothing from the helper yet',plan:'Plan',over:'you are driving'};
 const $=id=>document.getElementById(id),dot=$('dot'),st=$('st'),cv=$('cv'),g=cv.getContext('2d'),log=$('log'),kb=$('kb'),txt=$('txt');
 $('hNote').textContent=L.note;$('note').dataset.empty=L.noNote;$('hPlan').textContent=L.plan;
 const base=location.pathname.split('/').slice(0,3).join('/');   // /v/<token>: the link has no trailing slash, so a relative URL would resolve to /v/frame
@@ -1141,26 +1143,51 @@ let ended=false,control=false,meta={ox:0,oy:0,sc:1},seq=0,shown=0,mon='',monitor
 const viewerClient=Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,'0')).join(''),viewerAbort=new AbortController(),nativeFetch=window.fetch.bind(window);
 window.fetch=(input,init={})=>{const u=new URL(typeof input==='string'?input:input.url,location.href);if(u.origin===location.origin&&u.pathname.startsWith(base+'/')){if(gone)return Promise.reject(new DOMException('Viewer disconnected','AbortError'));const headers=new Headers(init.headers||{});headers.set('x-viewer-client',viewerClient);init={...init,headers,signal:init.signal||viewerAbort.signal}}return nativeFetch(input,init)};
 function status(t,cls){st.textContent=gone?(ru?'отключено':'disconnected'):t;dot.className=gone?'':cls||''}
-async function fetchFrame(my){const epoch=monitorEpoch;try{const r=await fetch(base+'/frame?mon='+mon+'&prev='+encodeURIComponent(snapshotHash));if(ended||epoch!==monitorEpoch)return;
- if(r.status===410){ended=true;return}
+function accessEnded(r){
+ if(![403,404,410].includes(r.status))return false;
+ disconnectViewer(true,r.status===410?L.end:L.expired);
+ return true;
+}
+async function fetchFrame(my,phase){
+ const epoch=monitorEpoch,request=new AbortController();
+ const stop=()=>request.abort();
+ phase.addEventListener('abort',stop,{once:true});
+ const timeout=setTimeout(stop,4000);
+ let bmp;
+ try{const r=await fetch(base+'/frame?mon='+mon+'&prev='+encodeURIComponent(snapshotHash),{signal:request.signal});
+ if(ended||request.signal.aborted||epoch!==monitorEpoch||accessEnded(r))return;
  if(r.status===204){status(L.live,'on');await new Promise(x=>setTimeout(x,250));return}
- if(r.ok){const b=await r.blob();const bmp=await createImageBitmap(b);
-  if(!ended&&epoch===monitorEpoch&&my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
+ if(r.ok){const b=await r.blob();bmp=await new Promise((resolve,reject)=>{
+   const aborted=()=>reject(new DOMException('Snapshot cancelled','AbortError'));
+   if(request.signal.aborted){aborted();return}
+   request.signal.addEventListener('abort',aborted,{once:true});
+   createImageBitmap(b).then(image=>{if(request.signal.aborted)image.close();else resolve(image)},reject)
+    .finally(()=>request.signal.removeEventListener('abort',aborted));
+  });
+  if(!ended&&!request.signal.aborted&&epoch===monitorEpoch&&my>shown){shown=my;if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}g.drawImage(bmp,0,0);
    snapshotHash=r.headers.get('x-frame-hash')||'';
    meta={ox:+r.headers.get('x-ox')||0,oy:+r.headers.get('x-oy')||0,sc:+r.headers.get('x-sc')||1};status(L.live+'  '+Math.round(b.size/1024)+' KB','on')}
-  bmp.close()}
+ }
  else{let m='';try{m=(await r.json()).error||''}catch(_){}status(/offline|away|reboot/i.test(m)?L.off:/PAUSED/.test(m)?L.paused:L.wait,'bad');await new Promise(x=>setTimeout(x,1200))}}
- catch(e){status(L.wait,'bad');await new Promise(x=>setTimeout(x,1500))}}
-async function lane(gap){while(!ended&&noLive){await fetchFrame(++seq);await sleep(gap)}if(ended)status(L.end,'')}
+ catch(e){if(!ended&&!phase.aborted){status(L.recover,'bad');await sleep(500)}}
+ finally{bmp?.close();clearTimeout(timeout);phase.removeEventListener('abort',stop)}
+}
+async function lane(gap,phase){while(!ended&&!phase.aborted){await fetchFrame(++seq,phase);if(!phase.aborted)await sleep(gap)}}
 // the live stream: one long download of frames (full pictures, changed tiles, or H.264 video); pictures one by one only if the agent cannot stream
 let gone=false,abort=null,noLive=false,frames=0,bytes=0,dec=null,chain=Promise.resolve(),renderPending=0,renderEpoch=0,waitFull=false;
 let paintedAt=0,paintSerial=0,displayCodec='',streamConflict=false;
+function resetPictures(){
+ renderEpoch++;
+ chain=Promise.resolve();
+ renderPending=0;
+ waitFull=true;
+}
 function queuePicture(draw,full){
  if(waitFull&&!full)return;
- if(renderPending>=3){renderEpoch++;waitFull=true;if(abort)abort.abort();return}
+ if(renderPending>=3){resetPictures();if(abort)abort.abort();return}
  if(full)waitFull=false;
  const epoch=renderEpoch;renderPending++;
- chain=chain.then(async()=>{if(!ended&&epoch===renderEpoch)await draw(()=>!ended&&epoch===renderEpoch)}).catch(()=>{}).finally(()=>{renderPending--});
+ chain=chain.then(async()=>{if(!ended&&epoch===renderEpoch)await draw(()=>!ended&&epoch===renderEpoch)}).catch(()=>{}).finally(()=>{if(epoch===renderEpoch)renderPending--});
 }
 const sleep=ms=>new Promise(x=>setTimeout(x,ms)),td=new TextDecoder();
 setInterval(()=>{if(!ended&&paintSerial&&!noLive&&(frames||dot.className==='on'))status(L.live+'  '+displayCodec+'  '+frames+' fps  '+Math.round(bytes/1024)+' KB/s','on');frames=0;bytes=0},1000);   // 0 fps when a JPEG desktop is still
@@ -1195,6 +1222,7 @@ function streamStall(now,started,lastData,firstPaint,lastPaint,continuous,hidden
  if(!firstPaint)return now-started>=7000?(lastData===started?'no-packets':'initial-frame'):'';
  if(now-lastData>=22000)return 'no-packets';
  if(continuous&&!hidden&&now-lastPaint>=7000)return now-lastData>=7000?'no-packets':'no-video-frame';
+ if(!hidden&&now-lastPaint>=40000)return 'no-refresh';
  return '';
 }
 function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffset,p.byteLength);
@@ -1212,7 +1240,7 @@ function handle(ty,p){if(ended)return;const dv=new DataView(p.buffer,p.byteOffse
   for(let i=0;i<c;i++){const n=dv.getUint32(o+4);parts.push([dv.getUint16(o),dv.getUint16(o+2),p.subarray(o+8,o+8+n)]);o+=8+n}
   queuePicture(async valid=>{const bs=await Promise.allSettled(parts.map(q=>jpeg(q[2])));const complete=bs.every(x=>x.status==='fulfilled');bs.forEach((x,i)=>{if(x.status==='fulfilled'){if(valid()&&complete)g.drawImage(x.value,parts[i][0],parts[i][1]);x.value.close()}});if(valid()&&complete)painted('JPEG');else if(!complete){waitFull=true;if(abort)abort.abort()}},false)}
  else if(ty==='C'){const n=dv.getUint16(0),m=JSON.parse(td.decode(p.subarray(2,2+n)));meta={ox:m.ox,oy:m.oy,sc:m.sc};
-  renderEpoch++;waitFull=false;
+  resetPictures();
   if(m.mons){window.__mons=m.mons;monMap(m.mons,m.mon)}
   if(!('VideoDecoder' in window)){noLive=true;if(abort)abort.abort();return}   // no WebCodecs in this browser: pictures instead
   try{if(dec)dec.close()}catch(_){}
@@ -1228,22 +1256,23 @@ async function live(){
  const first=paintSerial,started=performance.now(),requestedVideo=!noVideo&&'VideoDecoder' in window;
  let lastData=started,stall='';
  const watchdog=setInterval(()=>{
-   stall=streamStall(performance.now(),started,lastData,paintSerial>first,paintedAt,dec?.state==='configured',document.hidden);
+   stall=streamStall(performance.now(),started,lastData,paintSerial>first,paintedAt,dec?.state==='configured'||renderPending>0,document.hidden);
    if(stall)my.abort();
  },1000);
  try{const r=await fetch(base+'/live?codec='+(requestedVideo?'h264':'jpeg')+(mon?'&mon='+mon:''),{signal:my.signal});
-  if(r.status===410){ended=true;return true}
+  if(accessEnded(r))return true;
   if(r.status===409){const refusal=await r.json().catch(()=>({}));streamConflict=refusal.error==='stream-conflict'}
   if(!r.ok||!r.body)return false;
   const rd=r.body.getReader();let buf=new Uint8Array(0);
-  for(;;){const x=await rd.read();if(x.done)break;lastData=performance.now();bytes+=x.value.length;
+  for(;;){const x=await rd.read();if(x.done)break;bytes+=x.value.length;
    const nb=new Uint8Array(buf.length+x.value.length);nb.set(buf);nb.set(x.value,buf.length);buf=nb;
-   while(buf.length>=5){const n=new DataView(buf.buffer,buf.byteOffset).getUint32(0);if(buf.length<5+n)break;
+   while(buf.length>=5){const n=new DataView(buf.buffer,buf.byteOffset).getUint32(0);if(n>16000000){my.abort();break}if(buf.length<5+n)break;
     const ty=String.fromCharCode(buf[4]),pl=buf.slice(5,5+n);buf=buf.subarray(5+n);
-    handle(ty,pl)}}
+    if(ty!=='P')lastData=performance.now();handle(ty,pl)}}
  }catch(e){}finally{
    clearInterval(watchdog);
-   renderEpoch++;waitFull=true;
+   my.abort();
+   resetPictures();
    try{if(dec)dec.close()}catch(_){}dec=null;
  }
  if(stall&&requestedVideo&&stall!=='no-packets')noVideo=true;
@@ -1252,18 +1281,39 @@ async function live(){
 (async()=>{while(!ended){
  if(noLive){
   snapshotHash='';
-  const lanes=streamConflict?[lane(200)]:[lane(10),lane(10)];
-  await sleep(5000);noLive=false;await Promise.all(lanes);continue
+  const phase=new AbortController();abort=phase;
+  const stop=setTimeout(()=>phase.abort(),5000);
+  try{await Promise.all(streamConflict?[lane(200,phase.signal)]:[lane(10,phase.signal),lane(10,phase.signal)])}
+  finally{clearTimeout(stop);phase.abort();noLive=false}
+  continue
  } // retry video after startup, reconnect or an older agent's update
  const hadVideoFallback=noVideo;
  const ok=await live();if(ended)break;
- if(!ok&&noVideo===hadVideoFallback)noLive=true}
- status(L.end,'')})();
+ if(!ok&&noVideo===hadVideoFallback)noLive=true;
+ if(!gone){status(L.recover,'bad');await sleep(200)}
+ }})();
+addEventListener('online',()=>{if(!ended){noVideo=false;if(abort)abort.abort()}});
 const esc=x=>String(x||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+let viewerGeneration;
+async function readViewerInfo(path){
+ const request=new AbortController();
+ const stop=()=>request.abort();
+ viewerAbort.signal.addEventListener('abort',stop,{once:true});
+ const timeout=setTimeout(stop,4000);
+ try{const r=await fetch(base+path,{priority:'low',signal:request.signal});return accessEnded(r)||!r.ok?null:await r.json()}
+ finally{clearTimeout(timeout);viewerAbort.signal.removeEventListener('abort',stop)}
+}
 async function info(){while(!ended){try{
- const r=await fetch(base+'/log',{priority:'low'});if(ended)break;if(r.ok){const a=await r.json();log.innerHTML=a.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('')}
- const q=await fetch(base+'/state');if(q.ok){const s=await q.json();
+ const [events,s]=await Promise.all([readViewerInfo('/log').catch(()=>null),readViewerInfo('/state').catch(()=>null)]);
+ if(ended)break;
+ if(events)log.innerHTML=events.reverse().map(e=>'<div><i>'+new Date(e.t).toLocaleTimeString()+'</i> <b>'+esc(e.tool)+'</b> '+esc(e.args)+'</div>').join('');
+ if(s){
   const native= !s.realtime_capable || s.live_realtime;
+  if(viewerGeneration&&s.generation!==viewerGeneration){
+   window.ViewerInput?.setOnline(false);
+   noVideo=false;if(abort)abort.abort();
+  }
+  viewerGeneration=s.generation;
   window.ViewerInput?.setPointer(!!s.live_pointer && native);window.ViewerInput?.setKeyboard(!!s.live_keyboard && native);window.ViewerInput?.setRealtime(!!s.live_realtime);window.ViewerInput?.setLook(s.look||{});window.ViewerInput?.setOnline(!!s.online && !s.paused);
   $('note').textContent=s.note||'';const c=s.color||'#38ff7a';document.documentElement.style.setProperty('--st',c);
   const p=s.plan;$('hPlan').hidden=!p;$('plan').innerHTML=p?p.stages.map((x,i)=>'<li style="--c:'+esc(x.color||c)+'" class="'+(i===p.current?'cur':(p.done||[]).includes(i)||i<p.current?'done':'')+'">'+esc(x.title)+'</li>').join(''):'';
@@ -1283,7 +1333,7 @@ cv.addEventListener('pointermove',e=>{if(!pan)return;tx=pan.tx+(e.clientX-pan.x)
 addEventListener('pointerup',()=>{pan=null});
 $('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
 // disconnect: stop watching (the stream closes at once; the helper stops filming 15 s after the last viewer leaves); the same button reconnects
-function disconnectViewer(final=false){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));if(final){status(L.end,'');return}status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
+function disconnectViewer(final=false,message=L.end){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();resetPictures();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));if(final){st.textContent=message;dot.className='bad';$('disc').disabled=true;return}status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
 $('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(gone){location.reload();return}disconnectViewer()};addEventListener('pagehide',()=>disconnectViewer());
 </script>
 <script src=/assets/viewer-control.js></script><link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
@@ -1436,14 +1486,17 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         if (s.lastC && liveCodec(s) === 'h264') res.write(s.lastC);
         if (s.lastS) res.write(s.lastS);
         wantKey(v.code, s);
-        const ping = setInterval(() => res.write(Buffer.from([0, 0, 0, 0, 80])), 15_000);   // keeps proxies from closing a quiet stream
+        const ping = setInterval(() => {
+          res.write(Buffer.from([0, 0, 0, 0, 80]));
+          if (Date.now() - (s.livePictureAt || 0) >= 15_000) wantKey(v.code, s);
+        }, 15_000);   // refresh a still desktop and keep proxies from closing the stream
         req.on('close', () => {
           clearInterval(ping); s.live?.delete(lv); scheduleViewerHandback(vw[1],v,s,client);
           setTimeout(() => { if (!s.live?.size && sessions.get(v.code) === s) streamCtl(v.code, s, { on: false }); }, 15_000);   // nobody watches: the agent stops filming
         });
         return;
       }
-      if (vw[2] === '/state') return json(res, 200, { stream: { codec: liveCodec(s), viewers: s.live?.size || 0, video_viewers: [...(s.live || [])].filter(x => x.codec === 'h264').length }, look: { color: s.lookForce || s.lookColor || '', note: s.note || '', ...effLook(s) }, plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: isOnline(s), paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '', live_pointer: s.info?.viewer_pointer === 1 && s.mode !== 'confirm', live_keyboard: s.info?.viewer_keyboard === 1 && s.mode !== 'confirm', realtime_capable:s.info?.viewer_realtime===1,live_realtime:s.info?.viewer_realtime===1&&!!s.fastInput&&!s.paused });
+      if (vw[2] === '/state') return json(res, 200, { generation: s.viewerGeneration ??= crypto.randomUUID(), stream: { codec: liveCodec(s), viewers: s.live?.size || 0, video_viewers: [...(s.live || [])].filter(x => x.codec === 'h264').length }, look: { color: s.lookForce || s.lookColor || '', note: s.note || '', ...effLook(s) }, plan: s.plan || null, note: s.note || '', color: lookOf(s).color, online: isOnline(s), paused: !!s.paused, takeover: takenOver(s), os: s.info?.os || '', live_pointer: s.info?.viewer_pointer === 1 && s.mode !== 'confirm', live_keyboard: s.info?.viewer_keyboard === 1 && s.mode !== 'confirm', realtime_capable:s.info?.viewer_realtime===1,live_realtime:s.info?.viewer_realtime===1&&!!s.fastInput&&!s.paused });
       if (vw[2] === '/kill') {   // end a process from the System panel (control link only)
         if (req.method !== 'POST' || !v.ctl || !safeEq(req.headers['x-ctl'] || '', v.ctl)) return json(res, 403, { error: 'this link is view-only' });
         const b = JSON.parse((await body(req, 2000)) || '{}'), pid = Math.round(Number(b.pid));
@@ -1638,8 +1691,12 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (want && !old && ended.has(want) && Date.now() - ended.get(want) < 3600_000) return json(res, 410, { error: 'this session was ended' });
       if (old && resumeHash && safeEq(resumeHash, old.th)) {   // the same PC coming back (internet loss, reboot): same code, same token, nothing lost
         if (old.ending) return json(res, 410, { error: 'this session is ending' });
-        if (old.info.access_request || info.access_request === 1) clearAccess(want, old, 'The device reconnected. Request access again.');
-        old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = normMode(info.mode); old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
+        const nextMode = normMode(info.mode);
+        if (old.info.access_request || info.access_request === 1) {
+          const keepViewers = old.mode === 'unattended' && nextMode === 'unattended' && info.access_request === 1;
+          clearAccess(want, old, keepViewers ? 'The device reconnected.' : 'The device reconnected. Request access again.', keepViewers);
+        }
+        old.lastSeen = Date.now(); old.lastSeenKnown = true; old.awaitingReconnect = false; old.restoredAt = 0; old.ip = ip; old.mode = nextMode; old.persist = !!info.persist; old.keepMs = /android/i.test(String(info.os || '')) ? 6 * 3600_000 : undefined; old.paused = false;
         old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
         old.info.viewer_keyboard = info.viewer_keyboard === 1 ? 1 : 0;
         old.info.access_request = old.info.access_request || info.access_request === 1;
@@ -1741,7 +1798,8 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
           }
         });
         req.on('error', () => {});
-        req.on('end', () => { if (s.ingest === req) s.ingest = null; json(res, 200, {}); });
+        req.on('close', () => { if (s.ingest === req) s.ingest = null; });
+        req.on('end', () => json(res, 200, {}));
         return;
       }
       if (p === '/a/result' && req.method === 'POST') {

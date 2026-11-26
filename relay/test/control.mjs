@@ -314,6 +314,14 @@ try {
   const fresh = await (await post(base+'/a/register',{device_id:'consent-fixture-device',access_request:1})).json();
   assert.ok(fresh.code && fresh.code !== consent.code,'forgotten device inherited the old code');
   console.log('Consent gates preview, viewer and native input, resets on reconnect and forget revokes the old code PASS');
+  const unattended = await fakeAgent('Unattended-reconnect',0,0,{access_request:1,mode:'unattended'});
+  const retained = await (await admin('open',{code:unattended.code})).json();
+  const resume = {resume:unattended.code,resume_token:unattended.token,persist:true,access_request:1};
+  assert.equal((await post(base+'/a/register',{...resume,mode:'unattended'})).status,200);
+  assert.equal((await fetch(retained.watch+'/state')).status,200,'unattended viewer requires a page restart after agent reconnect');
+  assert.equal((await post(base+'/a/register',{...resume,mode:'auto'})).status,200);
+  assert.equal((await fetch(retained.watch+'/state')).status,404,'switching to consent mode left existing unattended access valid');
+  console.log('Viewer link survives authenticated unattended reconnect and is revoked when local consent becomes required PASS');
   if(process.argv.includes('--serve')) {
     const out=process.env.UI_FIXTURE_PATH;
     if(out)fs.writeFileSync(out,JSON.stringify({base,user:creds.user,password:creds.password,control:urls.control,watch:urls.watch,temp}));

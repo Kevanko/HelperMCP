@@ -1292,6 +1292,7 @@ namespace K__BUILD__ {
     public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk, Unattended;      // Esc = the user confirmed the end; Unattended = mode 3, Esc pauses instead of opening the end menu
     public static string Relay, Token, ConfirmEnd, StPaused, StRestore, Continuing;
     public static string[] MenuLabels;
+    public static string[] MenuDescriptions;
     public static string MenuHelp, MenuTitle, MenuStatus, MenuSettings, MenuBack, MenuEndTitle;
     public static volatile int SettingsSelection = -1;
     public static volatile string ReaderError;
@@ -1340,7 +1341,7 @@ namespace K__BUILD__ {
       lines[count + 3] = C("2", Fit(help, width));
       return lines;
     }
-    public static int Choose(string[] labels, string title, string help, int initial = 0) {
+    public static int Choose(string[] labels, string title, string help, int initial = 0, string[] descriptions = null) {
       int selected = initial, width = 0, height = 0, drawn = -1;
       string shownStatus = null;
       if (VT) Console.Write("\u001b[?1049h\u001b[r\u001b[?25l");
@@ -1350,7 +1351,11 @@ namespace K__BUILD__ {
           string status = MenuOpen ? MenuStatus ?? "" : "";
           if (selected != drawn || width != Console.WindowWidth || height != Console.WindowHeight || shownStatus != status) {
             width = Console.WindowWidth; height = Console.WindowHeight; drawn = selected; shownStatus = status;
-            string frame = String.Join(Environment.NewLine, MenuLines(labels, title, status, help, selected, width, height));
+            bool showDescription = descriptions != null && height >= 10;
+            var lines = MenuLines(labels, title, status, help, selected, width, height - (showDescription ? 1 : 0));
+            var frame = new System.Text.StringBuilder(String.Join(Environment.NewLine, lines, 0, lines.Length - 1));
+            if (showDescription) frame.AppendLine().Append(C("2", Fit(descriptions[selected], Math.Max(10, width - 1))));
+            frame.AppendLine().Append(lines[lines.Length - 1]);
             if (VT) Console.Write("\u001b[r\u001b[H\u001b[2J" + frame);
             else { Console.Clear(); Console.Write(frame); }
           }
@@ -1377,9 +1382,9 @@ namespace K__BUILD__ {
         int settings = SettingsSelection;
         SettingsSelection = -1;
         if (settings < 0) {
-          string[] home = { labels[0], labels[1], MenuSettings, labels[10], labels[11], labels[12] };
-          int[] actions = { 0, 1, -1, 10, 11, 12 };
-          int item = Choose(home, MenuTitle, MenuHelp);
+          string[] home = { labels[0], labels[13], MenuSettings, labels[1], labels[11], labels[10], labels[12] };
+          int[] actions = { 0, 13, -1, 1, 11, 10, 12 };
+          int item = Choose(home, MenuTitle, MenuHelp, 0, MenuDescriptions);
           if (item < 0) return;
           choice = actions[item];
         } else choice = -1;
@@ -3920,7 +3925,16 @@ function Set-ConsoleMenu {
     $items = for ($i = 0; $i -lt $look.Count; $i++) {
         $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
     }
-    [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Перейти в область уведомлений' 'Detach to notification area'), (T 'Завершить сеанс' 'End session'))
+    [K__BUILD__.Keys]::MenuLabels = @((T 'Статус подключения' 'Connection status'), (T 'Открыть журнал' 'Open recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Свернуть Helper в трей' 'Keep Helper in the notification area'), (T 'Завершить сеанс' 'End session'), (T 'Скопировать код сеанса' 'Copy session code'))
+    [K__BUILD__.Keys]::MenuDescriptions = @(
+        (T 'Показать код, режим доступа и состояние связи.' 'Show the code, access mode and connection status.'),
+        (T 'Скопировать код для оператора поддержки.' 'Copy the code for your support operator.'),
+        (T 'Автозапуск, тихий режим, звук и оформление.' 'Autostart, quiet mode, sound and appearance.'),
+        (T 'Показать недавние события Helper.' 'Show recent Helper events.'),
+        (T 'Закрыть окно и оставить Helper со значком в трее.' 'Close this window and keep Helper available from its tray icon.'),
+        $(if ($script:Mode -eq 'unattended') { T 'При постоянном доступе выберите «Завершить сеанс».' 'To stop unattended access, choose End session.' } else { T 'Остановить управление до нового запроса.' 'Stop remote control until a new request is approved.' }),
+        (T 'Отключить оператора и завершить текущий сеанс.' 'Disconnect the operator and end this session.')
+    )
     [K__BUILD__.Keys]::MenuTitle = 'HelperMCP   /   ' + (T 'Сеанс поддержки' 'Support session')
     [K__BUILD__.Keys]::MenuSettings = T 'Настройки' 'Settings'
     [K__BUILD__.Keys]::MenuBack = T 'Вернуться' 'Go back'
@@ -3935,6 +3949,11 @@ function Read-ConsoleMenu {
     $choice = [K__BUILD__.Keys]::MenuAction
     if (-not $choice) { return }
     [K__BUILD__.Keys]::MenuAction = 0
+    if ($choice -eq 13) {
+        try { Set-Clipboard -Value $script:Code -ErrorAction Stop; Draw-Header $script:Code $true }
+        catch { Write-Orange (T 'Не удалось скопировать код. Он указан в окне выше.' 'Could not copy the code. It is shown above.') }
+        return
+    }
     if ($choice -eq 1) {
         Write-Host ((Do-AgentLog @{ lines = 18 }).text) -ForegroundColor DarkCyan
         return
@@ -4077,7 +4096,12 @@ function Status-Text {
 }
 function Show-Status {
     $status = Status-Text
-    [K__BUILD__.Keys]::MenuStatus = "  $($script:Code)   |   $($status[1])"
+    $mode = switch ($script:Mode) {
+        'unattended' { T 'Постоянный доступ' 'Unattended access' }
+        'auto' { T 'Согласие на сеанс' 'Consent per session' }
+        default { T 'Согласие на действия' 'Consent per action' }
+    }
+    [K__BUILD__.Keys]::MenuStatus = "  $($script:Code) | $mode | $($status[1])"
     try { [K__BUILD__.Keys]::OpSeen = $script:OperatorSeen; if (-not [K__BUILD__.Keys]::Paused) { $xx = Status-Text; [K__BUILD__.Keys]::StRestore = $xx[1]; [K__BUILD__.Keys]::StRestoreOk = ($xx[0] -eq 'ok') } } catch { }
 
 }

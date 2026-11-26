@@ -4316,7 +4316,7 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
 
 function Start-Helper {
     $saved = if ($env:HELPER_NEW) { $null } else { Load-Session }
-    if ($script:Detached -and (-not $saved -or -not (Start-HelperTray))) { return }
+    if ($script:Detached -and -not $saved) { return }
     if ($env:HELPER_LOGON -and (-not $saved -or -not $script:Preferences.startup)) { return }
     $mode = Norm-Mode $env:HELPER_MODE
     if ($saved -and (Norm-Mode $saved.mode)) { $mode = Norm-Mode $saved.mode }   # after a reboot or a restart nothing is asked again: it reconnects at once
@@ -4466,12 +4466,33 @@ function Start-Helper {
         if ($final) { Forget-Session }
         try { if ((Get-Clipboard -Raw).Trim() -eq $code) { Set-Clipboard -Value ' ' } } catch { }   # the session code does not stay in the clipboard
         if ($script:VT) { try { $e = [char]27; [Console]::Write("$e[r$e[$([Console]::WindowHeight);1H`n") } catch { } }   # the header's scroll region off, the prompt back at the bottom
+        $script:DetachMayResume = -not $final
+    }
+}
+function Invoke-HelperSession {
+    # The tray must finish its handshake before it competes for the saved session.
+    if ($script:Detached -and -not (Start-HelperTray)) { return }
+    [void][IO.Directory]::CreateDirectory($StateDir)
+    $lockPath = Join-Path $StateDir 'session.lock'
+    try {
+        $sessionLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None')
+    } catch [IO.IOException] {
+        if (($_.Exception.GetBaseException().HResult -band 0xffff) -notin 32,33) { throw }
+        Write-Host (T 'Helper уже работает. Откройте существующую консоль или значок в области уведомлений.' 'Helper is already running. Open its existing console or notification icon.') -ForegroundColor Yellow
+        return
+    }
+    $script:DetachGo = $null
+    $script:DetachMayResume = $false
+    try { Start-Helper }
+    finally {
+        $sessionLock.Dispose()
         if ($script:DetachGo) {
-            try { if (-not $final) { [void]$script:DetachGo.Set() } } finally { $script:DetachGo.Dispose() }
+            try { if ($script:DetachMayResume) { [void]$script:DetachGo.Set() } }
+            finally { $script:DetachGo.Dispose() }
         }
     }
 }
 $script:Detached = $env:HELPER_DETACH -match '^Local\\HelperMCP-[0-9a-f]{32}$' -and $PSCommandPath -eq (Join-Path $StateDir ('detach-' + ($env:HELPER_DETACH -split '-')[-1] + '.ps1'))
 if ($script:Detached) { Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue }
-try { Start-Helper }
+try { Invoke-HelperSession }
 finally { $ErrorActionPreference = $prevEAP }

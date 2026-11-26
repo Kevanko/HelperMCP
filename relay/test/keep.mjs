@@ -48,6 +48,17 @@ saved.token = fs.readFileSync(TOKEN_FILE, 'utf8').trim();   // the agent wrote t
 assert.ok(saved.token, 'the agent saved a non-empty token');
 console.log('kept session saved ok');
 
+if (PS) {
+  const duplicate = startAgent(true);
+  await waitFor(() => duplicate.exitCode !== null, 'duplicate Windows launcher exits', 30000);
+  assert.equal(duplicate.exitCode, 0, agentOut);
+  assert.match(agentOut, /Helper (?:is already running)|Helper уже работает/);
+  const active = JSON.parse((await call('session_log', { session: code })).text);
+  assert.ok(!active.events.some(e => e.type === 'resumed'), 'second launcher registered the saved session');
+  assert.match((await call('run',{session:code,command:'echo original-still-running'})).text, /original-still-running/);
+  console.log('Duplicate Windows launcher leaves the original saved session in control PASS');
+}
+
 // the PC dies (reboot / power): the session must stay, with the same code, offline
 killAgent(agent);
 await sleep(6000);   // longer than IDLE_MS (3 s): a plain session would be gone by now

@@ -151,8 +151,8 @@
       function accessButton(s) {
         if (s.ended) return el('span', { class: 'mut', text: 'Ждём запуска Helper' });
         if (s.access === 'active') return null;
-        if (s.access === 'pending') return el('span', { class: 'waiting', role: 'status', text: 'Ждём согласия' });
-        return el('button', { class: 'go', disabled: !s.online || s.access === 'pending', onclick: async () => {
+        if (s.access === 'pending') return el('span', { class: 'waiting', role: 'status', text: 'Ждём ответа на устройстве' });
+        return el('button', { class: 'go', disabled: !s.online, onclick: async () => {
           try {
             const info = el('p', { role: 'status', text: 'На устройстве появится окно подтверждения.' });
             await modal('Запрос доступа', info, {
@@ -163,7 +163,13 @@
                 try { await call('request-access', { code: s.code }); return true; }
                 catch (e) {
                   info.textContent = 'Запрос завершён.';
-                  if (e.status === 409) throw new Error('Доступ не подтверждён. Проверьте статус устройства перед повторным запросом.');
+                  if (e.status === 409) {
+                    if (/pending access request/i.test(e.message)) throw new Error('Запрос уже на устройстве. Дождитесь ответа или истечения срока.');
+                    if (/offline|ending/i.test(e.message)) throw new Error('Устройство отключилось или завершает сеанс.');
+                    if (/timed out/i.test(e.message)) throw new Error('Helper не ответил вовремя. Проверьте связь с устройством.');
+                    if (/did not approve/i.test(e.message)) throw new Error('Пользователь отклонил запрос или время ответа истекло.');
+                    if (/wait before/i.test(e.message)) throw new Error('Подождите несколько секунд перед следующим запросом.');
+                  }
                   throw e;
                 }
                 finally { await draw(); }
@@ -171,7 +177,7 @@
             });
             await draw();
           } catch (e) { guard(e); }
-        } }, s.access === 'pending' ? 'Ждём подтверждения' : 'Попросить доступ');
+        } }, 'Попросить доступ');
       }
       function forgetButton(s) {
         return el('button', { title: 'Удалить сохранённое устройство', onclick: async () => {
@@ -179,16 +185,24 @@
           try { await call('forget', { code: s.code }); await draw(); } catch (e) { guard(e); }
         } }, 'Забыть');
       }
+      let drawRevision = 0;
       const draw = async () => {
+        const revision = ++drawRevision;
         try {
           const rows = await call('sessions');
+          if (revision !== drawRevision) return;
+          const previous = body.querySelector('.table-scroll');
+          const active = document.activeElement;
+          const activeRow = active?.closest('tr[data-code]');
+          const activeButtons = activeRow ? Array.from(activeRow.querySelectorAll('button')) : [];
+          const activeLabel = activeButtons.includes(active) ? active.getAttribute('aria-label') || active.title || active.textContent : null;
+          const scrollLeft = previous?.scrollLeft || 0, scrollTop = previous?.scrollTop || 0;
           body.replaceChildren(rows.length ? el('div', { class: 'table-scroll', role: 'region', 'aria-label': 'Устройства', tabindex: '0' },
             el('table', null, el('thead', null, el('tr', null, ['', 'Session', 'Device', 'State', 'Mode', 'Last seen', 'IP', 'Actions'].map((h) => el('th', { text: h, scope: 'col' })))),
-            el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off' },
+            el('tbody', null, rows.map((s) => el('tr', { class: s.online ? '' : 'off', 'data-code': s.code },
               el('td', { class: 'pv' }, previewTile(s)),
               el('th', { scope: 'row' }, el('div', { class: 'code', text: s.code }), s.note ? el('div', { class: 'recent', text: s.note }) : null),
               el('td', null, el('div', { text: s.user + '@' + s.host }), el('div', { class: 'recent', text: s.os, title: s.os }),
-                s.recent.length ? el('div', { class: 'recent', text: s.recent.map((r) => r.tool).join(' · ') }) : null,
                 el('div', { class: 'device-switches', 'aria-label': 'Настройки устройства ' + s.code },
                   ...Object.keys(appearance).map((key) => deviceToggle(key, !!s[key], async (e) => {
                     e.currentTarget.disabled = true;
@@ -201,6 +215,15 @@
               el('td', { class: 'ac' }, el('div', { class: 'acts' }, accessButton(s), forgetButton(s), s.ended ? null : el('button', { class: 'go', disabled: s.access !== 'active', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
                 el('button', { title: 'glow colour and task text for this device', onclick: () => lookBox(s).then(draw).catch(guard) }, label('eye', 'Look')),
                 s.ended ? null : el('button', { class: 'danger', title: 'end the session', onclick: async () => { if (!(await confirmBox('End session ' + s.code + '?', 'The helper on ' + (s.host || 'that device') + ' is told to stop and the session closes.', 'End session'))) return; try { await call('end', { code: s.code }); draw(); } catch (e) { guard(e); } } }, label('power', 'End'))))))))) : el('p', { class: 'mut', text: 'No sessions yet. Share the link from `helpermcp link` with someone who needs help.' }));
+          const table = body.querySelector('.table-scroll');
+          const row = activeRow && Array.from(table?.querySelectorAll('tr[data-code]') || []).find((item) => item.dataset.code === activeRow.dataset.code);
+          const button = activeLabel && Array.from(row?.querySelectorAll('button:not(:disabled)') || [])
+            .find((item) => (item.getAttribute('aria-label') || item.title || item.textContent) === activeLabel);
+          if (table) {
+            if (active === previous || (activeRow && !button)) table.focus({ preventScroll: true });
+            else button?.focus({ preventScroll: true });
+            table.scrollTo(scrollLeft, scrollTop);
+          }
         } catch (e) { guard(e); }
       };
       refreshDevices = draw; draw(); timer = setInterval(() => { draw(); top(); }, 3000);

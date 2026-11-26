@@ -64,9 +64,11 @@ td.pv,th:first-child{width:1%;padding-right:.2rem}
 .table-scroll:focus-visible{outline:2px solid var(--g);outline-offset:2px}
 .table-scroll thead th{position:sticky;inset-block-start:0;z-index:1;background:var(--panel)}
 .table-scroll tbody th{font-weight:normal;border-bottom:1px solid rgba(22,72,43,.4);white-space:nowrap}
-.table-scroll .device-switches{flex-wrap:nowrap}
+.table-scroll .device-switches{display:inline-flex;flex-wrap:nowrap;width:max-content}
 .table-scroll .device-toggle{flex:none}
 .table-scroll .code{white-space:nowrap}
+.table-scroll td:nth-child(3){min-inline-size:14rem}
+.table-scroll td:nth-child(4){white-space:nowrap}
 .waiting{align-self:center;color:var(--warn)}
 @container (width < 1020px){
   .table-scroll td.ac,.table-scroll th:last-child{white-space:normal;width:auto}

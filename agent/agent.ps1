@@ -1276,7 +1276,9 @@ namespace K__BUILD__ {
     public static volatile bool Esc, Paused, Final, OpSeen, VT, StRestoreOk, Unattended;      // Esc = the user confirmed the end; Unattended = mode 3, Esc pauses instead of opening the end menu
     public static string Relay, Token, ConfirmEnd, StPaused, StRestore, Continuing;
     public static string[] MenuLabels;
-    public static string MenuHelp, MenuTitle, MenuStatus;
+    public static string MenuHelp, MenuTitle, MenuStatus, MenuSettings, MenuBack, MenuEndTitle;
+    public static volatile int SettingsSelection = -1;
+    public static volatile string ReaderError;
     public static volatile bool MenuOpen, OpenMenu;
     public static volatile int MenuAction;
     public static System.IO.StreamWriter Overlay;
@@ -1311,29 +1313,30 @@ namespace K__BUILD__ {
       int count = Math.Min(labels.Length, Math.Max(1, height - 5));
       int first = Math.Max(0, Math.Min(selected - count + 1, labels.Length - count));
       var lines = new string[count + 4];
-      lines[0] = C("1;36", Fit(title, width));
+      lines[0] = C("1;38;5;179", Fit(title, width));
       lines[1] = Fit(status ?? "", width);
       lines[2] = C("2;36", new string('\u2500', Math.Min(width, 56)));
       for (int row = 0; row < count; row++) {
         int index = first + row;
         string line = Fit((index == selected ? " \u276f " : "   ") + labels[index], width);
-        lines[row + 3] = index == selected ? C("1;30;46", line.PadRight(Math.Min(width, Math.Max(32, line.Length)))) : line;
+        lines[row + 3] = index == selected ? C("1;30;48;5;179", line.PadRight(Math.Min(width, Math.Max(32, line.Length)))) : line;
       }
       lines[count + 3] = C("2", Fit(help, width));
       return lines;
     }
-    public static int Choose(string[] labels, string title, string help) {
-      int selected = 0, width = 0, height = 0, drawn = -1;
+    public static int Choose(string[] labels, string title, string help, int initial = 0) {
+      int selected = initial, width = 0, height = 0, drawn = -1;
       string shownStatus = null;
-      if (VT) Console.Write("\u001b[?1049h\u001b[?25l");
+      if (VT) Console.Write("\u001b[?1049h\u001b[r\u001b[?25l");
       try {
         while (true) {
           if (Thread.CurrentThread == reader && !reading) return -1;
           string status = MenuOpen ? MenuStatus ?? "" : "";
           if (selected != drawn || width != Console.WindowWidth || height != Console.WindowHeight || shownStatus != status) {
             width = Console.WindowWidth; height = Console.WindowHeight; drawn = selected; shownStatus = status;
-            if (VT) Console.Write("\u001b[H\u001b[2J"); else Console.Clear();
-            Console.WriteLine(String.Join(Environment.NewLine, MenuLines(labels, title, status, help, selected, width, height)));
+            string frame = String.Join(Environment.NewLine, MenuLines(labels, title, status, help, selected, width, height));
+            if (VT) Console.Write("\u001b[r\u001b[H\u001b[2J" + frame);
+            else { Console.Clear(); Console.Write(frame); }
           }
           if (!Console.KeyAvailable) { Thread.Sleep(35); continue; }
           var key = Console.ReadKey(true).Key;
@@ -1346,24 +1349,44 @@ namespace K__BUILD__ {
           if (key == ConsoleKey.Escape || key == ConsoleKey.Backspace) return -1;
         }
       } finally {
-        if (VT) Console.Write("\u001b[?25h\u001b[?1049l");
+        if (VT) Console.Write("\u001b[?1049l\u001b[?25h");
       }
     }
     static void Menu() {
       if (MenuLabels == null) return;
       int choice;
       MenuOpen = true;
-      try { choice = Choose(MenuLabels, MenuTitle, MenuHelp); }
-      finally { MenuOpen = false; }
-      if (choice < 0) return;
-      if (choice == MenuLabels.Length - 1) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(ConfirmEnd); }
-      else if (choice != 0) { MenuAction = choice; Post("/a/wake", "{}"); }
+      try {
+        var labels = MenuLabels;
+        int settings = SettingsSelection;
+        SettingsSelection = -1;
+        if (settings < 0) {
+          string[] home = { labels[0], labels[1], MenuSettings, labels[10], labels[11], labels[12] };
+          int[] actions = { 0, 1, -1, 10, 11, 12 };
+          int item = Choose(home, MenuTitle, MenuHelp);
+          if (item < 0) return;
+          choice = actions[item];
+        } else choice = -1;
+        if (choice == -1) {
+          string[] options = new string[8];
+          Array.Copy(labels, 2, options, 0, options.Length);
+          int item = Choose(options, MenuTitle + " / " + MenuSettings, MenuHelp, Math.Max(0, settings));
+          if (item < 0) { OpenMenu = true; return; }
+          choice = item + 2;
+        }
+        if (choice == 12 && Choose(new[] { MenuBack, labels[12] }, MenuEndTitle, MenuHelp) != 1) {
+          OpenMenu = true;
+          return;
+        }
+      } finally { MenuOpen = false; }
+      if (choice == 12) { Final = true; Esc = true; Post("/a/bye", "{\"final\":true}"); Say(ConfirmEnd); }
+      else if (choice > 0) { MenuAction = choice; Post("/a/wake", "{}"); }
     }
     public static void Start() {
       if (reader != null && reader.IsAlive) return;
-      reading = true; Esc = false; Final = false; Paused = false;
+      reading = true; Esc = false; Final = false; Paused = false; ReaderError = null;
       ConsoleKey discarded; while (Q.TryDequeue(out discarded)) { }
-      reader = new Thread(() => { try { while (reading) { if (OpenMenu) { OpenMenu = false; Menu(); continue; } if (!Console.KeyAvailable) { Thread.Sleep(20); continue; } var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape) Menu(); else Q.Enqueue(k.Key); } } catch { } });
+      reader = new Thread(() => { try { while (reading) { if (OpenMenu) { OpenMenu = false; Menu(); continue; } if (!Console.KeyAvailable) { Thread.Sleep(20); continue; } var k = Console.ReadKey(true); if (k.Key == ConsoleKey.Escape || (k.Key == ConsoleKey.P && (k.Modifiers & ConsoleModifiers.Control) != 0)) Menu(); else Q.Enqueue(k.Key); } } catch (Exception e) { ReaderError = e.GetType().Name; } });
       reader.IsBackground = true; reader.Start();
     }
     public static void Stop() { reading = false; if (reader != null && reader != Thread.CurrentThread) reader.Join(1000); }
@@ -3873,10 +3896,17 @@ function Set-ConsoleMenu {
         $look[$i] + ' · ' + $(if ($enabled[$i]) { T 'вкл' 'on' } else { T 'выкл' 'off' })
     }
     [K__BUILD__.Keys]::MenuLabels = @((T 'Продолжить' 'Continue'), (T 'Журнал' 'Recent log'), $startup, $quiet) + $items + @((T 'Отозвать доступ' 'Revoke access'), (T 'Перейти в область уведомлений' 'Detach to notification area'), (T 'Завершить сеанс' 'End session'))
-    [K__BUILD__.Keys]::MenuTitle = 'HelperMCP   /   ' + (T 'Управление' 'Controls')
+    [K__BUILD__.Keys]::MenuTitle = 'HelperMCP   /   ' + (T 'Сеанс поддержки' 'Support session')
+    [K__BUILD__.Keys]::MenuSettings = T 'Настройки' 'Settings'
+    [K__BUILD__.Keys]::MenuBack = T 'Вернуться' 'Go back'
+    [K__BUILD__.Keys]::MenuEndTitle = T 'Завершить сеанс? Код перестанет работать.' 'End this session? The code will stop working.'
     [K__BUILD__.Keys]::MenuHelp = T '↑ ↓ выбор   Enter / Пробел применить   Esc назад' '↑ ↓ select   Enter / Space apply   Esc back'
 }
 function Read-ConsoleMenu {
+    if ($script:KeysOn -and [K__BUILD__.Keys]::ReaderError) {
+        Write-AgentLog ('console input stopped: ' + [K__BUILD__.Keys]::ReaderError)
+        $script:KeysOn = $false
+    }
     $choice = [K__BUILD__.Keys]::MenuAction
     if (-not $choice) { return }
     [K__BUILD__.Keys]::MenuAction = 0
@@ -3917,6 +3947,7 @@ function Read-ConsoleMenu {
             [void](Do-Look $look)
             Write-Host ([K__BUILD__.Keys]::MenuLabels[$choice]) -ForegroundColor Green
         } catch { Write-Orange (T 'Настройка не сохранена. Проверьте подключение.' 'Could not save the setting. Check the connection.') }
+        [K__BUILD__.Keys]::SettingsSelection = $choice - 2
         [K__BUILD__.Keys]::OpenMenu = $true
         return
     }
@@ -3938,6 +3969,7 @@ function Read-ConsoleMenu {
         Write-AgentLog ('could not save console preferences: ' + $_.Exception.GetType().Name)
         Write-Orange (T 'Не удалось сохранить настройку.' 'Could not save the setting.')
     }
+    [K__BUILD__.Keys]::SettingsSelection = $choice - 2
     [K__BUILD__.Keys]::OpenMenu = $true
 }
 function Test-Ping($h) { try { (New-Object Net.NetworkInformation.Ping).Send($h, 1200).Status -eq 'Success' } catch { $false } }
@@ -4018,12 +4050,11 @@ function Status-Text {
         default { @('wait', ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…'))) }
     }
 }
-function Show-Status {   # redraw only the status row (row 5) of the pinned header
+function Show-Status {
     $status = Status-Text
     [K__BUILD__.Keys]::MenuStatus = "  $($script:Code)   |   $($status[1])"
     try { [K__BUILD__.Keys]::OpSeen = $script:OperatorSeen; if (-not [K__BUILD__.Keys]::Paused) { $xx = Status-Text; [K__BUILD__.Keys]::StRestore = $xx[1]; [K__BUILD__.Keys]::StRestoreOk = ($xx[0] -eq 'ok') } } catch { }
-    if (-not $script:VT -or -not $script:HdrDrawn -or [K__BUILD__.Keys]::MenuOpen) { return }
-    try { $e = [char]27; $x = Status-Text; $col = if ($x[0] -eq 'ok') { "$e[1;32m" } else { "$e[1;38;5;208m" }; [Console]::Write("${e}7$e[5;1H$e[2K" + [K__BUILD__.Keys]::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })) + "${e}8") } catch { }
+
 }
 function Draw-Header($code, $copied) {
     if ($script:Detached -or [K__BUILD__.Keys]::MenuOpen) { return }
@@ -4038,11 +4069,9 @@ function Draw-Header($code, $copied) {
         $k::Row((T 'Передайте код оператору поддержки.' 'Share the code with your support operator.'), '36'),
         $k::Row(((T 'Режим' 'Mode') + ' · ' + $script:Mode + '   |   ' + $relayHost), '2;36'),
         $k::Row($x[1], $(if ($x[0] -eq 'ok') { '1;32' } else { '1;38;5;208' })),
-        $k::Row((T 'Esc · Настройки, журнал и завершение сеанса' 'Esc · Settings, log and end session'), '36'),
+        $k::Row((T 'Ctrl+P / Esc · Открыть меню' 'Ctrl+P / Esc · Open menu'), '36'),
         $k::Bottom())
     foreach ($l in $lines) { if ($script:VT) { [Console]::WriteLine($l) } else { Write-Host $l -ForegroundColor Yellow } }
-    $script:HdrDrawn = $true
-    if ($script:VT) { try { $h = [Console]::WindowHeight; [Console]::Write("$e[8;${h}r$e[8;1H") } catch { } }   # the header stays on top, the log scrolls below it
 }
 function Flash-Console {
     try { $f = New-Object 'H.U__BUILD__+FLASHWINFO'; $f.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($f); $f.hwnd = [H.U__BUILD__]::GetAncestor([H.U__BUILD__]::GetConsoleWindow(), 3); $f.dwFlags = 15; $f.uCount = 8; [void][H.U__BUILD__]::FlashWindowEx([ref]$f) } catch { }
@@ -4068,7 +4097,7 @@ function Check-Esc {
 function Ask-Permission($name, $a) {
     $g = $AskGroup[$name]; if ($script:Allowed[$g]) { return }
     $fg = Focus-Before-Question; $d = @(Describe-Action $name $a)
-    if ($script:Detached -or [K__BUILD__.Keys]::MenuOpen) {
+    if ($script:Detached -or -not $script:KeysOn -or [K__BUILD__.Keys]::MenuOpen) {
         $message = (T 'Разрешить действие:' 'Allow action:') + "`n" + ($d -join "`n")
         if (-not (Confirm-LocalAccess (Cut $message 450) 35)) { throw 'The user denied this action or did not respond. Do not repeat it.' }
         Check-Esc
@@ -4392,9 +4421,7 @@ function Start-Helper {
         $copied = $false; try { Set-Clipboard -Value $code; $copied = $true } catch { try { $code | clip; $copied = $true } catch { } }
         Enable-VT; Draw-Header $code $copied
     }
-    Set-ConsoleMenu
     [K__BUILD__.Keys]::Relay = $RELAY; [K__BUILD__.Keys]::Token = $script:Token; [F__BUILD__.Route]::Token = $script:Token; $script:KeysOn = $false
-    if (-not $script:Detached) { try { [K__BUILD__.Keys]::Start(); $script:KeysOn = $true } catch { } }
     if ($r.look) { $script:GlowOn = [bool]$r.look.glow; $script:SoundOn = [bool]$r.look.sound;if($null -ne $r.look.banner){$script:BannerOn=[bool]$r.look.banner};if($null -ne $r.look.timer){$script:TimerOn=[bool]$r.look.timer} }
     if ($r.look) { $script:CursorOn = [bool]$r.look.cursor; $script:AnimationsOn = [bool]$r.look.animations }
     Set-ConsoleMenu
@@ -4408,7 +4435,11 @@ function Start-Helper {
     $k::StRestore = ([char]0x25CC + ' ' + (T 'Ожидание помощника… он подключается по коду' 'Waiting for the helper to connect with the code…')); $k::StRestoreOk = $false
     if ($r.resumed -and $saved -and $script:Mode -eq 'unattended') { $script:OperatorSeen = $true; Overlay-Send 'state ok' }
     Show-Status
-    if ($script:KeysOn -and -not [Console]::IsInputRedirected) { [K__BUILD__.Keys]::OpenMenu = $true }
+    if (-not $script:Detached -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
+        [K__BUILD__.Keys]::OpenMenu = $true
+        [K__BUILD__.Keys]::Start()
+        $script:KeysOn = $true
+    }
     $fails = 0; $delay = 1.0
     try {
         while ($true) {
@@ -4461,6 +4492,7 @@ function Start-Helper {
             if ($script:EndRequested -or [K__BUILD__.Keys]::Esc) { Write-Host ('  ' + (T 'сеанс завершён (Esc)' 'session ended (Esc)')) -ForegroundColor Yellow; return }
         }
     } finally {
+        if ($script:KeysOn) { [K__BUILD__.Keys]::Stop() }
         Stop-RealtimeInput
         if ($script:PointerProc) { try { $script:PointerProc.StandardInput.Close() } catch { }; $script:PointerProc.Dispose() }
         Cleanup-Children

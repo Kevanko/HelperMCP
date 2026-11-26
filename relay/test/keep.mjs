@@ -26,8 +26,9 @@ const file = path.join(SDIR, 'a.py'); fs.writeFileSync(file, src);
 const TOKEN_FILE = path.join(SDIR, 'token.txt');
 const killAgent = (a) => { if (PS) spawnSync('taskkill', ['/PID', String(a.pid), '/T', '/F']); else a.kill('SIGKILL'); };
 let agentOut = '';
-const startAgent = (again = false) => { const env = { ...process.env, ...(again ? {} : { HELPER_MODE: 'unattended', HELPER_PERSIST: '1' }),   // a restart after a reboot gets no hints: the saved session alone must decide, and nothing may be asked
-    HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_TOKEN_FILE: TOKEN_FILE };
+const startAgent = (again = false, mode = 'unattended', logon = false) => { const env = { ...process.env, ...(again ? {} : { HELPER_MODE: mode, HELPER_PERSIST: '1' }),
+    ...(logon ? { HELPER_LOGON: '1' } : {}),
+    HELPER_STATE_DIR: SDIR, HELPER_NO_AUTOSTART: '1', HELPER_NO_OVERLAY: '1', HELPER_LANG: 'en', HELPER_TOKEN_FILE: TOKEN_FILE };
   const a = PS ? spawn('powershell', ['-NoProfile', '-Command', `[Net.ServicePointManager]::SecurityProtocol=3072; irm ${BASE}/h | iex`], { env }) : spawn('python3', [file], { env }); kids.push(a); a.stdout.on('data', (d) => (agentOut += d)); a.stderr.on('data', (d) => (agentOut += d)); return a; };
 
 let client = new Client({ name: 'keep', version: '0' });
@@ -111,5 +112,76 @@ assert.equal(agent.exitCode, 0, agentOut);
 assert.equal(fs.existsSync(sfile), false, 'ended session retained on disk');
 assert.equal((await sessions()).length, 0, 'restart recreated an ended session');
 console.log('Ended saved session is cleared after HTTP 410 PASS');
+
+// Exercise the actual consent window and cached-mode launch on the isolated Windows runner.
+if (PS && process.env.GITHUB_ACTIONS === 'true') {
+  const responder = path.join(SDIR, 'accept-fixture-dialog.ps1');
+  fs.writeFileSync(responder, [
+    'param([int]$AgentPid)',
+    '$ErrorActionPreference = "Stop"',
+    'Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes',
+    '$element = [Windows.Automation.AutomationElement]',
+    '$pidMatch = [Windows.Automation.PropertyCondition]::new($element::ProcessIdProperty, $AgentPid)',
+    '$titleMatch = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "HelperMCP")',
+    '$match = [Windows.Automation.AndCondition]::new([Windows.Automation.Condition[]]@($pidMatch, $titleMatch))',
+    '$button = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "Allow")',
+    '$until = [DateTime]::UtcNow.AddSeconds(25)',
+    'do {',
+    '  $window = $element::RootElement.FindFirst("Children", $match)',
+    '  if ($window) {',
+    '    $accept = $window.FindFirst("Descendants", $button)',
+    '    if ($accept) {',
+    '      $accept.GetCurrentPattern([Windows.Automation.InvokePattern]::Pattern).Invoke()',
+    '      exit 0',
+    '    }',
+    '  }',
+    '  Start-Sleep -Milliseconds 100',
+    '} while ([DateTime]::UtcNow -lt $until)',
+    'throw "Fixture consent button did not appear"',
+  ].join('\n'));
+  async function approve(target, session) {
+    const responderProc = spawn('powershell',['-NoProfile','-STA','-File',responder,String(target.pid)]);
+    kids.push(responderProc);
+    let details='';
+    responderProc.stderr.on('data',data=>details+=data);
+    const closed=new Promise((resolve,reject)=>{
+      responderProc.once('error',reject);
+      responderProc.once('close',resolve);
+    });
+    const [result,exit] = await Promise.all([call('request_access',{session}),closed]);
+    assert.equal(exit,0,details);
+    assert.ok(!result.err && /Access approved/.test(result.text),result.text);
+  }
+  agent=startAgent(false,'auto');
+  const mode2=await waitFor(async()=>(await sessions()).find(s=>s.online && s.mode==='auto'),'mode 2 registration');
+  const args={session:mode2.code};
+  assert.match((await call('open_viewer',args)).text,/ACCESS_REQUIRED|request access/i);
+  const askedAt=Date.now();
+  await approve(agent,mode2.code);
+  const view=await call('open_viewer',args);
+  assert.ok(!view.err,view.text);
+  const watch=view.text.match(/https?:\/\/\S+?\/v\/[0-9a-f]+(?=\s|$|#)/)[0];
+  await waitFor(()=>fs.existsSync(sfile),'mode 2 saved before process exit');
+  const endedMode2=new Promise(resolve=>agent.once('exit',resolve));
+  killAgent(agent);
+  await endedMode2;
+  agent=startAgent(true,'auto',true);
+  await waitFor(async()=>{
+    const log=JSON.parse((await call('session_log',args)).text);
+    return log.events.some(e=>e.type==='resumed');
+  },'mode 2 saved credential resumed at logon',25000);
+  const resumed=(await sessions()).find(s=>s.code===mode2.code);
+  assert.ok(resumed.online && resumed.mode==='auto' && resumed.kept,'logon lost mode 2 or its code');
+  const blocked=await call('run',{...args,command:'echo should-not-run'});
+  assert.ok(blocked.err && /ACCESS_REQUIRED/.test(blocked.text),blocked.text);
+  assert.equal((await fetch(watch)).status,404,'old viewer remained valid across restart');
+  const resumedToken=fs.readFileSync(TOKEN_FILE,'utf8').trim();
+  assert.equal((await fetch(BASE+'/a/input',{headers:{Authorization:'Bearer '+resumedToken}})).status,409,'native input was available without consent');
+  await sleep(Math.max(0,10_100-(Date.now()-askedAt)));
+  await approve(agent,mode2.code);
+  assert.match((await call('run',{...args,command:'echo approved-again'})).text,/approved-again/);
+  assert.ok(!(await call('end_session',args)).err);
+  console.log('Windows mode 2 logon keeps its code, revokes the old viewer and requires fresh local consent PASS');
+}
 console.log('ALL PASSED');
 stop(); fs.rmSync(STATE, { force: true }); process.exit(0);

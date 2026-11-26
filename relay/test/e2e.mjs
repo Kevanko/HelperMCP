@@ -359,6 +359,49 @@ if (process.env.GUI) {   // wait_screen: one picture when the screen changed / s
   assert.ok(!w.isError && /No change|changed|settled/.test(txt(w)), 'wait_screen answers: ' + txt(w).slice(0, 80)); console.log('wait_screen ok');
 }
 console.log('viewer ok');
+// Measure actual Windows capture -> encoder -> relay -> viewer bytes on the hosted CI desktop.
+// Keep this separate from the optional desktop movement and JPEG adaptation suite.
+if (useps && process.env.GITHUB_ACTIONS === 'true' && !process.env.GUI) {
+  const started = performance.now();
+  const abort = new AbortController();
+  const deadline = setTimeout(() => abort.abort(), 15_000);
+  let reader;
+  try {
+    const live = await fetch(vurl + '/live?codec=h264', {signal:abort.signal});
+    assert.equal(live.status,200);
+    reader = live.body.getReader();
+    let buffer = Buffer.alloc(0);
+    let config = false;
+    let firstKeyAt;
+    const received = [];
+    while (firstKeyAt === undefined || performance.now() - firstKeyAt < 4000) {
+      const {value,done} = await reader.read();
+      assert.equal(done,false,'Windows live upload ended before the measurement');
+      buffer = Buffer.concat([buffer,value]);
+      while (buffer.length >= 5) {
+        const length = buffer.readUInt32BE(0);
+        if (buffer.length < 5 + length) break;
+        const type = String.fromCharCode(buffer[4]);
+        if (type === 'C') config = true;
+        if (type === 'V') {
+          const now = performance.now();
+          if (config && (buffer[5] & 1) && firstKeyAt === undefined) firstKeyAt = now;
+          if (firstKeyAt !== undefined) received.push(now);
+        }
+        assert.notEqual(type,'K','Windows H.264 capture unexpectedly fell back to JPEG');
+        buffer = buffer.subarray(5 + length);
+      }
+    }
+    assert.ok(received.length > 1,'no continuing video frames after the key frame');
+    const fps = (received.length - 1) * 1000 / (received.at(-1) - firstKeyAt);
+    const largestGap = Math.max(...received.slice(1).map((time,index)=>time-received[index]));
+    console.log(`Windows live loopback: first key ${Math.round(firstKeyAt-started)} ms, ${fps.toFixed(1)} fps, longest frame gap ${Math.round(largestGap)} ms`);
+  } finally {
+    clearTimeout(deadline);
+    abort.abort();
+    await reader?.cancel().catch(()=>{});
+  }
+}
 // files from the live view (control link only): browse, download, drop a file onto the PC; the AI hears about the upload
 const ctl = { 'x-ctl': /#c=([0-9a-f]+)/.exec(vtxt)[1] };
 assert.equal((await fetch(vurl + '/ls?path=' + encodeURIComponent(tmp))).status, 403, 'view-only link cannot browse files');
@@ -515,7 +558,7 @@ if (process.env.GUI) {
       '$end = [DateTime]::UtcNow.AddSeconds(40); while ([DateTime]::UtcNow -lt $end) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 50 }'].join('\n'));
     cover = spawn('powershell', ['-NoProfile', '-STA', '-File', cf]); kids.push(cover); await new Promise((x) => setTimeout(x, 2500));
   }
-  const ac = new AbortController(), lr = await fetch(vurl + '/live', { signal: ac.signal });
+  const ac = new AbortController(), lr = await fetch(vurl + '/live?codec=jpeg', { signal: ac.signal });
   assert.equal(lr.status, 200);
   const rd = lr.body.getReader(), seen = [], t0 = Date.now(); let lbuf = Buffer.alloc(0);
   const mover = (async () => { await new Promise((x) => setTimeout(x, 1500)); for (let i = 0; i < 8; i++) await tool('move', { session: code, x: 300 + i * 70, y: 320 + (i % 2) * 60 }); })();

@@ -1748,7 +1748,12 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
 
     if (p.startsWith('/a/')) {
       const [code, s] = byToken(req);
-      if (!s) return json(res, 401, { error: 'unknown token' });
+      if (!s) {
+        if (p === '/a/poll' && req.method === 'GET' && revokedTokens.has(sha(bearer(req)))) {
+          return json(res, 410, { error: 'this session was ended' });
+        }
+        return json(res, 401, { error: 'unknown token' });
+      }
       s.lastSeen = Date.now(); s.lastSeenKnown = true; s.awaitingReconnect = false; s.restoredAt = 0;
       if (p === '/a/poll') save();
       if (p === '/a/launch-preferences' && req.method === 'POST') {

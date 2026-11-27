@@ -70,6 +70,9 @@ try {
   const remembered = (await (await admin('sessions')).json()).find(row=>row.code===previous.code);
   assert.ok(remembered?.ended && remembered.glow && !remembered.online,'End or relay restart lost the device record or its appearance');
   assert.equal((await admin('open',{code:previous.code})).status,404,'ended device offered a control link');
+  const pollWith = (token) => fetch(base+'/a/poll?w=0',{headers:{Authorization:'Bearer '+token}});
+  assert.equal((await pollWith(previous.token)).status,410,'an ended agent was sent through registration again');
+  assert.equal((await pollWith('unknown-fixture-token')).status,401,'an unknown credential was treated as an explicit End');
   assert.equal((await post('/a/register',{...fixture,resume:previous.code,resume_token:previous.token},'')).status,410);
   const forgotten = await (await post('/a/register',fixture,'')).json();
   assert.equal(forgotten.code,previous.code,'an intentional fresh run lost its remembered device');

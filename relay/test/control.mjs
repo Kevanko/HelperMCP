@@ -168,7 +168,8 @@ try {
     assert.equal(mutation.isError, true, 'bot input collided with manual control');
     assert.match(mutation.content[0].text, /TAKEOVER/);
     assert.equal((await post(viewer+'/takeover',{on:true,shared:true},CH)).status,200);
-    const sharedKey = () => observers[0].callTool({ name: 'press_key', arguments: { session: first.code, keys: 'enter' } });
+    const sharedKey = (observer = observers[0], keys = 'enter') =>
+      observer.callTool({ name: 'press_key', arguments: { session: first.code, keys } });
     assert.ok(!(await sharedKey()).isError, 'shared input blocked the bot on an idle desktop');
     assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).artwork,operatorPointer.toString('base64'),
       'authorized bot input did not carry the configured cursor');
@@ -176,14 +177,16 @@ try {
     const mouse = (phase,seq) => post(viewer+'/input',{a:'pointer',phase,gesture,seq,x:20,y:40},CH);
     assert.equal((await mouse('down',1)).status,200);
     const keyCount = commands.filter(c=>c.code===first.code&&c.tool==='press_key').length;
-    const queuedKey = sharedKey();
-    assert.equal(await Promise.race([queuedKey.then(()=> 'finished'),sleep(220).then(()=> 'held')]),'held','bot input ran during an active mouse press');
+    const queuedKeys = [sharedKey(observers[0], 'enter'), sharedKey(observers[1], 'tab')];
+    assert.equal(await Promise.race([...queuedKeys.map(key=>key.then(()=> 'finished')),sleep(220).then(()=> 'held')]),'held','bot input ran during an active mouse press');
     assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').length,keyCount);
     const background = await observers[1].callTool({ name: 'sysinfo', arguments: { session: first.code } });
     assert.ok(!background.isError,'shared gesture blocked observation of the same desktop');
     assert.equal((await mouse('up',2)).status,200);
-    assert.ok(!(await queuedKey).isError,'queued bot input did not resume after the manual gesture');
-    assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).args.after_viewer_input,true,'bot kept its pre-gesture focus bookmark');
+    assert.ok((await Promise.all(queuedKeys)).every(key=>!key.isError),'queued bot input did not resume after the manual gesture');
+    const afterGesture = commands.filter(c=>c.code===first.code&&c.tool==='press_key').slice(keyCount);
+    assert.deepEqual(afterGesture.map(c=>c.args.keys).sort(),['enter','tab'],'both agents must execute exactly once');
+    assert.equal(afterGesture[0].args.after_viewer_input,true,'bot kept its pre-gesture focus bookmark');
     assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').at(-1).artwork,undefined,'acknowledged artwork was resent');
     assert.ok(commands.filter(c=>c.code===first.code&&c.tool==='viewer_pointer').every(c=>c.artwork===undefined),
       'manual input received the operator cursor');
@@ -195,8 +198,8 @@ try {
     first.holdPress = new Promise(resolve => { finishBotKey = resolve; });
     const runningKey = sharedKey();
     try {
-      for (let n=0; n<40 && commands.filter(c=>c.code===first.code&&c.tool==='press_key').length<keyCount+2; n++) await sleep(25);
-      assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').length,keyCount+2);
+      for (let n=0; n<40 && commands.filter(c=>c.code===first.code&&c.tool==='press_key').length<keyCount+3; n++) await sleep(25);
+      assert.equal(commands.filter(c=>c.code===first.code&&c.tool==='press_key').length,keyCount+3);
       const busy = await post(viewer+'/input',{a:'click',x:20,y:40},CH);
       assert.equal(busy.status,409);
       assert.equal((await busy.json()).error,'desktop-busy','manual click overlapped a running bot key');

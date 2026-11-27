@@ -368,7 +368,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   const s = sessions.get(String(code).toUpperCase());
   if (!s) return Promise.reject(new Error(`No such session "${code}" (it was never there, or the user closed the helper / pressed Esc). If you were working on it: STOP, do not retry, tell the operator. Use list_sessions.`));
   if (s.paused && tool !== 'bye' && !opts.release && !(opts.human && (tool === 'screenshot' || tool === 'stream' || tool === 'look'))) {   // the live viewer keeps showing the screen while it is paused
-    return Promise.reject(new Error('PAUSED by the user (they pressed Esc and chose Pause). The session is kept. Do not retry now: tell the operator, then use wait_online (it also waits for the user to resume) or check session_log.'));
+    return Promise.reject(new Error('PAUSED by the user. The session is kept. Use wait_online to wait for the user to resume, or check session_log.'));
   }
   if (s.ending && tool !== 'bye') return Promise.reject(new Error('The session is ending.'));
   if (!hasAccess(s) && !standbyTools.has(tool)) return Promise.reject(new Error('ACCESS_REQUIRED: request access and wait for the user to approve it on the device.'));
@@ -862,7 +862,7 @@ const tools = [
       const l = makeViewer(c);
       return { text: `Watch (view only, safe to share): ${l.watch}\nControl (click, drag, scroll, type, take over from the helper; keep it private): ${l.control}` };
     } },
-  { name: 'end_session', description: 'Disconnect the agent and forget the session.', props: {}, session: true,
+  { name: 'end_session', description: 'Stop Helper and end the session. A remembered device stays in the admin list.', props: {}, session: true,
     run: async (code) => { await endSession(code.toUpperCase()); return { text: 'ended' }; } },
 ];
 const byName = new Map(tools.map((t) => [t.name, t]));
@@ -1350,7 +1350,7 @@ addEventListener('pointerup',()=>{pan=null});
 $('zr').onclick=()=>{zoom=1;tx=0;ty=0;applyZoom()};
 // disconnect: stop watching (the stream closes at once; the helper stops filming 15 s after the last viewer leaves); the same button reconnects
 function disconnectViewer(final=false,message=L.end){if(gone)return;gone=true;ended=true;control=false;viewerAbort.abort();if(abort)abort.abort();resetPictures();try{if(dec)dec.close()}catch(_){}kb.style.display='none';$('tag').style.display='none';cv.className='';$('ctl').textContent=L.take;$('ctl').className='';document.documentElement.style.setProperty('--kb','0px');g.clearRect(0,0,cv.width,cv.height);if(window.Panels)Panels.suspend();document.querySelectorAll('button,input,select,textarea').forEach(e=>{if(e.id!=='disc'&&e.id!=='fs')e.disabled=true});dispatchEvent(new Event('helper-disconnected'));if(final){st.textContent=message;dot.className='bad';$('disc').disabled=true;return}status('','');$('disc').textContent=ru?'Подключиться':'Reconnect';return nativeFetch(base+'/disconnect',{method:'POST',keepalive:true,headers:{'content-type':'application/json','x-ctl':CTL,'x-viewer-client':viewerClient},body:JSON.stringify({client:viewerClient})}).then(r=>{if(!r.ok)throw new Error('disconnect failed')}).catch(()=>{st.textContent=ru?'отключено локально; сервер недоступен':'disconnected locally; server unavailable'})}
-$('disc').textContent=ru?'Отключиться':'Disconnect';$('disc').onclick=()=>{if(gone){location.reload();return}disconnectViewer()};addEventListener('pagehide',()=>disconnectViewer());
+$('disc').textContent=ru?'Остановить просмотр':'Stop watching';$('disc').onclick=()=>{if(gone){location.reload();return}disconnectViewer()};addEventListener('pagehide',()=>disconnectViewer());
 </script>
 <script src=/assets/viewer-control.js></script><link rel=stylesheet href=/assets/panels.css><script src=/assets/panels.js></script><script>Panels.init({base:base,CTL:CTL,ru:ru})</script>`;
 }
@@ -1720,7 +1720,6 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         old.info.access_request = old.info.access_request || info.access_request === 1;
         old.fastInput?.end();old.info.viewer_realtime=info.viewer_realtime===1?1:0;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
-        console.log(`~ ${want} resumed from ${ip}`);
         return json(res, 200, { code: want, token: info.resume_token, resumed: true, look: effLook(old) });
       }
       if (old) return json(res, 403, { error: 'invalid resume credentials' });

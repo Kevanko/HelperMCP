@@ -10,10 +10,10 @@
   const button = $('ctl'); button.hidden = false; button.textContent = ru ? 'Включить ввод' : 'Enable input';
   let desiredInput = true, claiming = false, online = false, desktopFocused = false;
   const endButton = $('disc');
-  endButton.textContent = ru ? 'Завершить' : 'End session';
-  endButton.title = ru ? 'Завершить сеанс Helper на устройстве' : 'End the Helper session on the device';
+  endButton.textContent = ru ? 'Завершить сеанс' : 'End session';
+  endButton.title = ru ? 'Остановить Helper и закрыть его окно на устройстве' : 'Stop Helper and close its window on the device';
   endButton.onclick = async () => {
-    if (!confirm(ru ? 'Завершить сеанс на устройстве?' : 'End the session on the device?')) return;
+    if (endButton.disabled || !confirm(ru ? 'Остановить Helper и закрыть его окно на устройстве?' : 'Stop Helper and close its window on the device?')) return;
     endButton.disabled = true;
     try {
       await request('/end', {});

@@ -75,7 +75,7 @@ They open it, run the line for their system and send you the code. Tell your AI:
 
 - **Nothing is installed.** The PC agent runs from memory and is gone when the window closes.
 - **Everything is visible.** A glowing screen edge, a label with the current step, the AI's own smooth pointer.
-- **They stay in charge.** By default every action asks `Y / A(lways) / N`. **Esc** pauses or ends the session.
+- **They stay in charge.** By default every action asks `Y / A(lways) / N`. On Windows, **Esc** opens the Helper menu, where they can end the session.
 - **Kept sessions reconnect.** After internet loss, VPN changes or reboot, the agent retries with the saved code when a working route is available.
 - **Detach to the notification area on Windows.** In the Helper console, press Esc and choose **Detach to notification area**. The Helper launcher can close once the icon is ready. Right-click the icon and choose **End Helper session** to stop the agent. Modes 1 and 2 require a new local approval after the handoff. In mode 1, individual requests appear in a dialog while detached. Detach applies to the current run. The separate autostart setting controls the next logon.
 
@@ -214,4 +214,4 @@ helpermcp link                # ссылка для друга
 
 **Остальное:** `helpermcp help` — все команды, `helpermcp` — панель, `helpermcp domain help.example.com` — добавить домен потом, `helpermcp config` — сменить домен / IP / порт, `helpermcp key` — новый ключ, `helpermcp update` — обновиться.
 
-**Друг всё видит и всё решает:** светящаяся рамка, плашка с текущим шагом, плавный курсор ИИ; каждое действие по умолчанию спрашивает `Y / A / N`, **Esc** ставит паузу или завершает. На ПК ничего не устанавливается, на Android — небольшое приложение (QR-код на странице ссылки). Сессия переживает обрыв интернета, смену VPN и перезагрузку.
+**Друг всё видит и всё решает:** доступны светящаяся рамка, плашка с текущим шагом и курсор ИИ. Каждое действие по умолчанию спрашивает `Y / A / N`. На Windows **Esc** открывает меню Helper, где можно завершить сеанс. На Android используется небольшое приложение (QR-код на странице ссылки). Сессия переживает обрыв интернета, смену VPN и перезагрузку.

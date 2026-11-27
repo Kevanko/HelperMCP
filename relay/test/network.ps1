@@ -318,7 +318,9 @@ try {
     $script:startupOverrides = 0
     function Test-Admin { $false }
     function Get-ScheduledTask { $script:taskFixture }
-    function Set-ItemProperty { }
+    function New-ItemProperty($Path, $Name, $PropertyType, $Value, [switch]$Force) {
+        $script:startupRunEntry = @{ Type = $PropertyType; Value = $Value }
+    }
     function Remove-ItemProperty { $script:startupOverrides++ }
     function Write-AgentLog($message) { }
     function Invoke-WebRequest { @{ Content = $script:copyFixture } }
@@ -345,6 +347,9 @@ try {
         $script:taskFixture = $null
         Install-Autostart
         Assert ($script:startupOverrides -eq 0) 'automatic refresh cleared the Windows startup switch'
+        Assert ($script:startupRunEntry.Type -eq 'ExpandString') 'Run entry cannot expand the default state path'
+        Assert ($script:startupRunEntry.Value.Length -le 260) 'Run entry exceeds the Windows limit'
+        Assert ($script:startupRunEntry.Value.EndsWith('-File "' + $file + '" -HelperLogon')) 'Run entry did not launch the saved helper directly'
         Install-Autostart -Enable
         Assert ($script:startupOverrides -eq 1) 'an explicit local enable did not clear the Windows startup switch'
         Write-Output 'Autostart update preserves previous valid copy and UTF-8 BOM PASS'

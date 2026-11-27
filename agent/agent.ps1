@@ -3732,6 +3732,10 @@ function Play-Sound($kind) {
 function Enable-VT { try { $h = [H.U__BUILD__]::GetStdHandle(-11); $m = 0; if ([H.U__BUILD__]::GetConsoleMode($h, [ref]$m) -and [H.U__BUILD__]::SetConsoleMode($h, $m -bor 4)) { $script:VT = $true } } catch { } }
 $script:OperatorSeen = $false; $script:HdrDrawn = $false
 # ---- keeping the session: local state, autostart, a log, network diagnosis and one repair attempt
+if ($PSCommandPath -and $args -contains '-HelperLogon') {
+    $env:HELPER_LOGON = '1'
+    $env:HELPER_STATE_DIR = $PSScriptRoot
+}
 $StateDir = if ($env:HELPER_STATE_DIR) { [IO.Path]::GetFullPath($env:HELPER_STATE_DIR) } else { Join-Path $env:APPDATA 'HelperMCP' }
 $SessionFile = Join-Path $StateDir 'session.json'; $LogFile = Join-Path $StateDir 'agent.log'; $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $PreferencesFile = Join-Path $StateDir 'preferences.json'
@@ -3874,7 +3878,12 @@ function Install-Autostart([switch]$Enable) {   # resume the same session after 
                 Write-AgentLog 'autostart installed (logon task, administrator)'; return
             } catch { Write-AgentLog "logon task failed, using the Run entry: $_" }
         } elseif ($task) { Write-AgentLog 'autostart: the administrator logon task is already there'; return }
-        Set-ItemProperty -Path $RunKey -Name 'HelperMCP' -Value ('powershell.exe ' + $cmd)
+        # Explorer's Run entry has a 260-character limit. The downloaded
+        # script can resume directly, so it does not need an encoded command.
+        $runPath = if ($StateDir -eq (Join-Path $env:APPDATA 'HelperMCP')) { '%APPDATA%\HelperMCP\agent.ps1' } else { $f }
+        $runCommand = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $runPath + '" -HelperLogon'
+        if ($runCommand.Length -gt 260) { throw 'The Helper state path is too long for the Windows Run entry.' }
+        [void](New-ItemProperty -Path $RunKey -Name 'HelperMCP' -PropertyType ExpandString -Value $runCommand -Force)
         if ($Enable) {
             Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run' -Name 'HelperMCP' -ErrorAction SilentlyContinue
         }
@@ -4545,7 +4554,7 @@ function Start-Helper {
                 $af = Join-Path $StateDir 'agent.ps1'
                 $task = Get-ScheduledTask -TaskName 'HelperMCP' -ErrorAction SilentlyContinue
                 $run = (Get-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue).HelperMCP
-                if ($task.State -ne 'Disabled' -and (-not $saved -or (-not $task -and -not $run) -or
+                if ($task.State -ne 'Disabled' -and (-not $saved -or (-not $task -and (-not $run -or $run.Length -gt 260)) -or
                     -not (Test-Path -LiteralPath $af) -or -not [IO.File]::ReadAllText($af).Contains('namespace F__BUILD__ {') -or
                     ((Get-Date) - (Get-Item -LiteralPath $af).LastWriteTime).TotalHours -gt 24)) {
                     Install-Autostart

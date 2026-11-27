@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { createAdmin } from '../admin.mjs';
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const PORT = 18900 + Math.floor(Math.random() * 90), BASE = `http://127.0.0.1:${PORT}`, KEY = 'keep-test-key';
@@ -131,14 +132,14 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     'a task already exists on the disposable runner');
   const responder = path.join(SDIR, 'accept-fixture-dialog.ps1');
   fs.writeFileSync(responder, [
-    'param([int]$AgentPid)',
+    'param([int]$AgentPid, [string]$ButtonName = "Allow")',
     '$ErrorActionPreference = "Stop"',
     'Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes',
     '$element = [Windows.Automation.AutomationElement]',
     '$pidMatch = [Windows.Automation.PropertyCondition]::new($element::ProcessIdProperty, $AgentPid)',
     '$titleMatch = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "HelperMCP")',
     '$match = [Windows.Automation.AndCondition]::new([Windows.Automation.Condition[]]@($pidMatch, $titleMatch))',
-    '$button = [Windows.Automation.PropertyCondition]::new($element::NameProperty, "Allow")',
+    '$button = [Windows.Automation.PropertyCondition]::new($element::NameProperty, $ButtonName)',
     'Add-Type -Namespace Fixture -Name Window -MemberDefinition @\'',
     '[StructLayout(LayoutKind.Sequential)] public struct Point { public int X; public int Y; }',
     '[DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(Point point);',
@@ -174,8 +175,8 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     '} while ([DateTime]::UtcNow -lt $until)',
     'throw "Fixture consent button did not appear"',
   ].join('\n'));
-  async function approve(target, session) {
-    const responderProc = spawn('powershell',['-NoProfile','-STA','-File',responder,String(target.pid)]);
+  async function answerDialog(target, request, button='Allow') {
+    const responderProc = spawn('powershell',['-NoProfile','-STA','-File',responder,String(target.pid),button]);
     kids.push(responderProc);
     let details='';
     responderProc.stderr.on('data',data=>details+=data);
@@ -183,8 +184,12 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
       responderProc.once('error',reject);
       responderProc.once('close',resolve);
     });
-    const [result,exit] = await Promise.all([call('request_access',{session}),closed]);
-    assert.equal(exit,0,details + '\n' + result.text + '\n' + agentOut.slice(-2600));
+    const [result,exit] = await Promise.all([request(),closed]);
+    assert.equal(exit,0,details + '\n' + agentOut.slice(-2600));
+    return result;
+  }
+  async function approve(target, session) {
+    const result = await answerDialog(target, () => call('request_access',{session}));
     assert.ok(!result.err && /Access approved/.test(result.text),result.text);
   }
   let fixtureError;
@@ -204,7 +209,29 @@ if (PS && process.env.GITHUB_ACTIONS === 'true') {
     await waitFor(()=>fs.existsSync(sfile),'mode 2 saved before process exit');
     await waitFor(()=>scheduler(ownedTask+'if ($task) { $task.Triggers[0].CimClass.CimClassName }')==='MSFT_TaskLogonTrigger',
       'Helper installed its logon task',20000);
-    if(startInTray) fs.writeFileSync(path.join(SDIR,'preferences.json'),JSON.stringify({startup:true,quiet:false,start_in_tray:true}));
+    if(startInTray) {
+      // Verify the real Windows dialog and the persisted choice before logon.
+      const creds=createAdmin(SDIR);
+      const auth=await fetch(BASE+'/admin/api/login',{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({user:creds.user,pass:creds.password})});
+      assert.equal(auth.status,200);
+      const cookie=auth.headers.get('set-cookie').split(';')[0], {csrf}=await auth.json();
+      const preferences={startup:true,quiet:false,start_in_tray:true};
+      const request=()=>fetch(BASE+'/admin/api/launch-preferences',{method:'POST',
+        headers:{cookie,'x-csrf':csrf,'content-type':'application/json'},
+        body:JSON.stringify({code:mode2.code,preferences})});
+      const prefsFile=path.join(SDIR,'preferences.json');
+      const readPrefs=()=>fs.existsSync(prefsFile)?JSON.parse(fs.readFileSync(prefsFile,'utf8').replace(/^\uFEFF/,'')):null;
+      const before=readPrefs();
+      const declined=await answerDialog(agent, request, 'Decline');
+      assert.equal(declined.status,409);
+      assert.deepEqual(readPrefs(),before,'declining the native dialog changed launch settings');
+      const approved=await answerDialog(agent, request);
+      assert.equal(approved.status,200);
+      assert.deepEqual((await approved.json()).preferences,preferences);
+      assert.deepEqual(readPrefs(),preferences);
+      console.log('Native Windows launch settings dialog preserves the prior choice on decline and persists only after approval PASS');
+    }
     const endedMode2=new Promise(resolve=>agent.once('exit',resolve));
     killAgent(agent);
     await endedMode2;

@@ -61,6 +61,14 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
     let data={text:'ok'};
     if(c.tool==='request_access')data={approved:a.approveAccess === true};
     if(c.tool==='set_mode')data={text:c.args.mode};
+    if(c.tool==='set_launch_preferences'){
+      if(!a.approveLaunch){
+        await post(base+'/a/result',{id:c.id,ok:false,error:'local consent declined'},{Authorization:'Bearer '+a.token});
+        continue;
+      }
+      const {startup,quiet,start_in_tray}=c.args;
+      data={preferences:{startup,quiet,start_in_tray}};
+    }
     if(c.tool==='screenshot'){
       const h=c.args.monitor===1?'fixture-monitor-one':'fixture';
       data=c.args.prev===h?{same:true,h}:{jpeg:picture.toString('base64'),mime:'image/png',h,sc:1,ox:c.args.monitor===1?960:0};
@@ -88,6 +96,22 @@ try {
   const cookie=/hm_admin=[0-9a-f]+/.exec(login.headers.get('set-cookie'))[0],csrf=(await login.json()).csrf;
   const H={cookie,'x-csrf':csrf};
   const admin=(name,b)=>b===undefined?fetch(base+'/admin/api/'+name,{headers:{cookie}}):post(base+'/admin/api/'+name,b,H);
+  // The admin reflects only acknowledged, per-device launch preferences.
+  const originalLaunch={startup:true,quiet:false,start_in_tray:false};
+  const desiredLaunch={startup:true,quiet:true,start_in_tray:true};
+  const launchAgent=await fakeAgent('Launch-settings',0,0,{mode:'unattended',access_request:1,launch_preferences:originalLaunch});
+  const launchRequest={code:launchAgent.code,preferences:desiredLaunch};
+  const reportedLaunch=async()=>(await(await admin('sessions')).json()).find(s=>s.code===launchAgent.code).launch_preferences;
+  assert.equal((await post(base+'/admin/api/launch-preferences',launchRequest)).status,401);
+  assert.equal((await admin('launch-preferences',launchRequest)).status,409);
+  assert.deepEqual(await reportedLaunch(),originalLaunch);
+  launchAgent.approveLaunch=true;
+  assert.equal((await admin('launch-preferences',launchRequest)).status,200);
+  assert.deepEqual(await reportedLaunch(),desiredLaunch);
+  assert.equal((await post(base+'/a/launch-preferences',originalLaunch,{Authorization:'Bearer '+launchAgent.token})).status,200);
+  assert.deepEqual(await reportedLaunch(),originalLaunch);
+  await post(base+'/a/bye',{final:true},{Authorization:'Bearer '+launchAgent.token});
+  console.log('Admin launch preferences require acknowledgement; local edits synchronize back to the same device PASS');
   assert.deepEqual(await(await admin('settings',{})).json(),{glow:false,sound:false,banner:false,timer:false,cursor:false,animations:false});
   await admin('settings',{glow:true,sound:true,banner:true,timer:true,cursor:true,animations:true});
   let list=await(await admin('sessions')).json();assert.ok(list.every(s=>s.glow&&s.sound&&s.banner&&s.timer&&s.cursor&&s.animations));

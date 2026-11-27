@@ -3752,6 +3752,35 @@ function Save-HelperPreferences($settings) {
     } finally { if ([IO.File]::Exists($pending)) { [IO.File]::Delete($pending) } }
     $script:Preferences = $settings
 }
+function Set-HelperLaunchPreferences($settings) {
+    if ($settings.startup -and -not $script:Preferences.startup) { Install-Autostart -Enable }
+    Save-HelperPreferences $settings
+    if (-not $settings.startup) {
+        Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
+        if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
+    }
+    Set-ConsoleMenu
+}
+function Do-SetLaunchPreferences($a) {
+    $settings = @{}
+    foreach ($key in 'startup','quiet','start_in_tray') {
+        if ($a.$key -isnot [bool]) { throw 'Invalid launch preference.' }
+        $settings[$key] = $a.$key
+    }
+    $deadline = [long]$a.deadline_ms
+    $left = [Math]::Floor(($deadline - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) / 1000)
+    if ($left -le 0) { throw 'The launch settings request expired.' }
+    $message = T 'Оператор просит изменить настройки запуска Helper.' 'The operator is requesting changes to how Helper starts.'
+    $startup = if ($settings.startup) { T 'включён' 'on' } else { T 'выключен' 'off' }
+    $quiet = if ($settings.quiet) { T 'включён' 'on' } else { T 'выключен' 'off' }
+    $presentation = if ($settings.start_in_tray) { T 'значок в трее' 'notification icon' } else { T 'окно Helper' 'Helper window' }
+    $message += "`n`n" + (T "Автозапуск: $startup`nТихий режим: $quiet`nПри входе в Windows: $presentation" "Autostart: $startup`nQuiet mode: $quiet`nAt Windows sign-in: $presentation")
+    if (-not (Confirm-LocalAccess $message ([int][Math]::Min(35, $left)))) { throw (T 'Пользователь не подтвердил изменение настроек запуска.' 'The user did not approve the launch settings.') }
+    Check-Esc
+    if ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) { throw 'The launch settings request expired.' }
+    Set-HelperLaunchPreferences $settings
+    return @{ preferences = $script:Preferences }
+}
 $script:Persist = $false; $script:FinalEnd = $false
 function Write-AgentLog($m) {
     try {
@@ -4060,13 +4089,9 @@ function Read-ConsoleMenu {
     $settings = $script:Preferences.Clone()
     $settings[$key] = -not $settings[$key]
     try {
-        if ($key -eq 'startup' -and $settings.startup) { Install-Autostart -Enable }
-        Save-HelperPreferences $settings
-        if ($key -eq 'startup' -and -not $settings.startup) {
-            Remove-ItemProperty -Path $RunKey -Name 'HelperMCP' -ErrorAction SilentlyContinue
-            if (Test-Admin) { Unregister-ScheduledTask -TaskName 'HelperMCP' -Confirm:$false -ErrorAction SilentlyContinue }
-        }
-        Set-ConsoleMenu
+        Set-HelperLaunchPreferences $settings
+        try { [void](Api '/a/launch-preferences' $settings $script:Token 5) }
+        catch { Write-AgentLog 'launch preferences saved locally; relay was unavailable' }
         Write-Host ([K__BUILD__.Keys]::MenuLabels[$choice]) -ForegroundColor Green
     } catch {
         Write-AgentLog ('could not save console preferences: ' + $_.Exception.GetType().Name)
@@ -4384,7 +4409,7 @@ function Process-Command($cmd) {
     $manualInput = $a.viewer_input -and $name -in 'move','click','drag','scroll','type_text','press_key','viewer_pointer'
     if ($manualInput -or $a.after_viewer_input) { $script:AiAt = $null }   # shared input can switch windows between bot commands
     $viewFrame = $name -eq 'screenshot' -and $a.view   # the operator's live viewer: no console line, no state change
-    $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode', 'request_access'
+    $meta = $name -in 'look', 'hold', 'task_done', 'stream', 'set_mode', 'request_access', 'set_launch_preferences'
     if (-not $viewFrame -and -not $meta) {
         $script:LastOp = [DateTime]::UtcNow
         if (-not $script:OperatorSeen -or $script:Phase -ne 'ok') {
@@ -4414,6 +4439,7 @@ function Process-Command($cmd) {
             actions = 'Do-Actions'; focus_window = 'Do-FocusWindow'; ui_tree = 'Do-UiTree'; ui_click = 'Do-UiClick'; ui_set = 'Do-UiSet'; trace = 'Do-Trace'; watch = 'Do-Watch'; look = 'Do-Look'; hold = 'Do-Hold'; task_done = 'Do-TaskDone'; set_mode = 'Do-SetMode'; agent_log = 'Do-AgentLog'; fetch_file = 'Do-FetchFile'; tree = 'Do-Tree'; find = 'Do-Find'; edit_file = 'Do-EditFile'; push_file = 'Do-PushFile'; net_check = 'Do-NetCheck'; net_recover = 'Do-NetRecover'; system = 'Do-System'; sysdata = 'Do-SysData'; fsop = 'Do-FsOp'; util = 'Do-Util'; stream = 'Do-Stream'; start_process = 'Do-StartProcess'; mcp_start = 'Do-McpStart'; mcp_tools = 'Do-McpTools'; mcp_call = 'Do-McpCall'; mcp_stop = 'Do-McpStop' }[$name]
         if ($name -eq 'viewer_pointer') { $fn='Do-ViewerPointer' }
         if ($name -eq 'request_access') { $fn='Do-RequestAccess' }
+        if ($name -eq 'set_launch_preferences') { $fn='Do-SetLaunchPreferences' }
         if (-not $fn) { throw "Unknown tool $name" }
         $res.ok = $true
         $res.data = if ($manualInput -and $name -notin 'drag','viewer_pointer') { Do-ViewerInput $name $a } else { & $fn $a }
@@ -4455,6 +4481,7 @@ function Register-Agent($mode, $resume, $resumeToken, $note) {
     $os = try { (Static-Sys).os } catch { [Environment]::OSVersion.VersionString }
     $body = @{ os = $os; host = $env:COMPUTERNAME; user = $env:USERNAME; mode = $mode; persist = $script:Persist; note = [string]$note; device_id = (Get-DeviceId); viewer_pointer = 1; viewer_keyboard = 1; viewer_realtime = 1; access_request = 1; cursor_artwork = 1 }
     if ($resumeToken) { $body.resume_token = $resumeToken }   # proof that it is the same PC: the server then keeps everything it has
+    $body.launch_preferences = $script:Preferences
     if ($resume) { $body.resume = $resume }   # the server may have forgotten us (restart, long outage): ask for the same code back
     (Api '/a/register' $body $null 20).Content | ConvertFrom-Json
 }

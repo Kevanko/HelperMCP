@@ -57,6 +57,8 @@ let saveTimer = null;
 const lookKeys = ['glow', 'sound', 'banner', 'timer', 'cursor', 'animations'];
 const settings = Object.fromEntries(lookKeys.map((key) => [key, false]));
 const effLook = (s) => Object.fromEntries(lookKeys.map((key) => [key, s[key] ?? settings[key]]));
+const launchPreferences = (value) => value && ['startup', 'quiet', 'start_in_tray'].every(key => typeof value[key] === 'boolean')
+  ? { startup: value.startup, quiet: value.quiet, start_in_tray: value.start_in_tray } : null;
 function writeState() {
   if (!STATE_FILE) return;
   clearTimeout(saveTimer);
@@ -379,7 +381,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   }
   if (!opts.release && tool !== 'bye' && s.pending.size >= 64) return Promise.reject(new Error('This device already has 64 pending commands. Wait for work to finish before sending more.'));
   // in "ask" mode a human must click through prompts, give them time
-  if (s.mode === 'confirm' && tool !== 'bye' && tool !== 'request_access' && tool !== 'set_mode') timeoutMs += 120_000;
+  if (s.mode === 'confirm' && !['bye', 'request_access', 'set_mode', 'set_launch_preferences'].includes(tool)) timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
   const passivePointer = tool === 'viewer_pointer' && ['move','keep','kkeep'].includes(args.op);
@@ -1364,7 +1366,7 @@ const byToken = (req) => {
 // ---- the admin panel (/admin): see admin.mjs
 const ADMIN_DIR = process.env.ADMIN_DIR || (STATE_FILE ? path.dirname(STATE_FILE) : path.join(os.tmpdir(), 'helpermcp-admin'));
 const adminHandle = makeAdminHandler({
-  look: humanLook, globalLook, settings, effLook, isOnline, hasAccess, requestAccess, clearAccess, contactAge, call, save, dir: ADMIN_DIR, here, sessions, endedDevices, makeViewer, endSession, forgetDevice, json, text, body, clientIp, baseUrl, ONLINE_MS,
+  look: humanLook, globalLook, settings, effLook, launchPreferences, isOnline, hasAccess, requestAccess, clearAccess, contactAge, call, save, dir: ADMIN_DIR, here, sessions, endedDevices, makeViewer, endSession, forgetDevice, json, text, body, clientIp, baseUrl, ONLINE_MS,
   audit: (type, data) => { try { actWrite({ t: new Date().toISOString(), sid: 'admin', dev: '', kind: 'event', type, data: JSON.stringify(data) }); } catch { /* optional */ } },
   status: () => ({ version: PKG_VERSION, uptime_s: Math.round(process.uptime()), counts: { sessions: sessions.size, online: [...sessions.values()].filter((x) => isOnline(x)).length, files: files.size, viewers: viewers.size } }),
   report: (days) => {
@@ -1714,6 +1716,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         old.info.viewer_pointer = info.viewer_pointer === 1 ? 1 : 0;
         old.info.viewer_keyboard = info.viewer_keyboard === 1 ? 1 : 0;
         old.info.cursor_artwork = info.cursor_artwork === 1;
+        old.info.launch_preferences = launchPreferences(info.launch_preferences);
         old.info.access_request = old.info.access_request || info.access_request === 1;
         old.fastInput?.end();old.info.viewer_realtime=info.viewer_realtime===1?1:0;
         evPush(old, { t: Date.now(), type: 'resumed', note: String(info.note || '').slice(0, 300) }); save();
@@ -1738,6 +1741,7 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
         ...(profile && { note: profile.note, lookForce: profile.lookForce, ...Object.fromEntries(lookKeys.map(key => [key, profile[key]])) }),
       });
       endedDevices.delete(code);
+      s.info.launch_preferences = launchPreferences(info.launch_preferences);
       sessions.set(code, s); save();
       console.log(`+ ${code} ${s.info.user}@${s.info.host} (${s.info.os}) ${s.mode} from ${ip}`);
       return json(res, 200, { code, token, look: effLook(s) });
@@ -1748,6 +1752,14 @@ python3 <(curl -fsSL ${baseUrl(req)}/p)
       if (!s) return json(res, 401, { error: 'unknown token' });
       s.lastSeen = Date.now(); s.lastSeenKnown = true; s.awaitingReconnect = false; s.restoredAt = 0;
       if (p === '/a/poll') save();
+      if (p === '/a/launch-preferences' && req.method === 'POST') {
+        if (s.ending) return json(res, 410, { error: 'session ending' });
+        const prefs = launchPreferences(JSON.parse(await body(req, 512)));
+        if (!prefs || !s.info.launch_preferences) return json(res, 400, { error: 'Invalid launch preferences.' });
+        s.info.launch_preferences = prefs;
+        save();
+        return json(res, 200, {});
+      }
       if (p === '/a/access/revoke' && req.method === 'POST') {
         if (!s.info.access_request || s.mode === 'unattended') return json(res, 409, { error: 'End the session to revoke unattended or legacy access.' });
         clearAccess(code, s, 'The device user ended remote control.');

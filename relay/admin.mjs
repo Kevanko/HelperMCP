@@ -83,6 +83,7 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
       send(res, 200, [...rows].map(([code, s]) => ({
         code, user: s.info?.user || '', host: s.info?.host || '', os: s.info?.os || '', mode: s.mode, persist: !!s.persist, ended: !!s.ended,
         online: !s.ended && d.isOnline(s), access: s.ended ? 'required' : d.hasAccess(s) ? 'active' : s.accessRequest ? 'pending' : 'required', paused: !!s.paused, taken: !!(s.takeover && now - s.takeover < 300_000),
+        launch_preferences: d.launchPreferences(s.info?.launch_preferences),
         last_seen_s: d.contactAge(s), created: s.created, ip: s.ip, running: s.pending?.size || 0, queued: s.queue?.length || 0, note: s.note || '', color: s.lookForce || s.lookColor || '', ...d.effLook(s),
         recent: (s.log || []).slice(-6).map((l) => ({ ago_s: Math.round((now - l.t) / 1000), tool: l.tool, args: l.args })),
       })).sort((a, b) => Number(b.online) - Number(a.online) || (a.last_seen_s ?? Infinity) - (b.last_seen_s ?? Infinity))); return true;
@@ -128,6 +129,30 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
         d.audit('admin_settings', { scope: 'all_devices', ...d.settings });
       }
       send(res, 200, d.settings); return true;
+    }
+    if (api === 'launch-preferences') {
+      const code = String(b.code || '').toUpperCase(), s = d.sessions.get(code);
+      const prefs = d.launchPreferences(b.preferences);
+      if (!prefs) { send(res, 400, { error: 'Invalid launch preferences.' }); return true; }
+      if (!s?.info?.launch_preferences || !d.isOnline(s) || !d.hasAccess(s)) {
+        send(res, 409, { error: 'Подключите актуальный Helper и получите доступ к устройству.' }); return true;
+      }
+      if (s.launchPreferencesPending) { send(res, 409, { error: 'Запрос настроек уже ожидает ответа на устройстве.' }); return true; }
+      const epoch = s.accessEpoch;
+      s.launchPreferencesPending = true;
+      try {
+        const reply = await d.call(code, 'set_launch_preferences', { ...prefs, deadline_ms: Date.now() + 40_000 }, 50_000, { human: true });
+        const applied = d.launchPreferences(reply?.preferences);
+        if (!applied || s.ending || d.sessions.get(code) !== s || s.accessEpoch !== epoch) {
+          send(res, 409, { error: 'Устройство не подтвердило сохранение настроек.' }); return true;
+        }
+        s.info.launch_preferences = applied;
+        d.save();
+        d.audit('admin_launch_preferences', { code, ...applied });
+        send(res, 200, { preferences: applied });
+      } catch (e) { send(res, 409, { error: e.message }); }
+      finally { s.launchPreferencesPending = false; }
+      return true;
     }
     if (api === 'mode') {   // confirm / auto / unattended, pushed to the live agent; never reachable by the AI
       const code = String(b.code || '').toUpperCase(), mode = String(b.mode || '');

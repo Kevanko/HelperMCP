@@ -97,6 +97,29 @@
     const body = el('div', { class: 'modes' }, opts);
     return modal('Access mode for ' + s.code, body, { ok: 'Apply', onok: async () => { if (picked !== s.mode) await call('mode', { code: s.code, mode: picked }); return true; } });
   }
+  async function launchBox(s) {
+    const labels = { startup: 'Автозапуск при входе в Windows', quiet: 'Тихий режим', start_in_tray: 'Открывать в трее' };
+    const fields = Object.keys(labels).map(key => {
+      const input = el('input', { type: 'checkbox', checked: s.launch_preferences[key] });
+      return [key, input];
+    });
+    const status = el('p', { role: 'status', class: 'mut', text: 'Подтвердите изменения на устройстве.' });
+    const options = el('div', { class: 'modes' }, fields.map(([key, input]) => el('label', { class: 'modeopt' }, input, labels[key])), status);
+    return modal('Запуск Helper', options, {
+      ok: 'Запросить изменение', cancel: 'Закрыть',
+      onok: async () => {
+        const preferences = Object.fromEntries(fields.map(([key, input]) => [key, input.checked]));
+        if (Object.keys(preferences).every(key => preferences[key] === s.launch_preferences[key])) return true;
+        for (const [, input] of fields) input.disabled = true;
+        status.textContent = 'Ждём подтверждения на устройстве…';
+        try { await call('launch-preferences', { code: s.code, preferences }); return true; }
+        finally {
+          for (const [, input] of fields) input.disabled = false;
+          status.textContent = 'Подтвердите изменения на устройстве.';
+        }
+      }
+    });
+  }
 
   function login(msg) {
     clearInterval(timer);
@@ -210,7 +233,8 @@
                     catch (err) { guard(err); }
                   })))),
               el('td', null, el('span', { class: 'dot ' + (s.online ? (s.paused || s.taken ? 'warn' : 'on') : '') }), s.ended ? 'Сеанс завершён' : s.online ? (s.taken ? 'operator at the keyboard' : s.paused ? 'paused' : s.running ? 'working' : 'online') : 'offline' + (s.persist ? ' (kept)' : '')),
-              el('td', null, s.ended ? s.mode : el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode))),
+              el('td', null, s.ended ? s.mode : el('button', { class: 'modebtn', title: 'change the access mode', onclick: () => modeBox(s).then(draw).catch(guard) }, label(MODES.find((m) => m[0] === s.mode)?.[1] || 'help', s.mode)),
+                s.launch_preferences && !s.ended ? el('button', { class: 'modebtn', disabled: !s.online || s.access !== 'active', title: 'Автозапуск, тихий режим и трей', onclick: () => launchBox(s).then(draw).catch(guard) }, 'Запуск') : null),
               el('td', { text: s.last_seen_s == null ? 'unknown' : ago(s.last_seen_s) + ' ago' }), el('td', { text: s.ip || '' }),
               el('td', { class: 'ac' }, el('div', { class: 'acts' }, accessButton(s), forgetButton(s), s.ended ? null : el('button', { class: 'go', disabled: s.access !== 'active', title: 'open the live view', onclick: async () => { const viewer = window.open('about:blank', '_blank'); if(viewer)viewer.opener=null; try { const j = await call('open', { code: s.code }); if(viewer)viewer.location.replace(j.control); else await modal('Open remote screen', el('a',{href:j.control,target:'_blank',rel:'noopener',text:'Open '+s.code}),{cancel:null}); } catch (e) { if(viewer)viewer.close();guard(e); } } }, label('open', 'Open')),
                 el('button', { title: 'glow colour and task text for this device', onclick: () => lookBox(s).then(draw).catch(guard) }, label('eye', 'Look')),

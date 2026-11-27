@@ -156,6 +156,19 @@ Write-Output 'network payload and validation PASS'
 # Compile the original route transport, then fail only our TLS relay fixture.
 $agentSource = [IO.File]::ReadAllText((Join-Path $root 'agent/agent.ps1'))
 & {
+    # Expired mode requests must not display consent or commit an access change.
+    $modeFunction = [regex]::Match($agentSource, '(?ms)^function Do-SetMode\(.*?^\}')
+    Assert $modeFunction.Success 'access mode handler not found'
+    Invoke-Expression $modeFunction.Value
+    function Norm-Mode($value) { $value }
+    function Confirm-LocalAccess { throw 'expired request reached the local dialog' }
+    $message = ''
+    try { Do-SetMode @{ mode = 'unattended'; deadline_ms = 1 } }
+    catch { $message = $_.Exception.Message }
+    Assert ($message -eq 'The access mode request expired.') 'the agent handled an expired access mode request'
+    Write-Output 'Expired mode requests are rejected before opening local consent PASS'
+}
+& {
     # Decode a private 32-bit DIB cursor without changing the desktop cursor.
     $cursorParser = [regex]::Match($agentSource, '(?ms)^function Read-Cur32\(.*?^\}')
     Assert $cursorParser.Success 'cursor parser not found'

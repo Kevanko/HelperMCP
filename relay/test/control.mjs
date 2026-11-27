@@ -56,9 +56,11 @@ async function fakeAgent(host,pointer=0,realtime=0,options={}) {
     if(r.status===204){await sleep(50);continue;}if(!r.ok)break;
     const c=await r.json();commands.push({code:a.code,tool:c.tool,args:c.args,artwork:c.cursor_artwork});
     if(c.tool==='press_key'&&a.holdPress)await a.holdPress;
+    if(c.tool==='set_mode'&&a.holdMode)await a.holdMode;
     if(c.tool==='stream'){if(c.args.on){a.liveMon=c.args.mon;startStream(a);}else{a.upload?.end();a.upload=null;}}
     let data={text:'ok'};
     if(c.tool==='request_access')data={approved:a.approveAccess === true};
+    if(c.tool==='set_mode')data={text:c.args.mode};
     if(c.tool==='screenshot'){
       const h=c.args.monitor===1?'fixture-monitor-one':'fixture';
       data=c.args.prev===h?{same:true,h}:{jpeg:picture.toString('base64'),mime:'image/png',h,sc:1,ox:c.args.monitor===1?960:0};
@@ -322,6 +324,21 @@ try {
   assert.equal(resumed.status,200);
   assert.equal((await fetch(granted.watch)).status,404,'a pre-reconnect viewer survived');
   assert.equal((await preview()).status,403,'cached preview survived a reconnect');
+  let finishMode;
+  consent.holdMode = new Promise(resolve => { finishMode = resolve; });
+  const modeChange = admin('mode',{code:consent.code,mode:'unattended'});
+  try {
+    let issued;
+    for(let n=0;n<40&&!issued;n++){
+      issued=commands.find(c=>c.code===consent.code&&c.tool==='set_mode');
+      if(!issued)await sleep(25);
+    }
+    assert.ok(issued && issued.args.deadline_ms-Date.now()>35_000,'the local consent deadline is shorter than the dialog');
+    assert.equal((await admin('mode',{code:consent.code,mode:'confirm'})).status,409,'overlapping mode change started');
+    assert.equal((await admin('open',{code:consent.code})).status,403,'access changed before the device answered');
+  } finally { consent.holdMode=null; finishMode(); }
+  assert.equal((await modeChange).status,200);
+  console.log('Admin mode changes allow the local consent window, reject duplicates and wait for the device result PASS');
   assert.equal((await admin('forget',{code:consent.code})).status,200);
   assert.equal((await post(base+'/a/register',{resume:consent.code,resume_token:consent.token,access_request:1})).status,410);
   const fresh = await (await post(base+'/a/register',{device_id:'consent-fixture-device',access_request:1})).json();

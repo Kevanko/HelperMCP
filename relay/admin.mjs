@@ -132,17 +132,23 @@ export function makeAdminHandler(d) {   // d: { dir, here, sessions, makeViewer,
     if (api === 'mode') {   // confirm / auto / unattended, pushed to the live agent; never reachable by the AI
       const code = String(b.code || '').toUpperCase(), mode = String(b.mode || '');
       if (!['confirm', 'auto', 'unattended'].includes(mode)) { send(res, 400, { error: 'unknown mode' }); return true; }
-      if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }
+      const s = d.sessions.get(code);
+      if (!s) { send(res, 404, { error: 'no such session' }); return true; }
+      if (s.modeChangePending) { send(res, 409, { error: 'A mode change is already pending on this device.' }); return true; }
+      const epoch = s.accessEpoch;
+      s.modeChangePending = true;
       try {
-        const r = await d.call(code, 'set_mode', { mode }, 15_000, { human: true });
-        const s = d.sessions.get(code);
-        if (s) {
-          if (s.info?.access_request && s.mode === 'unattended' && mode !== 'unattended') d.clearAccess(code, s, 'Access mode changed on the device.');
-          s.mode = mode;
-          d.save();
+        const r = await d.call(code, 'set_mode', { mode, deadline_ms: Date.now() + 40_000 }, 50_000, { human: true });
+        if (d.sessions.get(code) !== s || s.ending || s.accessEpoch !== epoch) {
+          send(res, 409, { error: 'The session changed before the mode change completed.' }); return true;
         }
+        if (s.info?.access_request && s.mode === 'unattended' && mode !== 'unattended') d.clearAccess(code, s, 'Access mode changed on the device.');
+        s.mode = mode;
+        d.save();
         d.audit('admin_mode', { code, mode }); send(res, 200, { text: r?.text || mode });
-      } catch (e) { send(res, 400, { error: e.message }); } return true;
+      } catch (e) { send(res, 400, { error: e.message }); }
+      finally { s.modeChangePending = false; }
+      return true;
     }
     if (api === 'end') {
       const code = String(b.code || '').toUpperCase(); if (!d.sessions.has(code)) { send(res, 404, { error: 'no such session' }); return true; }

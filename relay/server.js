@@ -379,7 +379,7 @@ function call(code, tool, args = {}, timeoutMs = 60_000, opts = {}) {
   }
   if (!opts.release && tool !== 'bye' && s.pending.size >= 64) return Promise.reject(new Error('This device already has 64 pending commands. Wait for work to finish before sending more.'));
   // in "ask" mode a human must click through prompts, give them time
-  if (s.mode === 'confirm' && tool !== 'bye' && tool !== 'request_access') timeoutMs += 120_000;
+  if (s.mode === 'confirm' && tool !== 'bye' && tool !== 'request_access' && tool !== 'set_mode') timeoutMs += 120_000;
   if (tool === 'screenshot' && !args.view && s.lite) args = { max_width: 1280, quality: 50, ...args };   // slow link: smaller by default
   let argStr = '';
   const passivePointer = tool === 'viewer_pointer' && ['move','keep','kkeep'].includes(args.op);

@@ -2034,6 +2034,9 @@ function Do-TaskDone($a) {
 }
 function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch confirm / auto / unattended on a live session
     $m = Norm-Mode $a.mode; if (-not $m) { throw "unknown mode '$($a.mode)'" }
+    $deadline = if ($a.deadline_ms) { [long]$a.deadline_ms } else { 0 }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($deadline -and $deadline -le $now) { throw 'The access mode request expired.' }
     $levels = @{ confirm = 0; auto = 1; unattended = 2 }
     if ($levels[$m] -gt $levels[$script:Mode]) {
         $message = if ($m -eq 'unattended') {
@@ -2041,12 +2044,15 @@ function Do-SetMode($a) {   # admin panel only (never offered to the AI): switch
         } else {
             T 'Разрешить помощнику выполнять действия без отдельного подтверждения каждого действия?' 'Allow the helper to perform actions without asking for each action?'
         }
-        if (-not (Confirm-LocalAccess $message 35)) { throw 'The user declined the requested access mode.' }
+        $seconds = if ($deadline) { [int][Math]::Min(35, [Math]::Floor(($deadline - $now) / 1000)) } else { 35 }
+        if (-not (Confirm-LocalAccess $message $seconds)) { throw 'The user declined the requested access mode or it expired.' }
+        Check-Esc
+        if ($deadline -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $deadline) { throw 'The access mode request expired.' }
     }
     if ($script:Mode -eq 'unattended' -and $m -ne 'unattended') { $script:AccessApproved = $false; Stop-RealtimeInput }
     $script:Mode = $m; [K__BUILD__.Keys]::Unattended = ($m -eq 'unattended')
     if($m -eq 'confirm'){Stop-RealtimeInput}else{Start-RealtimeInput}
-    if ($script:Persist) { Save-Session $script:Code $script:Token $m; if (-not $env:HELPER_NO_AUTOSTART) { Install-Autostart } }
+    if ($script:Persist) { Save-Session $script:Code $script:Token $m }
     Write-AgentLog "mode changed to $m (by the administrator)"
     Write-Host ('  ' + (T 'Администратор сменил режим на ' 'The administrator switched the mode to ') + $m) -ForegroundColor Yellow
     Draw-Header $script:Code $false; Show-Status
